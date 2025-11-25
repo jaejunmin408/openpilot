@@ -224,6 +224,35 @@ COMMA_TAIL_HEADING_LEN = 3.0     # path 끝 접선 heading 추정용 lookback [m
 COMMA_TAIL_WEIGHT_TAU = 3.0      # 유효 범위 밖 노드 weight 지수감쇠 시상수 [node]
 COMMA_TAIL_WEIGHT_FLOOR = 0.05   # tail reference weight 하한
 
+# ── comma MPC 지연 보정 (2026-08-21) ──────────────────
+# 지금까지 comma MPC 는 지연을 전혀 보정하지 않았다. 두 곳이 빠져 있었다.
+#
+# (1) 조향 액추에이터 지연. latcontrol_torque 는 받은 desiredCurvature 를
+#     "lat_delay 뒤에 도달할 목표"(future_desired_lateral_accel)로 해석하고,
+#     openpilot 원본 modeld 도 그래서 plan 을 t=lat_delay 에서 읽는다. 그런데
+#     CommaMpcController 는 t=DT_MDL(0.05s) 에서 읽고 있었다. MPC 해의 t=0 노드는
+#     x0(직전 명령)로 하드 고정돼 있어서, 그 옆값을 읽으면 사실상 과거값을 싣는다.
+#     실측(064000 로그, 경로 #52058, v=1.93): 경로는 우(-)로 꺾이는데 명령은
+#     +0.0047(좌)로 나왔고 부호가 뒤집히는 데 0.40s 이상 걸렸다. 같은 해에서
+#     추출만 0.30s 로 옮기면 첫 프레임 +0.0013, 부호 전환 0.15s.
+#     이건 lateral_planner 를 되살릴 때 빠진 회귀다(원본에는 있던 보정).
+COMMA_MPC_USE_LAT_DELAY = True
+COMMA_MPC_EXTRACT_MAX_S = 0.6   # liveDelay 가 튀어도 이 이상 앞은 안 본다
+#
+# (2) 패킷 나이. 외부 publisher 경로는 추론(~0.25s)+전송 뒤에 도착하는데, 받은
+#     경로를 "지금 내 위치에서 시작하는 경로" 로 그대로 썼다. 차는 이미 age·v
+#     만큼 전진해 있고, MPC 노드가 앞에 몰려 있어(v=2.2m/s 에서 앞 1m 안에
+#     7/33 노드) 가장 무거운 구간이 그만큼 어긋난다. 원본은 modeld 가 방금 찍은
+#     프레임으로 추론해 age~0.05s 였으므로 애초에 필요 없던 보정이다 — 외부
+#     publisher 로 바꾸면서 새로 생긴 요구사항이고 미구현 상태였다.
+#     path dict 에 t0_mono_s 가 있을 때만 동작한다(comma_model 경로는 없음 →
+#     기존 동작 그대로. 그쪽은 age~0.05s 이고 MODEL_PATH_MAX_AGE_S 검사가 있다).
+#     주의: compare 모드에서는 comma 만 보정된 경로를 받고 alpasim/pure pursuit 는
+#     원본 경로를 받는다. 세 출력을 나란히 비교할 때 이 비대칭을 감안해야 한다
+#     (보정을 끄고 비교하려면 아래 두 토글을 False 로).
+COMMA_MPC_USE_PATH_AGE = True
+COMMA_MPC_AGE_MAX_S = 1.0       # 나이가 이보다 커도 이 값으로 clip (과보정 방지)
+
 # ── alpasim MPC 파라미터 (5090_controller 브랜치 실측 튜닝값) ──
 # horizon 2.0s(=20×0.1s) 는 줄이면 원호 정상상태 횡오차가 크게 나빠지고, 늘려도
 # 이득이 적다(A 행렬을 현재 yaw 로 고정 선형화하므로 예측이 길수록 모델이 틀림).
@@ -346,10 +375,13 @@ def decode_packet(data: bytes):
     return d
 
 
-def build_path_from_json(d):
+def build_path_from_json(d, recv_mono_s=None):
     """{"pred_xyz": [[x,y,z], ...]} 형태 ego-frame slice → path dict. 없거나 못 쓰면 None.
     수신은 x=forward, y=right 규약이지만 내부적으로는 openpilot body frame(y=left)로
     통일해서 반환한다.
+
+    recv_mono_s 를 주면 t0_mono_s(= 이 경로의 기준시각)를 함께 담는다. 제어 시점에
+    경로 나이를 계산해 지연 보정하는 데 쓴다(COMMA_MPC_USE_PATH_AGE).
     """
     if 'pred_xyz' not in d:
         return None
@@ -368,11 +400,19 @@ def build_path_from_json(d):
     raw_y = pred_xyz[:, 1]
     y = -raw_y   # 수신 y=right(+) → 내부 y=left(+) (openpilot 규약)
 
+    # 기준시각은 publisher 가 추론을 시작한 순간. build_action_from_json 과 같은
+    # 규약(recv - inference_time_s)으로 잡아 둔다.
+    inference_time_s = _as_float_or_none(d.get('inference_time_s')) or 0.0
+    t0_mono_s = (None if recv_mono_s is None
+                 else float(recv_mono_s - max(inference_time_s, 0.0)))
+
     return {
         'x': x,
         'y': y,
         'raw_y': raw_y,
         'N': int(x.shape[0]),
+        't0_mono_s': t0_mono_s,
+        'inference_time_s': float(inference_time_s),
         'meta': _packet_meta(d),
     }
 
@@ -536,6 +576,48 @@ def sample_path_for_comma_mpc(path_ego, v_plan):
     return y_s, heading, yaw_rate, n_valid
 
 
+def advance_path_for_age(path_ego, s_shift, min_remaining_m=2.0):
+    """경로를 호길이 s_shift 지점으로 재정렬해 '현재' ego frame 으로 옮긴다.
+
+    수신 경로의 s=0 은 publisher 가 추론한 순간의 차량 위치다. 제어 시점에는 이미
+    age 만큼 지났고 차는 s_shift = age·v 만큼 전진해 있다. s_shift 지점을 새 원점
+    으로 삼고 그 점의 접선을 새 x축으로 회전시킨다.
+
+    횡방향 이탈은 pose 없이 알 수 없으므로 무시한다(차가 경로 위에 있다고 가정).
+    이 보정이 다루는 건 "얼마나 전진했는가" 하나다.
+
+    자를 수 없으면(s_shift<=0, 점이 너무 적음, 남는 길이가 min_remaining_m 미만)
+    원본을 그대로 돌려준다 — 보정 실패가 제어 정지로 번지지 않게.
+    """
+    x = np.asarray(path_ego['x'], dtype=np.float64)
+    y = np.asarray(path_ego['y'], dtype=np.float64)
+    if s_shift <= 1e-3 or x.shape[0] < 3:
+        return path_ego
+    s = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(x), np.diff(y)))])
+    if float(s[-1]) - s_shift < min_remaining_m:
+        return path_ego
+
+    x0 = float(np.interp(s_shift, s, x))
+    y0 = float(np.interp(s_shift, s, y))
+    # 새 원점의 접선: 리샘플 노이즈를 피해 앞으로 1m 구간의 방향을 쓴다
+    s_fwd = min(s_shift + 1.0, float(s[-1]))
+    psi0 = float(np.arctan2(float(np.interp(s_fwd, s, y)) - y0,
+                            max(float(np.interp(s_fwd, s, x)) - x0, 1e-3)))
+    keep = s > s_shift + 1e-6
+    dx = np.concatenate([[0.0], x[keep] - x0])
+    dy = np.concatenate([[0.0], y[keep] - y0])
+    cs, sn = np.cos(psi0), np.sin(psi0)
+    x_new = dx * cs + dy * sn
+    y_new = -dx * sn + dy * cs
+
+    meta = dict(path_ego.get('meta') or {})
+    meta['age_shift_m'] = float(s_shift)
+    out = dict(path_ego)
+    out.update({'x': x_new, 'y': y_new, 'raw_y': -y_new,
+                'N': int(x_new.shape[0]), 'meta': meta})
+    return out
+
+
 class CommaMpcController:
     """받은 ego-frame path 한 개에 대해 lateral MPC 를 돌려 desired curvature 산출.
 
@@ -553,10 +635,15 @@ class CommaMpcController:
 
     def reset(self):
         self.x0 = np.zeros(4)
+        self.last_t_cmd = DT_MDL   # 마지막으로 해에서 명령을 꺼낸 시점 [s] (로그용)
         self.lat_mpc.reset(x0=self.x0)
 
-    def update(self, path_ego, v_ego):
-        """return (curvature, valid, solve_time). valid=False 면 caller 가 직전 값 유지."""
+    def update(self, path_ego, v_ego, lat_delay_s=None):
+        """return (curvature, valid, solve_time). valid=False 면 caller 가 직전 값 유지.
+
+        lat_delay_s 를 주면 해에서 그 시점의 yaw rate 를 명령으로 꺼낸다
+        (COMMA_MPC_USE_LAT_DELAY). 이유는 상수 정의부 주석 참고.
+        """
         v_plan = max(float(v_ego), MIN_SPEED)
         y_pts, heading_pts, yaw_rate_pts, n_valid = sample_path_for_comma_mpc(path_ego, v_plan)
 
@@ -581,9 +668,20 @@ class CommaMpcController:
             self.reset()
             return 0.0, False, self.lat_mpc.solve_time
 
-        # 다음 iteration init 용 + 현재 command: DT_MDL 앞 desired yaw rate
-        self.x0[3] = float(np.interp(DT_MDL, T_IDXS[:LAT_MPC_N + 1], self.lat_mpc.x_sol[:, 3]))
-        kappa = float(np.clip(self.x0[3] / v_plan, -COMMA_CURV_LIMIT, COMMA_CURV_LIMIT))
+        # 다음 iteration warm start 는 '다음 프레임의 실제 초기상태' 여야 하므로
+        # 항상 DT_MDL 시점 값을 쓴다. 명령으로 내보내는 값만 추출 시점을 옮긴다.
+        sol_yaw_rate = self.lat_mpc.x_sol[:, 3]
+        t_grid = T_IDXS[:LAT_MPC_N + 1]
+        self.x0[3] = float(np.interp(DT_MDL, t_grid, sol_yaw_rate))
+
+        # 명령: torque 단이 'lat_delay 뒤 목표' 로 해석하므로 그 시점 값을 싣는다.
+        if COMMA_MPC_USE_LAT_DELAY and lat_delay_s is not None:
+            t_cmd = float(np.clip(float(lat_delay_s), DT_MDL, COMMA_MPC_EXTRACT_MAX_S))
+        else:
+            t_cmd = DT_MDL
+        self.last_t_cmd = t_cmd
+        yaw_rate_cmd = float(np.interp(t_cmd, t_grid, sol_yaw_rate))
+        kappa = float(np.clip(yaw_rate_cmd / v_plan, -COMMA_CURV_LIMIT, COMMA_CURV_LIMIT))
         return kappa, True, self.lat_mpc.solve_time
 
 
@@ -1732,7 +1830,7 @@ def main():
                                 action_info=act_info_recv,
                             ))
 
-                pkt = build_path_from_json(d)
+                pkt = build_path_from_json(d, loop_start)
                 if pkt is not None:
                     recv_count += 1
                     ext_path = pkt
@@ -1992,8 +2090,16 @@ def main():
             kappa_comma = kappa_alpasim = float('nan')
             comma_ok = alpasim_ok = False
             solve_comma = solve_alpasim = 0.0
+            comma_age_s = comma_shift_m = 0.0
             if mode == "comma_mpc" or lat_state.compare:
-                kappa_comma, comma_ok, solve_comma = comma_ctl.update(path, v_ego)
+                # 지연 보정 (1) 패킷 나이만큼 경로를 앞으로 재정렬,
+                #           (2) 해에서 lat_delay 시점 값을 꺼내기 (update 안에서)
+                comma_path = path
+                if COMMA_MPC_USE_PATH_AGE and path.get('t0_mono_s') is not None:
+                    comma_age_s = max(loop_start - float(path['t0_mono_s']), 0.0)
+                    comma_shift_m = min(comma_age_s, COMMA_MPC_AGE_MAX_S) * max(v_ego, 0.0)
+                    comma_path = advance_path_for_age(path, comma_shift_m)
+                kappa_comma, comma_ok, solve_comma = comma_ctl.update(comma_path, v_ego, lat_delay)
             if mode == "alpasim_mpc" or lat_state.compare:
                 kappa_alpasim, alpasim_ok, solve_alpasim = alpasim_ctl.update(path, sm)
 
@@ -2067,6 +2173,8 @@ def main():
                     f"alpasim={kappa_alpasim:+.4f}({'ok' if alpasim_ok else '-'}) "
                     f"pp={kappa_pp:+.4f} sm={kappa:+.4f} "
                     f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} solve={solve_s * 1e3:.1f}ms "
+                    f"comma_t={comma_ctl.last_t_cmd:.3f} comma_age={comma_age_s:.3f} "
+                    f"comma_shift={comma_shift_m:.2f} "
                     f"cte={float(path['y'][0]):+.2f} path={path_seq} pkts={recv_count} "
                     f"model_curv={'nan' if mc is None else f'{mc:+.4f}'} "
                     f"model_age={'nan' if ma is None else f'{ma:.3f}'}\n"
@@ -2097,6 +2205,8 @@ def main():
                     f"κ={kappa:+.4f}[{mode}](comma {kappa_comma:+.4f} "
                     f"alpasim {kappa_alpasim:+.4f} pp {kappa_pp:+.4f}) a={a_cmd:+.2f} "
                     f"L_d={L_d_eff:.1f} i_goal={i_goal} N={path['N']} "
+                    f"comma_t={comma_ctl.last_t_cmd:.2f}s age={comma_age_s:.2f}s "
+                    f"shift={comma_shift_m:.1f}m "
                     f"cte={cte:+.2f} path={path_seq} pkts={recv_count}"
                 )
         else:
