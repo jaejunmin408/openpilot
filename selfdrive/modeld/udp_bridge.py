@@ -14,14 +14,27 @@ ego-frame JSON으로 보내준다.
 받은 path를 그대로 ego-frame path로 사용한다. 원점(0,0) 재정렬(re-zero) 없이
 받은 path 위에서 곧바로 desired curvature 를 산출한다.
 
-횡방향 제어기는 LAT_MODE 로 고른다(기본 "mpc"):
-  "mpc"          — comma openpilot 원본 lateral MPC(acados) 부활판. 삭제된
+횡방향 제어기 3종을 담고 있고 **주행 중 실시간으로 전환** 할 수 있다:
+
+  "pure_pursuit" — 기하 추종. 속도 비례 look-ahead L_d = clip(k·v, MIN, MAX).
+                   비용이 사실상 0 이라 항상 같이 계산해 두고 diag 기준선 +
+                   MPC 연속 실패 시 폴백으로도 쓴다.
+  "comma_mpc"    — comma openpilot 원본 lateral MPC(acados) 부활판. 삭제된
                    lateral_planner.py(66dbadb02^) 와 동일한 모델/게인/사용법으로
                    controls/lib/lateral_mpc_lib 를 그대로 쓰고, reference 만 모델
-                   출력(modelV2) 대신 수신 path 에서 뽑아 넣는다.
-  "pure_pursuit" — 기존 방식(속도 비례 look-ahead). 비교·폴백용.
-선택하지 않은 쪽도 매 loop 계산해 로그/diag 에 남기므로 같은 경로에 대해 두
-제어기를 바로 비교할 수 있다.
+                   출력(modelV2) 대신 수신 path 에서 뽑아 넣는다.  (~5ms)
+  "alpasim_mpc"  — alpasim LinearMPC 이식판. 8-state 동적 자전거 모델을 매 프레임
+                   선형화해 ADMM QP 로 푼다. controls/lib/alpasim_mpc 참고.
+                   전륜 조향각 δ 를 내고 κ = curvature_factor(v)·δ 로 환산.  (~13ms)
+
+전환 방법 (프로세스 재시작 불필요):
+    python selfdrive/modeld/lat_ctl.py          # 터미널에서 키 입력으로 전환
+udp_bridge 는 manager 가 띄우는 프로세스라 stdin 이 터미널이 아니다. 그래서 키
+입력은 lat_ctl.py 가 받아 UDP 제어 포트(LAT_CTL_PORT)로 명령을 보내는 구조다.
+같은 LAN 의 노트북에서 `--host <device-ip>` 로 원격 조작도 된다.
+
+MPC 는 20Hz 예산(50ms)을 생각해 활성 제어기만 매 loop 돌린다. lat_ctl 의 compare
+를 켜면 셋 다 돌려 같은 경로에 대한 출력을 로그·diag 에 나란히 남긴다.
 
 종방향은 TARGET_SPEED_MPS(=15 km/h) 유지 P 제어.
 """
@@ -35,11 +48,19 @@ import time
 import numpy as np
 
 import cereal.messaging as messaging
-from cereal import log
+from cereal import car, log
 from cereal.messaging import PubMaster, SubMaster
+from opendbc.car.vehicle_model import VehicleModel
 from openpilot.common.basedir import BASEDIR
+from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.controls.lib.alpasim_mpc import (
+    EgoState,
+    MPCGains,
+    MPCPathTracker,
+    VehicleParameters,
+)
 from openpilot.selfdrive.controls.lib.drive_helpers import smooth_value, MIN_SPEED, CAR_ROTATION_RADIUS
 from openpilot.selfdrive.controls.lib.lateral_mpc_lib.lat_mpc import LateralMpc, N as LAT_MPC_N
 from openpilot.selfdrive.controls.lib.local_world import LocalWorld
@@ -89,23 +110,46 @@ def lookahead_for_speed(v_ego):
 
 
 # ── 횡방향 제어기 선택 ───────────────────────────────
-#   "mpc"          → comma 원본 lateral MPC (기본)
-#   "pure_pursuit" → 기존 pure pursuit
-# 환경변수 UDP_BRIDGE_LAT_MODE 로 코드 수정 없이 교체.
-LAT_MODE = os.environ.get("UDP_BRIDGE_LAT_MODE", "mpc").strip().lower()
+LAT_MODES = ("pure_pursuit", "comma_mpc", "alpasim_mpc")
+DEFAULT_LAT_MODE = "comma_mpc"
+# 마지막으로 고른 제어기 (재시작해도 유지). openpilot Params 는 등록된 키만
+# 받으므로(common/params.cc 화이트리스트) 재빌드가 필요 없는 평범한 파일을 쓴다.
+LAT_MODE_FILE = "/data/udp_bridge_lat_mode"
+LAT_CTL_PORT = 5009            # lat_ctl.py ↔ udp_bridge 제어/상태 포트
+# 활성 MPC 가 이만큼 연속 실패하면 낡은 curvature 를 붙들지 않고 PP 로 폴백
+LAT_FAIL_FALLBACK_N = 10
 
-# ── lateral MPC 파라미터 (삭제된 lateral_planner.py 원본 값) ─
-MPC_PATH_COST = 1.0
-MPC_LATERAL_MOTION_COST = 0.11
-MPC_LATERAL_ACCEL_COST = 0.0
-MPC_LATERAL_JERK_COST = 0.04
-MPC_STEERING_RATE_COST = 700.0
-MPC_CURV_LIMIT = 0.2
+# ── comma MPC 파라미터 (삭제된 lateral_planner.py 원본 값) ──
+COMMA_PATH_COST = 1.0
+COMMA_LATERAL_MOTION_COST = 0.11
+COMMA_LATERAL_ACCEL_COST = 0.0
+COMMA_LATERAL_JERK_COST = 0.04
+COMMA_STEERING_RATE_COST = 700.0
+COMMA_CURV_LIMIT = 0.2
 
-# ── 짧은 path tail 처리 (path 길이 < v_plan·10s 인 경우) ──
-MPC_TAIL_HEADING_LEN = 3.0     # path 끝 접선 heading 추정용 lookback [m]
-MPC_TAIL_WEIGHT_TAU = 3.0      # 유효 범위 밖 노드 weight 지수감쇠 시상수 [node]
-MPC_TAIL_WEIGHT_FLOOR = 0.05   # tail reference weight 하한
+# ── comma MPC: 짧은 path tail 처리 (path 길이 < v_plan·10s) ──
+COMMA_TAIL_HEADING_LEN = 3.0     # path 끝 접선 heading 추정용 lookback [m]
+COMMA_TAIL_WEIGHT_TAU = 3.0      # 유효 범위 밖 노드 weight 지수감쇠 시상수 [node]
+COMMA_TAIL_WEIGHT_FLOOR = 0.05   # tail reference weight 하한
+
+# ── alpasim MPC 파라미터 (5090_controller 브랜치 실측 튜닝값) ──
+# horizon 2.0s(=20×0.1s) 는 줄이면 원호 정상상태 횡오차가 크게 나빠지고, 늘려도
+# 이득이 적다(A 행렬을 현재 yaw 로 고정 선형화하므로 예측이 길수록 모델이 틀림).
+ALPASIM_N_HORIZON = 20
+ALPASIM_DT_MPC = 0.1
+ALPASIM_CURV_LIMIT = 0.2
+ALPASIM_STEERING_TIME_CONSTANT = 0.1
+# alpasim configs/controller/default.yaml 과 동일한 gain.
+ALPASIM_GAINS = MPCGains(
+    long_position_weight=2.0,
+    lat_position_weight=1.0,
+    heading_weight=1.0,
+    acceleration_weight=0.1,
+    rel_front_steering_angle_weight=5.0,
+    rel_acceleration_weight=1.0,
+    idx_start_penalty=10,
+)
+CARPARAMS_WAIT_S = 5.0         # CarParams 대기 한도. 넘으면 기본 차량 파라미터로 진행
 
 # ── 디버그 로그 ──────────────────────────────────────
 DEBUG_LOG_DIR = os.path.join(BASEDIR, "logs")
@@ -262,8 +306,8 @@ def pure_pursuit_curvature(path_ego, v_ego, lookahead_m=None, index_frac=None):
     return kappa, goal_idx, L_d_eff
 
 
-# ── lateral MPC (comma 원본 lateral_mpc_lib 부활) ────
-def sample_path_for_mpc(path_ego, v_plan):
+# ── comma MPC (원본 lateral_mpc_lib 부활) ───────────
+def sample_path_for_comma_mpc(path_ego, v_plan):
     """ego-frame path(x=fwd, y=left)를 MPC reference 33점(N+1)으로 리샘플.
 
     MPC shooting node 는 시간축 T_IDXS(33점). node i 의 reference 는 차량이
@@ -294,7 +338,7 @@ def sample_path_for_mpc(path_ego, v_plan):
     # ── path 끝 너머는 끝점 접선 방향 직선으로 외삽 ──
     if n_valid < IDX_N:
         # 끝점 접선 heading: resample 노이즈를 피해 끝에서 살짝 뒤 구간 방향 사용
-        s_back = max(s_end - MPC_TAIL_HEADING_LEN, 0.0)
+        s_back = max(s_end - COMMA_TAIL_HEADING_LEN, 0.0)
         x_back = float(np.interp(s_back, s_path, x))
         y_back = float(np.interp(s_back, s_path, y))
         x_end, y_end = float(x[-1]), float(y[-1])
@@ -309,7 +353,7 @@ def sample_path_for_mpc(path_ego, v_plan):
     return y_s, heading, yaw_rate, n_valid
 
 
-class LatMpcController:
+class CommaMpcController:
     """받은 ego-frame path 한 개에 대해 lateral MPC 를 돌려 desired curvature 산출.
 
     삭제된 comma lateral_planner.py(66dbadb02^) 와 동일한 dynamics/weight/사용법.
@@ -331,20 +375,20 @@ class LatMpcController:
     def update(self, path_ego, v_ego):
         """return (curvature, valid, solve_time). valid=False 면 caller 가 직전 값 유지."""
         v_plan = max(float(v_ego), MIN_SPEED)
-        y_pts, heading_pts, yaw_rate_pts, n_valid = sample_path_for_mpc(path_ego, v_plan)
+        y_pts, heading_pts, yaw_rate_pts, n_valid = sample_path_for_comma_mpc(path_ego, v_plan)
 
         # path 끝 너머(외삽) 노드는 reference-tracking weight 를 지수감쇠시켜
         # fabricate 한 tail 을 MPC 가 추종하지 않게 한다. node n_valid 부터 감쇠.
         if n_valid < LAT_MPC_N + 1:
             over = np.clip(np.arange(LAT_MPC_N + 1) - (n_valid - 1), 0, None)
-            node_weights = np.maximum(MPC_TAIL_WEIGHT_FLOOR,
-                                      np.exp(-over / MPC_TAIL_WEIGHT_TAU))
+            node_weights = np.maximum(COMMA_TAIL_WEIGHT_FLOOR,
+                                      np.exp(-over / COMMA_TAIL_WEIGHT_TAU))
         else:
             node_weights = None
 
-        self.lat_mpc.set_weights(MPC_PATH_COST, MPC_LATERAL_MOTION_COST,
-                                 MPC_LATERAL_ACCEL_COST, MPC_LATERAL_JERK_COST,
-                                 MPC_STEERING_RATE_COST, node_weights=node_weights)
+        self.lat_mpc.set_weights(COMMA_PATH_COST, COMMA_LATERAL_MOTION_COST,
+                                 COMMA_LATERAL_ACCEL_COST, COMMA_LATERAL_JERK_COST,
+                                 COMMA_STEERING_RATE_COST, node_weights=node_weights)
         v_arr = np.full(LAT_MPC_N + 1, v_plan)
         p = np.column_stack([v_arr, np.full(LAT_MPC_N + 1, CAR_ROTATION_RADIUS)])
         self.lat_mpc.run(self.x0, p, y_pts, heading_pts, yaw_rate_pts)
@@ -356,8 +400,227 @@ class LatMpcController:
 
         # 다음 iteration init 용 + 현재 command: DT_MDL 앞 desired yaw rate
         self.x0[3] = float(np.interp(DT_MDL, T_IDXS[:LAT_MPC_N + 1], self.lat_mpc.x_sol[:, 3]))
-        kappa = float(np.clip(self.x0[3] / v_plan, -MPC_CURV_LIMIT, MPC_CURV_LIMIT))
+        kappa = float(np.clip(self.x0[3] / v_plan, -COMMA_CURV_LIMIT, COMMA_CURV_LIMIT))
         return kappa, True, self.lat_mpc.solve_time
+
+
+# ── alpasim MPC (alpasim LinearMPC 이식판) ───────────
+def load_car_params(timeout_s=CARPARAMS_WAIT_S):
+    """CarParams 를 non-blocking 으로 기다린다. 못 받으면 None.
+
+    controlsd 처럼 block=True 로 무한 대기하면 CarParams 가 없는 흐름
+    (오프로드 replay 등)에서 udp_bridge 가 멈춘다. alpasim MPC 는 기본 차량
+    파라미터만으로도 돌아가므로 타임아웃 후 진행한다.
+    """
+    params = Params()
+    deadline = time.monotonic() + timeout_s
+    while True:
+        raw = params.get("CarParams")
+        if raw is not None:
+            try:
+                return messaging.log_from_bytes(raw, car.CarParams)
+            except Exception as e:
+                cloudlog.warning(f"udp_bridge: CarParams parse 실패 ({e})")
+                return None
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.1)
+
+
+class AlpasimMpcController:
+    """alpasim LinearMPC(8-state 동적 자전거, ADMM QP)로 desired curvature 산출.
+
+    MPC 원출력은 전륜 조향각 δ 이고 κ = curvature_factor(v)·δ 로 환산한다.
+    curvature_factor 는 opendbc VehicleModel(언더스티어 반영)을 쓰고, CarParams
+    를 못 받으면 kinematic 1/wheelbase 로 대체한다.
+
+    comma MPC 와 달리 횡속도·yaw rate·조향각 실측(livePose/carState)을 상태로
+    받으므로 SubMaster 를 통째로 받아 EgoState 를 만든다.
+    """
+
+    def __init__(self, CP):
+        if CP is not None:
+            veh = VehicleParameters.from_car_params(
+                CP, steering_time_constant=ALPASIM_STEERING_TIME_CONSTANT)
+            try:
+                vm = VehicleModel(CP)
+            except Exception as e:
+                cloudlog.warning(f"udp_bridge: VehicleModel 생성 실패 ({e}), kinematic 1/L 사용")
+                vm = None
+            self.default_steer_ratio = float(CP.steerRatio) if CP.steerRatio > 0.1 else None
+        else:
+            veh = VehicleParameters(steering_time_constant=ALPASIM_STEERING_TIME_CONSTANT)
+            vm = None
+            self.default_steer_ratio = None
+
+        self.tracker = MPCPathTracker(
+            vehicle_params=veh,
+            gains=ALPASIM_GAINS,
+            n_horizon=ALPASIM_N_HORIZON,
+            dt_mpc=ALPASIM_DT_MPC,
+            target_speed=TARGET_SPEED_MPS,
+            lon_kp=LON_KP,
+            accel_min=ACCEL_MIN,
+            accel_max=ACCEL_MAX,
+            curv_limit=ALPASIM_CURV_LIMIT,
+            vm=vm,
+        )
+        self.last_result = None
+        cloudlog.warning(
+            f"udp_bridge alpasim MPC: horizon={ALPASIM_N_HORIZON}×{ALPASIM_DT_MPC}s="
+            f"{self.tracker.horizon_seconds:.1f}s "
+            f"(≈{self.tracker.reach_at_speed(TARGET_SPEED_MPS):.1f}m @ {TARGET_SPEED_MPS * 3.6:.0f}km/h), "
+            f"mass={veh.mass:.0f}kg L={veh.wheelbase:.2f}m "
+            f"tau_s={veh.steering_time_constant:.2f}s VM={'opendbc' if vm else 'kinematic'}"
+        )
+
+    def reset(self):
+        self.tracker.reset()
+        self.last_result = None
+
+    def _ego_state(self, sm):
+        """SubMaster → EgoState. livePose 가 죽어 있으면 횡속도/yaw rate 0."""
+        if sm.alive["liveParameters"]:
+            lp = sm["liveParameters"]
+            steer_ratio = float(lp.steerRatio) if lp.steerRatio > 0.1 else self.default_steer_ratio
+            angle_offset = float(lp.angleOffsetDeg)
+        else:
+            steer_ratio = self.default_steer_ratio
+            angle_offset = 0.0
+        return EgoState.from_messages(
+            sm["carState"],
+            live_pose=sm["livePose"] if sm.alive["livePose"] else None,
+            steer_ratio=steer_ratio,
+            angle_offset_deg=angle_offset,
+        )
+
+    def update(self, path_ego, sm):
+        """return (curvature, valid, solve_time_s)."""
+        res = self.tracker.update(path_ego['x'], path_ego['y'], self._ego_state(sm))
+        self.last_result = res
+        if not res.ok or not math.isfinite(res.curvature):
+            return 0.0, False, res.solve_time_ms / 1e3
+        return float(res.curvature), True, res.solve_time_ms / 1e3
+
+
+# ── 런타임 제어기 전환 (UDP 제어 포트) ───────────────
+#
+# udp_bridge 는 manager 가 띄우는 프로세스라 stdin 이 터미널이 아니다. 그래서
+# 여기서 직접 키를 읽지 않고, 별도 CLI(selfdrive/modeld/lat_ctl.py)가 터미널
+# 키 입력을 받아 이 UDP 포트로 명령을 보낸다. 프로세스 재시작 없이 주행 중에
+# 제어기를 바꿀 수 있고, 같은 LAN 의 노트북에서 원격으로도 조작할 수 있다.
+#
+# 프로토콜 (JSON, 요청 1패킷 → 응답 1패킷):
+#   {"cmd": "get"}                    → 현재 상태
+#   {"cmd": "set", "mode": "<mode>"}  → 제어기 전환 후 상태
+#   {"cmd": "cycle"}                  → 다음 제어기로 순환 후 상태
+#   {"cmd": "compare", "on": bool}    → 비활성 제어기도 매 loop 계산(로그 비교용)
+#   {"cmd": "reset"}                  → 활성 제어기 내부 상태 리셋
+# 응답은 아래 LatModeState.status() 의 dict 를 JSON 으로 직렬화한 것.
+class LatModeState:
+    """현재 선택된 횡제어기 + 제어 포트 서버 (non-blocking)."""
+
+    def __init__(self, mode, sock):
+        self.mode = mode
+        self.compare = False        # True 면 비활성 제어기도 매 loop 계산(로그용)
+        self.sock = sock
+        self.reset_request = False  # main loop 가 소비하는 1회성 플래그
+        self.switch_count = 0
+        self.last_cmd_from = None
+        # main loop 가 매 frame 채워 넣는 텔레메트리 (status 응답용)
+        self.telemetry = {}
+
+    # ── 상태 조회/변경 ──
+    def set_mode(self, mode):
+        mode = str(mode).strip().lower()
+        if mode not in LAT_MODES:
+            return False, f"unknown mode {mode!r} (choose from {', '.join(LAT_MODES)})"
+        if mode == self.mode:
+            return True, f"already {mode}"
+        prev, self.mode = self.mode, mode
+        self.switch_count += 1
+        self.reset_request = True     # 새로 붙는 제어기의 누적 상태를 비우고 시작
+        save_lat_mode(mode)
+        msg = f"lateral controller {prev} -> {mode}"
+        cloudlog.warning(f"udp_bridge: {msg}")
+        print(f"[LAT] {msg}", flush=True)
+        return True, msg
+
+    def cycle(self):
+        return self.set_mode(LAT_MODES[(LAT_MODES.index(self.mode) + 1) % len(LAT_MODES)])
+
+    def status(self):
+        st = {
+            "mode": self.mode,
+            "modes": list(LAT_MODES),
+            "compare": self.compare,
+            "switch_count": self.switch_count,
+        }
+        st.update(self.telemetry)
+        return st
+
+    # ── 제어 포트 서비스 (매 loop 1회 호출) ──
+    def poll(self):
+        """대기 중인 명령을 전부 처리하고 각각에 상태를 응답한다."""
+        while True:
+            try:
+                data, addr = self.sock.recvfrom(4096)
+            except BlockingIOError:
+                return
+            except OSError:
+                return
+            ok, msg = True, ""
+            try:
+                req = json.loads(data.decode("utf-8"))
+                cmd = str(req.get("cmd", "get")).lower()
+                if cmd == "set":
+                    ok, msg = self.set_mode(req.get("mode", ""))
+                elif cmd == "cycle":
+                    ok, msg = self.cycle()
+                elif cmd == "compare":
+                    self.compare = bool(req.get("on", not self.compare))
+                    msg = f"compare={'on' if self.compare else 'off'}"
+                elif cmd == "reset":
+                    self.reset_request = True
+                    msg = "controller state reset"
+                elif cmd != "get":
+                    ok, msg = False, f"unknown cmd {cmd!r}"
+            except Exception as e:
+                ok, msg = False, f"bad request ({e})"
+            self.last_cmd_from = addr
+            resp = self.status()
+            resp["ok"] = ok
+            resp["msg"] = msg
+            try:
+                self.sock.sendto(json.dumps(resp).encode("utf-8"), addr)
+            except OSError:
+                pass
+
+
+def load_lat_mode():
+    """시작 시 모드 결정: 환경변수 > 마지막 선택 저장값 > 기본값."""
+    env = os.environ.get("UDP_BRIDGE_LAT_MODE", "").strip().lower()
+    if env in LAT_MODES:
+        return env
+    if env:
+        cloudlog.warning(f"udp_bridge: unknown UDP_BRIDGE_LAT_MODE {env!r}, ignoring")
+    try:
+        with open(LAT_MODE_FILE, encoding="utf-8") as f:
+            saved = f.read().strip().lower()
+        if saved in LAT_MODES:
+            return saved
+    except OSError:
+        pass
+    return DEFAULT_LAT_MODE
+
+
+def save_lat_mode(mode):
+    """다음 실행에서도 같은 제어기로 뜨도록 저장 (실패해도 무시)."""
+    try:
+        with open(LAT_MODE_FILE, "w", encoding="utf-8") as f:
+            f.write(mode)
+    except OSError as e:
+        cloudlog.warning(f"udp_bridge: lat mode 저장 실패 ({e})")
 
 
 def _safe_float(value):
@@ -810,7 +1073,7 @@ def main():
     cloudlog.warning("udp_bridge init (ref-path slice mode, target=15km/h)")
 
     pm = PubMaster(["modelV2", "drivingModelData", "longitudinalPlan", "driverAssistance"])
-    sm = SubMaster(["carState", "livePose", "selfdriveState"])
+    sm = SubMaster(["carState", "livePose", "selfdriveState", "liveParameters"])
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -820,15 +1083,31 @@ def main():
     viz_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     viz_sock.setblocking(False)
 
+    # 제어기 전환 명령 수신 포트 (lat_ctl.py)
+    ctl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ctl_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ctl_sock.bind(('0.0.0.0', LAT_CTL_PORT))
+    ctl_sock.setblocking(False)
+
     cloudlog.warning(f"udp_bridge listening on port {UDP_PORT} (ref path slice JSON @ ~10Hz)")
     cloudlog.warning(f"udp_bridge viz: vehicle/trail→{VEHICLE_VIZ_PORT}, raw mirror→{LOCAL_PATH_VIZ_PORT}, "
                      f"world path→{WORLD_PATH_VIZ_PORT}")
-    cloudlog.warning(f"udp_bridge lateral mode: {LAT_MODE}"
-                     + (" (comma 원본 lateral MPC)" if LAT_MODE == "mpc" else " (pure pursuit)"))
     cloudlog.warning(f"udp_bridge debug log: engage 시 {DEBUG_LOG_DIR}/udp_bridge_debug_*.log 생성")
 
     world = LocalWorld()        # viz only (vehicle trail)
-    lat_mpc_ctl = LatMpcController()   # 받은 path → comma 원본 lateral MPC → curvature
+
+    # 제어기 3종을 전부 만들어 두고 lat_state.mode 로 고른다. 주행 중 전환은
+    # lat_ctl.py 가 제어 포트로 보내는 명령으로 처리(프로세스 재시작 불필요).
+    comma_ctl = CommaMpcController()
+    alpasim_ctl = AlpasimMpcController(load_car_params())
+    lat_state = LatModeState(load_lat_mode(), ctl_sock)
+    lat_fail_streak = 0
+    last_loop_ms = 0.0
+    cloudlog.warning(f"udp_bridge lateral controller: {lat_state.mode} "
+                     f"(전환: python selfdrive/modeld/lat_ctl.py, 포트 {LAT_CTL_PORT})")
+    print(f"[LAT] lateral controller = {lat_state.mode}  "
+          f"(전환: python selfdrive/modeld/lat_ctl.py)", flush=True)
+
     frame_id = 0
     path = None
     recv_count = 0
@@ -929,23 +1208,72 @@ def main():
                 diag_writer = None
         prev_engaged = engaged
 
+        # 2.6. 제어 포트 서비스 — 주행 중 제어기 전환 (lat_ctl.py)
+        lat_state.poll()
+        if lat_state.reset_request:
+            comma_ctl.reset()
+            alpasim_ctl.reset()
+            lat_fail_streak = 0
+            lat_state.reset_request = False
+
         # 3. tracker — 받은 path 를 그대로(원점 재정렬 없이) 추종
         if path is not None:
-            # 두 제어기를 모두 돌리고 LAT_MODE 인 쪽만 제어에 쓴다(나머지는 로그용).
+            mode = lat_state.mode
+            # pure pursuit 는 비용이 없으니 항상 계산 (diag 기준선 + 폴백용)
             kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path, v_ego, index_frac=PP_INDEX_FRAC)
-            kappa_mpc, mpc_valid, mpc_solve_time = lat_mpc_ctl.update(path, v_ego)
 
-            if LAT_MODE == "mpc":
-                kappa_raw, ctl_valid = kappa_mpc, mpc_valid
+            # MPC 는 20Hz 예산(50ms)을 생각해 활성 제어기만 돌린다.
+            # compare 를 켜면 둘 다 돌려 같은 경로에 대한 출력을 로그에 남긴다.
+            kappa_comma = kappa_alpasim = float('nan')
+            comma_ok = alpasim_ok = False
+            solve_comma = solve_alpasim = 0.0
+            if mode == "comma_mpc" or lat_state.compare:
+                kappa_comma, comma_ok, solve_comma = comma_ctl.update(path, v_ego)
+            if mode == "alpasim_mpc" or lat_state.compare:
+                kappa_alpasim, alpasim_ok, solve_alpasim = alpasim_ctl.update(path, sm)
+
+            if mode == "comma_mpc":
+                kappa_raw, ctl_valid, solve_s = kappa_comma, comma_ok, solve_comma
+            elif mode == "alpasim_mpc":
+                kappa_raw, ctl_valid, solve_s = kappa_alpasim, alpasim_ok, solve_alpasim
             else:
-                kappa_raw, ctl_valid = kappa_pp, True
+                kappa_raw, ctl_valid, solve_s = kappa_pp, True, 0.0
 
-            # MPC 해가 실패하면 직전 curvature 유지(0 으로 튀지 않게)
+            # 솔버 실패: 짧으면 직전 curvature 유지(0 으로 튀지 않게), 연속으로
+            # 이어지면 낡은 값을 계속 붙들지 않고 pure pursuit 으로 폴백한다.
+            if ctl_valid:
+                lat_fail_streak = 0
+            else:
+                lat_fail_streak += 1
+                if lat_fail_streak == LAT_FAIL_FALLBACK_N:
+                    cloudlog.warning(f"udp_bridge: {mode} 연속 실패 {lat_fail_streak}회 "
+                                     f"→ pure pursuit 폴백")
+                    print(f"[LAT] {mode} 연속 실패 → pure pursuit 폴백", flush=True)
+                if lat_fail_streak >= LAT_FAIL_FALLBACK_N:
+                    kappa_raw, ctl_valid = kappa_pp, True
+
             if ctl_valid and v_ego > MIN_LAT_CONTROL_SPEED:
                 kappa = smooth_value(kappa_raw, prev_curvature, LAT_SMOOTH_SECONDS)
             else:
                 kappa = prev_curvature
             prev_curvature = kappa
+
+            lat_state.telemetry = {
+                "kappa_cmd": kappa,
+                "kappa_pp": kappa_pp,
+                "kappa_comma": None if math.isnan(kappa_comma) else kappa_comma,
+                "kappa_alpasim": None if math.isnan(kappa_alpasim) else kappa_alpasim,
+                "solve_ms": solve_s * 1e3,
+                "fail_streak": lat_fail_streak,
+                "v_ego": v_ego,
+                "cte_m": float(path['y'][0]),
+                "path_points": int(path['N']),
+                "pkts": recv_count,
+                "engaged": engaged,
+                "frame": frame_id,
+                "loop_ms": last_loop_ms,
+                "has_path": True,
+            }
 
             # 직진 데드존: |curvature| 이 임계 이하면 제어 입력을 0 으로
             if abs(kappa) <= CURV_DEADZONE:
@@ -963,9 +1291,10 @@ def main():
             if debug_log is not None:
                 debug_log.write(
                     f"[t={time.monotonic():.3f}] CURV frame={frame_id} v_ego={v_ego:.2f} "
-                    f"mode={LAT_MODE} mpc={kappa_mpc:+.4f}({'ok' if mpc_valid else 'INVALID'}) "
+                    f"mode={mode} comma={kappa_comma:+.4f}({'ok' if comma_ok else '-'}) "
+                    f"alpasim={kappa_alpasim:+.4f}({'ok' if alpasim_ok else '-'}) "
                     f"pp={kappa_pp:+.4f} sm={kappa:+.4f} "
-                    f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} solve={mpc_solve_time * 1e3:.1f}ms "
+                    f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} solve={solve_s * 1e3:.1f}ms "
                     f"cte={float(path['y'][0]):+.2f} pkts={recv_count}\n"
                 )
 
@@ -990,8 +1319,8 @@ def main():
                 cte = float(path['y'][0])
                 cloudlog.warning(
                     f"track: v_ego={v_ego:.2f} target={TARGET_SPEED_MPS:.2f} "
-                    f"κ={kappa:+.4f}[{LAT_MODE}](mpc {kappa_mpc:+.4f}{'' if mpc_valid else '!'} "
-                    f"pp {kappa_pp:+.4f}) a={a_cmd:+.2f} "
+                    f"κ={kappa:+.4f}[{mode}](comma {kappa_comma:+.4f} "
+                    f"alpasim {kappa_alpasim:+.4f} pp {kappa_pp:+.4f}) a={a_cmd:+.2f} "
                     f"L_d={L_d_eff:.1f} i_goal={i_goal} N={path['N']} "
                     f"cte={cte:+.2f} pkts={recv_count}"
                 )
@@ -999,7 +1328,17 @@ def main():
             action = idle_action()
             rs = default_resampled()
             prev_curvature = 0.0
-            lat_mpc_ctl.reset()
+            lat_fail_streak = 0
+            comma_ctl.reset()
+            alpasim_ctl.reset()
+            lat_state.telemetry = {
+                "v_ego": v_ego,
+                "pkts": recv_count,
+                "engaged": engaged,
+                "frame": frame_id,
+                "loop_ms": last_loop_ms,
+                "has_path": False,
+            }
 
         # 4. 메시지 발행
         publish_messages(pm, rs, action, frame_id, v_ego)
@@ -1012,6 +1351,7 @@ def main():
 
         # 6. 20Hz 타이밍 유지
         elapsed = time.monotonic() - loop_start
+        last_loop_ms = elapsed * 1e3
         sleep_time = loop_period - elapsed
         if sleep_time > 0:
             time.sleep(sleep_time)
