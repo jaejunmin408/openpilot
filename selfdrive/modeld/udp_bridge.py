@@ -12,7 +12,16 @@ ego-frame JSON으로 보내준다.
 
 매 패킷이 그 시점 차량 위치 기준으로 잘려 들어오므로 anchor/world 변환 없이
 받은 path를 그대로 ego-frame path로 사용한다. 원점(0,0) 재정렬(re-zero) 없이
-받은 path 위에서 곧바로 pure pursuit 으로 curvature 를 산출한다.
+받은 path 위에서 곧바로 desired curvature 를 산출한다.
+
+횡방향 제어기는 LAT_MODE 로 고른다(기본 "mpc"):
+  "mpc"          — comma openpilot 원본 lateral MPC(acados) 부활판. 삭제된
+                   lateral_planner.py(66dbadb02^) 와 동일한 모델/게인/사용법으로
+                   controls/lib/lateral_mpc_lib 를 그대로 쓰고, reference 만 모델
+                   출력(modelV2) 대신 수신 path 에서 뽑아 넣는다.
+  "pure_pursuit" — 기존 방식(속도 비례 look-ahead). 비교·폴백용.
+선택하지 않은 쪽도 매 loop 계산해 로그/diag 에 남기므로 같은 경로에 대해 두
+제어기를 바로 비교할 수 있다.
 
 종방향은 TARGET_SPEED_MPS(=15 km/h) 유지 P 제어.
 """
@@ -29,8 +38,10 @@ import cereal.messaging as messaging
 from cereal import log
 from cereal.messaging import PubMaster, SubMaster
 from openpilot.common.basedir import BASEDIR
+from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.controls.lib.drive_helpers import smooth_value
+from openpilot.selfdrive.controls.lib.drive_helpers import smooth_value, MIN_SPEED, CAR_ROTATION_RADIUS
+from openpilot.selfdrive.controls.lib.lateral_mpc_lib.lat_mpc import LateralMpc, N as LAT_MPC_N
 from openpilot.selfdrive.controls.lib.local_world import LocalWorld
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
@@ -59,8 +70,8 @@ CURV_DEADZONE = 0.00                  # |curvature| 이 이하면 0 으로 (직�
 # ── pure pursuit 파라미터 ────────────────────────────
 # 속도 비례 look-ahead: L_d = clip(PP_LOOKAHEAD_K_S * v_ego, MIN, MAX)
 #   대중적 pure pursuit 방식(L_d ∝ v). 최소 10m, 최대 20m 로 clamp.
-PP_LOOKAHEAD_MIN_M = 5.0
-PP_LOOKAHEAD_MAX_M = 15.0
+PP_LOOKAHEAD_MIN_M = 8.0
+PP_LOOKAHEAD_MAX_M = 8.0
 PP_LOOKAHEAD_K_S = 3.0               # look-ahead time gain (s) — L_d = k · v
 PP_CURV_LIMIT = 0.2
 
@@ -75,6 +86,26 @@ def lookahead_for_speed(v_ego):
     """속도 비례 look-ahead 거리 L_d = clip(k · v, MIN, MAX)."""
     return float(np.clip(PP_LOOKAHEAD_K_S * max(v_ego, 0.0),
                          PP_LOOKAHEAD_MIN_M, PP_LOOKAHEAD_MAX_M))
+
+
+# ── 횡방향 제어기 선택 ───────────────────────────────
+#   "mpc"          → comma 원본 lateral MPC (기본)
+#   "pure_pursuit" → 기존 pure pursuit
+# 환경변수 UDP_BRIDGE_LAT_MODE 로 코드 수정 없이 교체.
+LAT_MODE = os.environ.get("UDP_BRIDGE_LAT_MODE", "mpc").strip().lower()
+
+# ── lateral MPC 파라미터 (삭제된 lateral_planner.py 원본 값) ─
+MPC_PATH_COST = 1.0
+MPC_LATERAL_MOTION_COST = 0.11
+MPC_LATERAL_ACCEL_COST = 0.0
+MPC_LATERAL_JERK_COST = 0.04
+MPC_STEERING_RATE_COST = 700.0
+MPC_CURV_LIMIT = 0.2
+
+# ── 짧은 path tail 처리 (path 길이 < v_plan·10s 인 경우) ──
+MPC_TAIL_HEADING_LEN = 3.0     # path 끝 접선 heading 추정용 lookback [m]
+MPC_TAIL_WEIGHT_TAU = 3.0      # 유효 범위 밖 노드 weight 지수감쇠 시상수 [node]
+MPC_TAIL_WEIGHT_FLOOR = 0.05   # tail reference weight 하한
 
 # ── 디버그 로그 ──────────────────────────────────────
 DEBUG_LOG_DIR = os.path.join(BASEDIR, "logs")
@@ -229,6 +260,104 @@ def pure_pursuit_curvature(path_ego, v_ego, lookahead_m=None, index_frac=None):
     kappa = 2.0 * y_goal / (L_d_eff * L_d_eff)
     kappa = float(np.clip(kappa, -PP_CURV_LIMIT, PP_CURV_LIMIT))
     return kappa, goal_idx, L_d_eff
+
+
+# ── lateral MPC (comma 원본 lateral_mpc_lib 부활) ────
+def sample_path_for_mpc(path_ego, v_plan):
+    """ego-frame path(x=fwd, y=left)를 MPC reference 33점(N+1)으로 리샘플.
+
+    MPC shooting node 는 시간축 T_IDXS(33점). node i 의 reference 는 차량이
+    v_plan 으로 달릴 때 시각 T_IDXS[i] 에 도달하는 arc-length s_i=v_plan·t_i
+    지점의 path 값이다. 거기서 lateral offset y, 접선 heading, yaw rate 를 뽑는다.
+
+    수신 path 길이(~20m)가 가장 먼 노드의 목표 호길이(v_plan·10s)보다 짧으면
+    path 끝 너머 노드가 생긴다. 이 구간은 끝값 hold(y 고정=직진 명령) 대신 끝점
+    접선(heading) 방향 직선으로 외삽해 기하학적으로 일관되게 채운다. 외삽 구간은
+    실제 reference 가 아니므로 호출부에서 weight 를 감쇠시키도록 n_valid 를 함께
+    반환한다(s_target ≤ path 길이 인 노드 수).
+    """
+    x = np.asarray(path_ego['x'], dtype=np.float64)
+    y = np.asarray(path_ego['y'], dtype=np.float64)
+    ds = np.hypot(np.diff(x), np.diff(y))
+    s_path = np.concatenate([[0.0], np.cumsum(ds)])
+    s_end = float(s_path[-1])
+    s_target = T_IDXS * max(float(v_plan), MIN_SPEED)
+
+    # path 안에 들어오는 (= 실제 데이터로 채워지는) shooting node 수
+    n_valid = int(np.count_nonzero(s_target <= s_end + 1e-6))
+    n_valid = max(n_valid, 1)   # 최소 원점 노드는 항상 유효
+
+    # 호길이 기준 리샘플 (밖은 일단 끝점 clamp)
+    x_s = np.interp(s_target, s_path, x)
+    y_s = np.interp(s_target, s_path, y)
+
+    # ── path 끝 너머는 끝점 접선 방향 직선으로 외삽 ──
+    if n_valid < IDX_N:
+        # 끝점 접선 heading: resample 노이즈를 피해 끝에서 살짝 뒤 구간 방향 사용
+        s_back = max(s_end - MPC_TAIL_HEADING_LEN, 0.0)
+        x_back = float(np.interp(s_back, s_path, x))
+        y_back = float(np.interp(s_back, s_path, y))
+        x_end, y_end = float(x[-1]), float(y[-1])
+        psi_end = np.arctan2(y_end - y_back, max(x_end - x_back, 1e-3))
+        ds_ext = s_target - s_end                      # 끝 너머 노드는 양수
+        ext = s_target > s_end + 1e-6
+        x_s[ext] = x_end + ds_ext[ext] * np.cos(psi_end)
+        y_s[ext] = y_end + ds_ext[ext] * np.sin(psi_end)
+
+    heading = np.arctan2(np.gradient(y_s), np.maximum(np.gradient(x_s), 1e-3))
+    yaw_rate = np.gradient(heading, T_IDXS)
+    return y_s, heading, yaw_rate, n_valid
+
+
+class LatMpcController:
+    """받은 ego-frame path 한 개에 대해 lateral MPC 를 돌려 desired curvature 산출.
+
+    삭제된 comma lateral_planner.py(66dbadb02^) 와 동일한 dynamics/weight/사용법.
+    거기서는 reference 가 modelV2(position.y / orientation.z / orientationRate.z)
+    였고, 여기서는 같은 자리에 수신 reference path 를 시간축 리샘플해 넣는다.
+    x0=[x, y, psi, psi_rate] 중 x/y/psi 는 매 프레임 ego 원점이므로 0, psi_rate
+    (=desired yaw rate) 만 다음 iteration 으로 carry-over. curvature=psi_rate/v.
+    """
+
+    def __init__(self):
+        self.lat_mpc = LateralMpc()
+        self.x0 = np.zeros(4)
+        self.reset()
+
+    def reset(self):
+        self.x0 = np.zeros(4)
+        self.lat_mpc.reset(x0=self.x0)
+
+    def update(self, path_ego, v_ego):
+        """return (curvature, valid, solve_time). valid=False 면 caller 가 직전 값 유지."""
+        v_plan = max(float(v_ego), MIN_SPEED)
+        y_pts, heading_pts, yaw_rate_pts, n_valid = sample_path_for_mpc(path_ego, v_plan)
+
+        # path 끝 너머(외삽) 노드는 reference-tracking weight 를 지수감쇠시켜
+        # fabricate 한 tail 을 MPC 가 추종하지 않게 한다. node n_valid 부터 감쇠.
+        if n_valid < LAT_MPC_N + 1:
+            over = np.clip(np.arange(LAT_MPC_N + 1) - (n_valid - 1), 0, None)
+            node_weights = np.maximum(MPC_TAIL_WEIGHT_FLOOR,
+                                      np.exp(-over / MPC_TAIL_WEIGHT_TAU))
+        else:
+            node_weights = None
+
+        self.lat_mpc.set_weights(MPC_PATH_COST, MPC_LATERAL_MOTION_COST,
+                                 MPC_LATERAL_ACCEL_COST, MPC_LATERAL_JERK_COST,
+                                 MPC_STEERING_RATE_COST, node_weights=node_weights)
+        v_arr = np.full(LAT_MPC_N + 1, v_plan)
+        p = np.column_stack([v_arr, np.full(LAT_MPC_N + 1, CAR_ROTATION_RADIUS)])
+        self.lat_mpc.run(self.x0, p, y_pts, heading_pts, yaw_rate_pts)
+
+        mpc_nans = bool(np.isnan(self.lat_mpc.x_sol[:, 3]).any())
+        if mpc_nans or self.lat_mpc.solution_status != 0:
+            self.reset()
+            return 0.0, False, self.lat_mpc.solve_time
+
+        # 다음 iteration init 용 + 현재 command: DT_MDL 앞 desired yaw rate
+        self.x0[3] = float(np.interp(DT_MDL, T_IDXS[:LAT_MPC_N + 1], self.lat_mpc.x_sol[:, 3]))
+        kappa = float(np.clip(self.x0[3] / v_plan, -MPC_CURV_LIMIT, MPC_CURV_LIMIT))
+        return kappa, True, self.lat_mpc.solve_time
 
 
 def _safe_float(value):
@@ -694,9 +823,12 @@ def main():
     cloudlog.warning(f"udp_bridge listening on port {UDP_PORT} (ref path slice JSON @ ~10Hz)")
     cloudlog.warning(f"udp_bridge viz: vehicle/trail→{VEHICLE_VIZ_PORT}, raw mirror→{LOCAL_PATH_VIZ_PORT}, "
                      f"world path→{WORLD_PATH_VIZ_PORT}")
+    cloudlog.warning(f"udp_bridge lateral mode: {LAT_MODE}"
+                     + (" (comma 원본 lateral MPC)" if LAT_MODE == "mpc" else " (pure pursuit)"))
     cloudlog.warning(f"udp_bridge debug log: engage 시 {DEBUG_LOG_DIR}/udp_bridge_debug_*.log 생성")
 
     world = LocalWorld()        # viz only (vehicle trail)
+    lat_mpc_ctl = LatMpcController()   # 받은 path → comma 원본 lateral MPC → curvature
     frame_id = 0
     path = None
     recv_count = 0
@@ -797,12 +929,20 @@ def main():
                 diag_writer = None
         prev_engaged = engaged
 
-        # 3. tracker — 받은 path 를 그대로(원점 재정렬 없이) pure pursuit
+        # 3. tracker — 받은 path 를 그대로(원점 재정렬 없이) 추종
         if path is not None:
+            # 두 제어기를 모두 돌리고 LAT_MODE 인 쪽만 제어에 쓴다(나머지는 로그용).
             kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path, v_ego, index_frac=PP_INDEX_FRAC)
+            kappa_mpc, mpc_valid, mpc_solve_time = lat_mpc_ctl.update(path, v_ego)
 
-            if v_ego > MIN_LAT_CONTROL_SPEED:
-                kappa = smooth_value(kappa_pp, prev_curvature, LAT_SMOOTH_SECONDS)
+            if LAT_MODE == "mpc":
+                kappa_raw, ctl_valid = kappa_mpc, mpc_valid
+            else:
+                kappa_raw, ctl_valid = kappa_pp, True
+
+            # MPC 해가 실패하면 직전 curvature 유지(0 으로 튀지 않게)
+            if ctl_valid and v_ego > MIN_LAT_CONTROL_SPEED:
+                kappa = smooth_value(kappa_raw, prev_curvature, LAT_SMOOTH_SECONDS)
             else:
                 kappa = prev_curvature
             prev_curvature = kappa
@@ -823,8 +963,9 @@ def main():
             if debug_log is not None:
                 debug_log.write(
                     f"[t={time.monotonic():.3f}] CURV frame={frame_id} v_ego={v_ego:.2f} "
-                    f"raw={kappa_pp:+.4f} sm={kappa:+.4f} "
-                    f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} "
+                    f"mode={LAT_MODE} mpc={kappa_mpc:+.4f}({'ok' if mpc_valid else 'INVALID'}) "
+                    f"pp={kappa_pp:+.4f} sm={kappa:+.4f} "
+                    f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} solve={mpc_solve_time * 1e3:.1f}ms "
                     f"cte={float(path['y'][0]):+.2f} pkts={recv_count}\n"
                 )
 
@@ -849,7 +990,8 @@ def main():
                 cte = float(path['y'][0])
                 cloudlog.warning(
                     f"track: v_ego={v_ego:.2f} target={TARGET_SPEED_MPS:.2f} "
-                    f"κ={kappa:+.4f}(raw {kappa_pp:+.4f}) a={a_cmd:+.2f} "
+                    f"κ={kappa:+.4f}[{LAT_MODE}](mpc {kappa_mpc:+.4f}{'' if mpc_valid else '!'} "
+                    f"pp {kappa_pp:+.4f}) a={a_cmd:+.2f} "
                     f"L_d={L_d_eff:.1f} i_goal={i_goal} N={path['N']} "
                     f"cte={cte:+.2f} pkts={recv_count}"
                 )
@@ -857,6 +999,7 @@ def main():
             action = idle_action()
             rs = default_resampled()
             prev_curvature = 0.0
+            lat_mpc_ctl.reset()
 
         # 4. 메시지 발행
         publish_messages(pm, rs, action, frame_id, v_ego)

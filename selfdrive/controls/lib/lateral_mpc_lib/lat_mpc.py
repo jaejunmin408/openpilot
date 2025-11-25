@@ -158,13 +158,25 @@ class LateralMpc:
 
   def set_weights(self, path_weight, heading_weight,
                   lat_accel_weight, lat_jerk_weight,
-                  steering_rate_weight):
+                  steering_rate_weight, node_weights=None):
     W = np.asfortranarray(np.diag([path_weight, heading_weight,
                                    lat_accel_weight, lat_jerk_weight,
                                    steering_rate_weight]))
+    if node_weights is None:
+      for i in range(N):
+        self.solver.cost_set(i, 'W', W)
+      self.solver.cost_set(N, 'W', W[:COST_E_DIM,:COST_E_DIM])
+      return
+
+    # node_weights: 길이 N+1, stage 별 reference-tracking cost(첫 COST_E_DIM 개:
+    # y/heading/yaw_rate) 에만 스케일을 곱한다. jerk/steering_rate 정규화 cost 는
+    # 그대로 둬서 reference 가 약해진 구간에서도 해가 부드럽게 유지되도록 한다.
     for i in range(N):
-      self.solver.cost_set(i, 'W', W)
-    self.solver.cost_set(N, 'W', W[:COST_E_DIM,:COST_E_DIM])
+      Wi = np.array(W, copy=True)
+      Wi[:COST_E_DIM, :COST_E_DIM] *= node_weights[i]
+      self.solver.cost_set(i, 'W', np.asfortranarray(Wi))
+    We = W[:COST_E_DIM, :COST_E_DIM] * node_weights[N]
+    self.solver.cost_set(N, 'W', np.asfortranarray(We))
 
   def run(self, x0, p, y_pts, heading_pts, yaw_rate_pts):
     x0_cp = np.copy(x0)
