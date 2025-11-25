@@ -99,7 +99,7 @@ X_IDXS = np.array(ModelConstants.X_IDXS, dtype=np.float64)
 IDX_N = ModelConstants.IDX_N   # 33
 
 # ── 종방향 ────────────────────────────────────────────
-TARGET_SPEED_MPS = 8.0 / 3.6        # 15 km/h ≈ 4.17 m/s
+TARGET_SPEED_MPS = 10.0 / 3.6       # 10 km/h ≈ 2.78 m/s
 LON_KP = 0.3
 ACCEL_MIN = -3.5
 ACCEL_MAX = 2.0
@@ -176,10 +176,12 @@ RAW_ACTION_V_KEY = 'accel_mps2'        # 실제 내용 = 속도 [m/s]
 RAW_ACTION_A_KEY = 'raw_accel_mps2'    # 실제 내용 = 종가속도 [m/s²] (없을 수 있음)
 RAW_ACTION_DT_S = 0.1          # plan_dt_s 가 없을 때 쓰는 기본 간격
 RAW_ACTION_MIN_N = 2           # 이보다 점이 적으면 버림
-# 마지막 raw_action 이 이보다 오래되면 버림 → 제어 정지. publisher 10Hz 기준으로
-# (추론지연 ~0.3s + 연속 3패킷 유실) 정도를 한도로 잡았다. 이보다 완만한 노화는
-# 시계열 인덱스가 앞으로 밀리는 것으로 자연히 흡수되고, horizon 을 넘기면 따로 걸린다.
-RAW_ACTION_MAX_AGE_S = 0.6
+# 마지막 raw_action 이 이보다 오래되면 버림 → 제어 정지(idle_action: 조향 0 +
+# shouldStop=True 라 제동까지 걸린다). 실차 8/20 측정: publisher 실효 3.2Hz,
+# inference_time_s ~0.2s 라 age 가 0.6s 를 자주 넘어 제어의 21% 가 STOP 으로 끊겼다.
+# 시계열이 6.4s 를 덮으므로 조금 낡은 값을 쓰는 편이 지령을 끊는 것보다 안전하고,
+# 진짜 상한은 horizon 초과 판정이 맡는다. 링크가 죽으면 여전히 여기서 잡힌다.
+RAW_ACTION_MAX_AGE_S = 1.5
 # 시계열에서 읽을 시점 t [s] 를 정하는 방식.
 #   기본(적응식): t = 패킷 나이 + liveDelay.lateralDelay 를 매 loop 계산.
 #     latcontrol_torque 가 desired_curvature 를 "lat_delay 후 도달 목표"
@@ -196,10 +198,12 @@ RAW_ACTION_LAT_DELAY_MAX_S = 0.5   # liveDelay 가 튀어도 이 이상은 앞�
 # lead(= t - 패킷 나이 = 지금보다 앞선 양) 가 이 값보다 작으면 경고. 적응식에서는
 # lead 가 곧 lat_delay 라, liveDelay 가 아직 추정 전(0)이면 여기서 걸린다.
 RAW_ACTION_LEAD_WARN_S = 0.05
-# curvature 부호. Alpamayo raw_action 은 openpilot desiredCurvature(좌회전 +) 와 같은
-# 규약으로 확인됐다 — debug 브랜치에서 실차로 음수 부호를 걷어낸 결과값(5/15)이다.
-# 차가 반대로 조향하면 여기만 -1.0 으로 바꾸면 된다.
-RAW_ACTION_CURV_SIGN = 1.0
+# curvature 부호. **실차 결정(2026-08-20): -1.0.** +1.0 으로 주행하니 조향이
+# 정반대로 갔다 — publisher 의 raw_action.curvature 는 openpilot
+# desiredCurvature(좌회전 +) 와 부호 규약이 반대다.
+# (debug 브랜치 5/15 에서는 여기 음수를 걷었지만, 실주행에서 반증됐다.)
+# 부호 반전은 build_action_from_json 한 곳에서만 적용된다.
+RAW_ACTION_CURV_SIGN = -1.0
 RAW_ACTION_CURV_LIMIT = 0.2    # |κ| clip (pure pursuit / MPC 와 동일 한도)
 # 받은 종가속도(raw_accel_mps2)를 종방향 명령으로 쓸지. 초기엔 검증된 TARGET_SPEED
 # 유지 P 제어를 그대로 두고 받은 값은 로그·표시로만 본다 (debug 브랜치
