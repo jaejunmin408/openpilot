@@ -35,8 +35,12 @@ tinygrad_files = ["#"+x for x in glob.glob(env.Dir("#tinygrad_repo").relpath + "
 for model_name in ['driving_vision', 'driving_policy', 'dmonitoring_model']:
   fn = File(f"models/{model_name}").abspath
   script_files = [File(Dir("#selfdrive/modeld").File("get_model_metadata.py").abspath)]
-  cmd = f'python3 {Dir("#selfdrive/modeld").abspath}/get_model_metadata.py {fn}.onnx'
-  lenv.Command(fn + "_metadata.pkl", [fn + ".onnx"] + tinygrad_files + script_files, cmd)
+  onnx = fn + ".onnx"
+  cmd = f'python3 {Dir("#selfdrive/modeld").abspath}/get_model_metadata.py {onnx}'
+  # release-tizi can ship pre-generated *_metadata.pkl and *_tinygrad.pkl without ONNX.
+  # Only generate metadata when the ONNX exists (and the symlink isn't broken).
+  if os.path.exists(onnx):
+    lenv.Command(fn + "_metadata.pkl", [onnx] + tinygrad_files + script_files, cmd)
 
 def tg_compile(flags, model_name):
   pythonpath_string = 'PYTHONPATH="${PYTHONPATH}:' + env.Dir("#tinygrad_repo").abspath + '"'
@@ -53,7 +57,9 @@ for model_name in ['driving_vision', 'driving_policy', 'dmonitoring_model']:
     'larch64': 'DEV=QCOM FLOAT16=1 NOLOCALS=1 IMAGE=2 JIT_BATCH_SIZE=0',
     'Darwin': f'DEV=CPU HOME={os.path.expanduser("~")}', # tinygrad calls brew which needs a $HOME in the env
   }.get(arch, 'DEV=CPU CPU_LLVM=1')
-  tg_compile(flags, model_name)
+  # Only compile when ONNX exists. If only *_tinygrad.pkl is shipped, skip compilation.
+  if os.path.exists(File(f"models/{model_name}").abspath + ".onnx"):
+    tg_compile(flags, model_name)
 
 # Compile BIG model if USB GPU is available
 if "USBGPU" in os.environ:
