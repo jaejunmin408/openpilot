@@ -10,6 +10,14 @@ extern ExitHandler do_exit;
 // Max messages to process per socket per poll
 constexpr int MAX_MESSAGES_PER_SOCKET = 50;
 
+// MSGQ queues are created per-service with custom sizes (e.g. can=10MB).
+// bridge must subscribe with the same segment size, otherwise read pointers
+// can land outside the mapped region and corrupt message size reads.
+static size_t get_service_queue_size(const std::string &endpoint) {
+  const auto it = services.find(endpoint);
+  return it != services.end() ? it->second.queue_size : 0;
+}
+
 static std::string recv_zmq_msg(void *sock) {
   zmq_msg_t msg;
   zmq_msg_init(&msg);
@@ -109,8 +117,8 @@ void MsgqToZmq::zmqMonitorThread() {
           if (++pair.connected_clients == 1) {
             // Create new MSGQ subscriber socket and map to ZMQ publisher
             pair.sub_sock = std::make_unique<MSGQSubSocket>();
-            size_t queue_size = services.at(pair.endpoint).queue_size;
-            pair.sub_sock->connect(msgq_context.get(), pair.endpoint, "127.0.0.1", false, true, queue_size);
+            const size_t segment_size = get_service_queue_size(pair.endpoint);
+            pair.sub_sock->connect(msgq_context.get(), pair.endpoint, "127.0.0.1", false, true, segment_size);
             sub2pub[pair.sub_sock.get()] = pair.pub_sock.get();
             registerSockets();
           }

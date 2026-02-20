@@ -6,6 +6,13 @@
 
 ExitHandler do_exit;
 
+// Keep bridge queue layout identical to regular messaging sockets.
+// This avoids publisher/subscriber size mismatches on large services.
+static size_t get_service_queue_size(const std::string &endpoint) {
+  const auto it = services.find(endpoint);
+  return it != services.end() ? it->second.queue_size : 0;
+}
+
 static std::vector<std::string> get_services(const std::string &whitelist_str, bool zmq_to_msgq) {
   std::vector<std::string> service_list;
   for (const auto& it : services) {
@@ -33,8 +40,7 @@ void zmq_to_msgq(const std::vector<std::string> &endpoints, const std::string &i
   for (auto endpoint : endpoints) {
     auto pub_sock = new PubSocket();
     auto sub_sock = new BridgeZmqSubSocket();
-    size_t queue_size = services.at(endpoint).queue_size;
-    pub_sock->connect(pub_context.get(), endpoint, true, queue_size);
+    pub_sock->connect(pub_context.get(), endpoint, true, get_service_queue_size(endpoint));
     sub_sock->connect(sub_context.get(), endpoint, ip, false);
 
     poller->registerSocket(sub_sock);
