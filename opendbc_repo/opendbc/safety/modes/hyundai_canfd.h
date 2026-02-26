@@ -136,83 +136,9 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
 }
 
 static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
-  const TorqueSteeringLimits HYUNDAI_CANFD_STEERING_LIMITS = {
-    .max_torque = 270,
-    .max_rt_delta = 112,
-    .max_rate_up = 2,
-    .max_rate_down = 3,
-    .driver_torque_allowance = 250,
-    .driver_torque_multiplier = 2,
-    .type = TorqueDriverLimited,
-
-    // the EPS faults when the steering angle is above a certain threshold for too long. to prevent this,
-    // we allow setting torque actuation bit to 0 while maintaining the requested torque value for two consecutive frames
-    .min_valid_request_frames = 89,
-    .max_invalid_request_frames = 2,
-    .min_valid_request_rt_interval = 810000,  // 810ms; a ~10% buffer on cutting every 90 frames
-    .has_steer_req_tolerance = true,
-  };
-
-  bool tx = true;
-
-  // steering
-  const unsigned int steer_addr = (hyundai_canfd_lka_steering && !hyundai_longitudinal) ? hyundai_canfd_get_lka_addr() : 0x12aU;
-  if (msg->addr == steer_addr) {
-    int desired_torque = (((msg->data[6] & 0xFU) << 7U) | (msg->data[5] >> 1U)) - 1024U;
-    bool steer_req = GET_BIT(msg, 52U);
-
-    if (steer_torque_cmd_checks(desired_torque, steer_req, HYUNDAI_CANFD_STEERING_LIMITS)) {
-      tx = false;
-    }
-  }
-
-  // cruise buttons check
-  if (msg->addr == 0x1cfU) {
-    int button = msg->data[2] & 0x7U;
-    bool is_cancel = (button == HYUNDAI_BTN_CANCEL);
-    bool is_resume = (button == HYUNDAI_BTN_RESUME);
-
-    bool allowed = (is_cancel && cruise_engaged_prev) || (is_resume && controls_allowed);
-    if (!allowed) {
-      tx = false;
-    }
-  }
-
-  // UDS: only tester present ("\x02\x3E\x80\x00\x00\x00\x00\x00") allowed on diagnostics address
-  if (((msg->addr == 0x730U) && hyundai_canfd_lka_steering) || ((msg->addr == 0x7D0U) && !hyundai_camera_scc)) {
-    if ((GET_BYTES(msg, 0, 4) != 0x00803E02U) || (GET_BYTES(msg, 4, 4) != 0x0U)) {
-      tx = false;
-    }
-  }
-
-  // ACCEL: safety check
-  if (msg->addr == 0x1a0U) {
-    int desired_accel_raw = (((msg->data[17] & 0x7U) << 8) | msg->data[16]) - 1023U;
-    int desired_accel_val = ((msg->data[18] << 4) | (msg->data[17] >> 4)) - 1023U;
-
-    bool violation = false;
-
-    if (hyundai_longitudinal) {
-      violation |= longitudinal_accel_checks(desired_accel_raw, HYUNDAI_LONG_LIMITS);
-      violation |= longitudinal_accel_checks(desired_accel_val, HYUNDAI_LONG_LIMITS);
-    } else {
-      // only used to cancel on here
-      const int acc_mode = (msg->data[8] >> 4) & 0x7U;
-      if (acc_mode != 4) {
-        violation = true;
-      }
-
-      if ((desired_accel_raw != 0) || (desired_accel_val != 0)) {
-        violation = true;
-      }
-    }
-
-    if (violation) {
-      tx = false;
-    }
-  }
-
-  return tx;
+  (void)msg;
+  // UNSAFE: allow all TX (bypass Hyundai CAN-FD safety checks)
+  return true;
 }
 
 static safety_config hyundai_canfd_init(uint16_t param) {

@@ -177,75 +177,9 @@ static void hyundai_rx_hook(const CANPacket_t *msg) {
 }
 
 static bool hyundai_tx_hook(const CANPacket_t *msg) {
-  const TorqueSteeringLimits HYUNDAI_STEERING_LIMITS = HYUNDAI_LIMITS(384, 3, 7);
-  const TorqueSteeringLimits HYUNDAI_STEERING_LIMITS_ALT = HYUNDAI_LIMITS(270, 2, 3);
-  const TorqueSteeringLimits HYUNDAI_STEERING_LIMITS_ALT_2 = HYUNDAI_LIMITS(170, 2, 3);
-
-  bool tx = true;
-
-  // FCA11: Block any potential actuation
-  if (msg->addr == 0x38DU) {
-    int CR_VSM_DecCmd = msg->data[1];
-    bool FCA_CmdAct = GET_BIT(msg, 20U);
-    bool CF_VSM_DecCmdAct = GET_BIT(msg, 31U);
-
-    if ((CR_VSM_DecCmd != 0) || FCA_CmdAct || CF_VSM_DecCmdAct) {
-      tx = false;
-    }
-  }
-
-  // ACCEL: safety check
-  if (msg->addr == 0x421U) {
-    int desired_accel_raw = (((msg->data[4] & 0x7U) << 8) | msg->data[3]) - 1023U;
-    int desired_accel_val = ((msg->data[5] << 3) | (msg->data[4] >> 5)) - 1023U;
-
-    int aeb_decel_cmd = msg->data[2];
-    bool aeb_req = GET_BIT(msg, 54U);
-
-    bool violation = false;
-
-    violation |= longitudinal_accel_checks(desired_accel_raw, HYUNDAI_LONG_LIMITS);
-    violation |= longitudinal_accel_checks(desired_accel_val, HYUNDAI_LONG_LIMITS);
-    violation |= (aeb_decel_cmd != 0);
-    violation |= aeb_req;
-
-    if (violation) {
-      tx = false;
-    }
-  }
-
-  // LKA STEER: safety check
-  if (msg->addr == 0x340U) {
-    int desired_torque = ((GET_BYTES(msg, 0, 4) >> 16) & 0x7ffU) - 1024U;
-    bool steer_req = GET_BIT(msg, 27U);
-
-    const TorqueSteeringLimits limits = hyundai_alt_limits_2 ? HYUNDAI_STEERING_LIMITS_ALT_2 :
-                                        hyundai_alt_limits ? HYUNDAI_STEERING_LIMITS_ALT : HYUNDAI_STEERING_LIMITS;
-
-    if (steer_torque_cmd_checks(desired_torque, steer_req, limits)) {
-      tx = false;
-    }
-  }
-
-  // UDS: Only tester present ("\x02\x3E\x80\x00\x00\x00\x00\x00") allowed on diagnostics address
-  if (msg->addr == 0x7D0U) {
-    if ((GET_BYTES(msg, 0, 4) != 0x00803E02U) || (GET_BYTES(msg, 4, 4) != 0x0U)) {
-      tx = false;
-    }
-  }
-
-  // BUTTONS: used for resume spamming and cruise cancellation
-  if ((msg->addr == 0x4F1U) && !hyundai_longitudinal) {
-    int button = msg->data[0] & 0x7U;
-
-    bool allowed_resume = (button == 1) && controls_allowed;
-    bool allowed_cancel = (button == 4) && cruise_engaged_prev;
-    if (!(allowed_resume || allowed_cancel)) {
-      tx = false;
-    }
-  }
-
-  return tx;
+  (void)msg;
+  // UNSAFE: allow all TX (bypass Hyundai safety checks)
+  return true;
 }
 
 static safety_config hyundai_init(uint16_t param) {

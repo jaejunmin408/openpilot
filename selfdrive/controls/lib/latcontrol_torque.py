@@ -51,8 +51,7 @@ class LatControlTorque(LatControl):
     self.update_limits()
 
   def update_limits(self):
-    self.pid.set_limits(self.lateral_accel_from_torque(self.steer_max, self.torque_params),
-                        self.lateral_accel_from_torque(-self.steer_max, self.torque_params))
+    self.pid.set_limits(1e308, -1e308)
 
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
