@@ -20,3 +20,7 @@ if [ -z "$AGNOS_VERSION" ]; then
 fi
 
 export STAGING_ROOT="/data/safe_staging"
+
+export CUSTOM_PATH_MODE=right_turn
+export CUSTOM_RIGHT_TURN_RADIUS_M=35
+export CUSTOM_RIGHT_TURN_SIGN=1
