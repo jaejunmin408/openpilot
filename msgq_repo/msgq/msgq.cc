@@ -389,10 +389,13 @@ int msgq_msg_recv(msgq_msg_t * msg, msgq_queue_t * q){
     goto start;
   }
 
-  // crashing is better than passing garbage data to the consumer
-  // the size will have weird value if it was overwritten by data accidentally
-  assert((uint64_t)size < q->size);
-  assert(size > 0);
+  // Defensive recovery: queue metadata can be transiently inconsistent if a
+  // publisher/subscriber layout mismatch or corrupted slot is observed.
+  // Drop back to the latest write pointer instead of aborting the process.
+  if (size <= 0 || (uint64_t)size >= q->size) {
+    msgq_reset_reader(q);
+    goto start;
+  }
 
   uint32_t new_read_pointer = ALIGN(read_pointer + sizeof(std::int64_t) + size);
 
