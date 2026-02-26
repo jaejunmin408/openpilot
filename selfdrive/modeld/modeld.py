@@ -47,6 +47,52 @@ MIN_LAT_CONTROL_SPEED = 0.3
 IMG_QUEUE_SHAPE = (6*(ModelConstants.MODEL_RUN_FREQ//ModelConstants.MODEL_CONTEXT_FREQ + 1), 128, 256)
 assert IMG_QUEUE_SHAPE[0] == 30
 
+CUSTOM_PATH_MODE = os.getenv("CUSTOM_PATH_MODE", "off").strip().lower()
+CUSTOM_RIGHT_TURN_RADIUS_M = float(os.getenv("CUSTOM_RIGHT_TURN_RADIUS_M", "40.0"))
+CUSTOM_RIGHT_TURN_SIGN = float(os.getenv("CUSTOM_RIGHT_TURN_SIGN", "1.0"))
+
+POS_X_COL = Plan.POSITION.start + 0
+POS_Y_COL = Plan.POSITION.start + 1
+POS_Z_COL = Plan.POSITION.start + 2
+YAW_COL = Plan.T_FROM_CURRENT_EULER.start + 2
+YAW_RATE_COL = Plan.ORIENTATION_RATE.start + 2
+
+
+def apply_custom_lateral_plan(model_output: dict[str, np.ndarray], mode: str, v_ego: float) -> None:
+  if mode not in ("straight", "right_turn"):
+    return
+
+  plan = model_output["plan"][0]
+  t = np.asarray(ModelConstants.T_IDXS, dtype=np.float32)
+  speed = max(float(v_ego), 1.0)
+
+  if mode == "straight":
+    x = speed * t
+    y = np.zeros_like(t)
+    yaw = np.zeros_like(t)
+    yaw_rate = np.zeros_like(t)
+  else:
+    radius = max(CUSTOM_RIGHT_TURN_RADIUS_M, 8.0)
+    sign = 1.0 if CUSTOM_RIGHT_TURN_SIGN >= 0.0 else -1.0
+    kappa = np.clip(sign / radius, -0.12, 0.12)
+
+    theta = kappa * speed * t
+    if abs(kappa) < 1e-6:
+      x = speed * t
+      y = np.zeros_like(t)
+    else:
+      x = np.sin(theta) / kappa
+      y = (1.0 - np.cos(theta)) / kappa
+
+    yaw = theta
+    yaw_rate = np.full_like(t, kappa * speed)
+
+  plan[:, POS_X_COL] = x
+  plan[:, POS_Y_COL] = y
+  plan[:, POS_Z_COL] = 0.0
+  plan[:, YAW_COL] = yaw
+  plan[:, YAW_RATE_COL] = yaw_rate
+
 
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
                           lat_action_t: float, long_action_t: float, v_ego: float) -> log.ModelDataV2.Action:
@@ -302,6 +348,8 @@ def main(demo=False):
   # TODO Move smooth seconds to action function
   long_delay = CP.longitudinalActuatorDelay + LONG_SMOOTH_SECONDS
   prev_action = log.ModelDataV2.Action()
+  if CUSTOM_PATH_MODE in ("straight", "right_turn"):
+    cloudlog.warning(f"custom lateral path mode enabled: {CUSTOM_PATH_MODE}")
 
   DH = DesireHelper()
 
@@ -388,6 +436,7 @@ def main(demo=False):
       drivingdata_send = messaging.new_message('drivingModelData')
       posenet_send = messaging.new_message('cameraOdometry')
 
+      apply_custom_lateral_plan(model_output, CUSTOM_PATH_MODE, v_ego)
       action = get_action_from_model(model_output, prev_action, lat_delay + DT_MDL, long_delay + DT_MDL, v_ego)
       prev_action = action
       fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
