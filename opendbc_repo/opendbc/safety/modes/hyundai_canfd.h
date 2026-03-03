@@ -48,9 +48,6 @@
 static bool hyundai_canfd_alt_buttons = false;
 static bool hyundai_canfd_lka_steering_alt = false;
 
-static unsigned int hyundai_canfd_get_lka_addr(void) {
-  return hyundai_canfd_lka_steering_alt ? 0x110U : 0x50U;
-}
 
 static uint8_t hyundai_canfd_get_counter(const CANPacket_t *msg) {
   uint8_t ret = 0;
