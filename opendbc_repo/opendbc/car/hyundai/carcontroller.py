@@ -1,6 +1,7 @@
 import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import Bus, DT_CTRL, make_tester_present_msg, structs
+from opendbc.car.lateral import common_fault_avoidance
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.hyundai import hyundaicanfd, hyundaican
 from opendbc.car.hyundai.hyundaicanfd import CanBus
@@ -10,6 +11,11 @@ from opendbc.car.interfaces import CarControllerBase
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 LongCtrlState = structs.CarControl.Actuators.LongControlState
 
+# EPS faults if you apply torque while the steering angle is above 90 degrees for more than 1 second
+# All slightly below EPS thresholds to avoid fault
+MAX_ANGLE = 85
+MAX_ANGLE_FRAMES = 89
+MAX_ANGLE_CONSECUTIVE_FRAMES = 2
 
 
 def process_hud_alert(enabled, fingerprint, hud_control):
@@ -42,6 +48,7 @@ class CarController(CarControllerBase):
     self.CAN = CanBus(CP)
     self.params = CarControllerParams(CP)
     self.packer = CANPacker(dbc_names[Bus.pt])
+    self.angle_limit_counter = 0
 
     self.accel_last = 0
     self.apply_torque_last = 0
@@ -55,7 +62,11 @@ class CarController(CarControllerBase):
     # steering torque
     new_torque = int(round(actuators.torque * self.params.STEER_MAX))
     apply_torque = new_torque
-    apply_steer_req = CC.latActive
+
+    # >90 degree steering fault prevention
+    self.angle_limit_counter, apply_steer_req = common_fault_avoidance(abs(CS.out.steeringAngleDeg) >= MAX_ANGLE, CC.latActive,
+                                                                       self.angle_limit_counter, MAX_ANGLE_FRAMES,
+                                                                       MAX_ANGLE_CONSECUTIVE_FRAMES)
 
     if not CC.latActive:
       apply_torque = 0
