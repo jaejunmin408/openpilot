@@ -23,5 +23,5 @@ export STAGING_ROOT="/data/safe_staging"
 export GIT_SSH_COMMAND='ssh -F /data/ssh_config/config'
 
 export CUSTOM_PATH_MODE=right_turn
-export CUSTOM_RIGHT_TURN_RADIUS_M=35
+export CUSTOM_RIGHT_TURN_RADIUS_M=15
 export CUSTOM_RIGHT_TURN_SIGN=1
