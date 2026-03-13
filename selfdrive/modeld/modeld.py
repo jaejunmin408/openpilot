@@ -72,7 +72,7 @@ def apply_custom_lateral_plan(model_output: dict[str, np.ndarray], mode: str, v_
     yaw = np.zeros_like(t)
     yaw_rate = np.zeros_like(t)
   else:
-    radius = max(CUSTOM_RIGHT_TURN_RADIUS_M, 8.0)
+    radius = max(CUSTOM_RIGHT_TURN_RADIUS_M, 1.0)
     sign = 1.0 if CUSTOM_RIGHT_TURN_SIGN >= 0.0 else -1.0
     kappa = np.clip(sign / radius, -0.2, 0.2)
 
