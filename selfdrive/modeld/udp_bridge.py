@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
 UDP Bridge: receives trajectory from external PC via UDP,
-publishes modelV2 and drivingModelData cereal messages
+publishes modelV2, drivingModelData, and cameraOdometry cereal messages
 (replaces modeld in the pipeline).
+
+Key design:
+  - Runs a fixed 20Hz publish loop regardless of UDP arrival
+  - If no UDP packet arrives, re-publishes last known data
+  - Publishes cameraOdometry (dummy) so calibrationd/locationd stay alive
 
 Packet format must match trajectory_sender.py:
   Header (16 bytes): magic(uint32) + seq(uint32) + timestamp(float64)
@@ -24,7 +29,10 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 
 # -- UDP config --
 UDP_PORT = 5005
-RECV_TIMEOUT = 0.1  # seconds
+
+# -- Timing --
+PUBLISH_HZ = 20
+DT = 1.0 / PUBLISH_HZ
 
 # -- Packet format --
 MAGIC = 0x4F505431
@@ -37,22 +45,31 @@ HEADER_SIZE = struct.calcsize(HEADER_FMT)
 ACTION_SIZE = struct.calcsize(ACTION_FMT)
 TRAJ_SIZE = struct.calcsize(TRAJ_FMT)
 
+# Default action/trajectory (straight, stopped)
+DEFAULT_ACTION = {
+  "desired_curvature": 0.0,
+  "desired_acceleration": 0.0,
+  "should_stop": True,
+}
+DEFAULT_TRAJECTORY = {
+  "position_x": np.zeros(ModelConstants.IDX_N, dtype=np.float32),
+  "velocity_x": np.zeros(ModelConstants.IDX_N, dtype=np.float32),
+  "acceleration_x": np.zeros(ModelConstants.IDX_N, dtype=np.float32),
+}
+
 
 def parse_packet(data: bytes):
   """Parse UDP packet into action and trajectory dicts."""
   if len(data) != PACKET_SIZE:
     return None, None, None
 
-  # header
   magic, seq, timestamp = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
   if magic != MAGIC:
     return None, None, None
 
-  # action
   offset = HEADER_SIZE
   curv, accel, stop = struct.unpack(ACTION_FMT, data[offset:offset + ACTION_SIZE])
 
-  # trajectory
   offset += ACTION_SIZE
   traj_flat = struct.unpack(TRAJ_FMT, data[offset:offset + TRAJ_SIZE])
   traj = np.array(traj_flat, dtype=np.float32).reshape(ModelConstants.IDX_N, 3)
@@ -70,6 +87,22 @@ def parse_packet(data: bytes):
   return seq, action, trajectory
 
 
+def fill_camera_odometry(posenet_send, frame_id):
+  """Fill dummy cameraOdometry message for calibrationd/locationd."""
+  posenet_send.valid = True
+  co = posenet_send.cameraOdometry
+  co.frameId = frame_id
+  co.timestampEof = int(time.monotonic() * 1e9)
+  co.trans = [0.0, 0.0, 0.0]
+  co.rot = [0.0, 0.0, 0.0]
+  co.wideFromDeviceEuler = [0.0, 0.0, 0.0]
+  co.roadTransformTrans = [0.0, 0.0, 1.2]  # default road height ~1.2m
+  co.transStd = [1.0, 1.0, 1.0]
+  co.rotStd = [1.0, 1.0, 1.0]
+  co.wideFromDeviceEulerStd = [1.0, 1.0, 1.0]
+  co.roadTransformTransStd = [1.0, 1.0, 1.0]
+
+
 def fill_model_msg_from_udp(modelv2_send, drivingdata_send, action, trajectory, frame_id):
   """Fill cereal modelV2 and drivingModelData messages from UDP data."""
   t_idxs = list(ModelConstants.T_IDXS)
@@ -82,31 +115,25 @@ def fill_model_msg_from_udp(modelv2_send, drivingdata_send, action, trajectory, 
   dmd.frameDropPerc = 0.0
   dmd.modelExecutionTime = 0.0
 
-  # action
   dmd.action.desiredCurvature = action["desired_curvature"]
   dmd.action.desiredAcceleration = action["desired_acceleration"]
   dmd.action.shouldStop = action["should_stop"]
 
-  # poly path (fit polynomial from position data)
   pos_x = trajectory["position_x"]
-  # y and z are zero for now (straight-ahead reference frame)
   pos_y = np.zeros(ModelConstants.IDX_N, dtype=np.float32)
   pos_z = np.zeros(ModelConstants.IDX_N, dtype=np.float32)
 
-  # fit 4th degree polynomial on time
   xyz = np.stack([pos_x, pos_y, pos_z], axis=1)
   coeffs = np.polynomial.polynomial.polyfit(t_idxs, xyz, deg=ModelConstants.POLY_PATH_DEGREE)
   dmd.path.xCoefficients = coeffs[:, 0].tolist()
   dmd.path.yCoefficients = coeffs[:, 1].tolist()
   dmd.path.zCoefficients = coeffs[:, 2].tolist()
 
-  # lane line meta (defaults)
   dmd.laneLineMeta.leftY = 1.8
   dmd.laneLineMeta.leftProb = 0.0
   dmd.laneLineMeta.rightY = -1.8
   dmd.laneLineMeta.rightProb = 0.0
 
-  # meta (defaults)
   dmd.meta.laneChangeState = log.LaneChangeState.off
   dmd.meta.laneChangeDirection = log.LaneChangeDirection.none
 
@@ -119,12 +146,10 @@ def fill_model_msg_from_udp(modelv2_send, drivingdata_send, action, trajectory, 
   mv2.timestampEof = int(time.monotonic() * 1e9)
   mv2.modelExecutionTime = 0.0
 
-  # action (same as drivingModelData)
   mv2.action.desiredCurvature = action["desired_curvature"]
   mv2.action.desiredAcceleration = action["desired_acceleration"]
   mv2.action.shouldStop = action["should_stop"]
 
-  # position (forward distance over time)
   mv2.position.t = t_idxs
   mv2.position.x = pos_x.tolist()
   mv2.position.y = pos_y.tolist()
@@ -133,31 +158,26 @@ def fill_model_msg_from_udp(modelv2_send, drivingdata_send, action, trajectory, 
   mv2.position.yStd = [0.0] * ModelConstants.IDX_N
   mv2.position.zStd = [0.0] * ModelConstants.IDX_N
 
-  # velocity
   mv2.velocity.t = t_idxs
   mv2.velocity.x = trajectory["velocity_x"].tolist()
   mv2.velocity.y = [0.0] * ModelConstants.IDX_N
   mv2.velocity.z = [0.0] * ModelConstants.IDX_N
 
-  # acceleration
   mv2.acceleration.t = t_idxs
   mv2.acceleration.x = trajectory["acceleration_x"].tolist()
   mv2.acceleration.y = [0.0] * ModelConstants.IDX_N
   mv2.acceleration.z = [0.0] * ModelConstants.IDX_N
 
-  # orientation (yaw = 0 for straight, can be computed from curvature later)
   mv2.orientation.t = t_idxs
   mv2.orientation.x = [0.0] * ModelConstants.IDX_N
   mv2.orientation.y = [0.0] * ModelConstants.IDX_N
   mv2.orientation.z = [0.0] * ModelConstants.IDX_N
 
-  # orientation rate
   mv2.orientationRate.t = t_idxs
   mv2.orientationRate.x = [0.0] * ModelConstants.IDX_N
   mv2.orientationRate.y = [0.0] * ModelConstants.IDX_N
   mv2.orientationRate.z = [0.0] * ModelConstants.IDX_N
 
-  # lane lines (4 lines, default positions)
   mv2.init('laneLines', 4)
   default_y_offsets = [3.6, 1.8, -1.8, -3.6]
   for i in range(4):
@@ -169,7 +189,6 @@ def fill_model_msg_from_udp(modelv2_send, drivingdata_send, action, trajectory, 
   mv2.laneLineStds = [0.0, 0.0, 0.0, 0.0]
   mv2.laneLineProbs = [0.0, 0.0, 0.0, 0.0]
 
-  # road edges (2 edges)
   mv2.init('roadEdges', 2)
   default_edge_y = [5.0, -5.0]
   for i in range(2):
@@ -180,7 +199,6 @@ def fill_model_msg_from_udp(modelv2_send, drivingdata_send, action, trajectory, 
     re.z = [0.0] * ModelConstants.IDX_N
   mv2.roadEdgeStds = [1.0, 1.0]
 
-  # leads (3 leads, no detection)
   lead_t_idxs = list(ModelConstants.LEAD_T_IDXS)
   n_lead = len(lead_t_idxs)
   mv2.init('leadsV3', 3)
@@ -198,7 +216,6 @@ def fill_model_msg_from_udp(modelv2_send, drivingdata_send, action, trajectory, 
     lead.prob = 0.0
     lead.probTime = ModelConstants.LEAD_T_OFFSETS[i]
 
-  # meta
   meta = mv2.meta
   meta.desireState = [0.0] * ModelConstants.DESIRE_LEN
   meta.desirePrediction = [0.0] * (ModelConstants.DESIRE_PRED_LEN * ModelConstants.DESIRE_PRED_WIDTH)
@@ -217,13 +234,11 @@ def fill_model_msg_from_udp(modelv2_send, drivingdata_send, action, trajectory, 
   dp.brake3MetersPerSecondSquaredProbs = [0.0] * n_meta
   dp.brake4MetersPerSecondSquaredProbs = [0.0] * n_meta
   dp.brake5MetersPerSecondSquaredProbs = [0.0] * n_meta
-  dp.gasPressProbs = [1.0] * n_meta  # allow throttle
+  dp.gasPressProbs = [1.0] * n_meta
   dp.brakePressProbs = [0.0] * n_meta
 
-  # confidence
   mv2.confidence = log.ModelDataV2.ConfidenceClass.green
 
-  # mark valid
   modelv2_send.valid = True
   drivingdata_send.valid = True
 
@@ -232,47 +247,90 @@ def main():
   cloudlog.warning("udp_bridge init")
   config_realtime_process(7, 54)
 
-  pm = PubMaster(["modelV2", "drivingModelData"])
+  pm = PubMaster(["modelV2", "drivingModelData", "cameraOdometry"])
 
-  # UDP socket
+  # UDP socket (non-blocking)
   sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
   sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
   sock.bind(("0.0.0.0", UDP_PORT))
-  sock.settimeout(RECV_TIMEOUT)
+  sock.setblocking(False)
 
   cloudlog.warning(f"udp_bridge listening on port {UDP_PORT}, packet size={PACKET_SIZE} bytes")
+  cloudlog.warning(f"udp_bridge: waiting for UDP connection from external PC...")
 
   frame_id = 0
   last_log_time = time.monotonic()
+  start_time = time.monotonic()
+  last_seq = -1
+  udp_connected = False
+  waiting_log_count = 0
+
+  # start with safe defaults (stopped)
+  current_action = DEFAULT_ACTION
+  current_trajectory = DEFAULT_TRAJECTORY
 
   while True:
-    try:
-      data, addr = sock.recvfrom(PACKET_SIZE + 64)  # small buffer margin
-    except socket.timeout:
-      continue
+    t_start = time.monotonic()
 
-    seq, action, trajectory = parse_packet(data)
-    if seq is None:
-      cloudlog.error(f"udp_bridge: invalid packet from {addr}, size={len(data)}")
-      continue
+    # drain all pending UDP packets, keep the latest
+    got_new = False
+    while True:
+      try:
+        data, addr = sock.recvfrom(PACKET_SIZE + 64)
+      except BlockingIOError:
+        break
 
-    # build and publish cereal messages
+      seq, action, trajectory = parse_packet(data)
+      if seq is not None:
+        current_action = action
+        current_trajectory = trajectory
+        last_seq = seq
+        got_new = True
+        if not udp_connected:
+          elapsed_wait = time.monotonic() - start_time
+          cloudlog.warning(f"udp_bridge: === UDP CONNECTED === from {addr} (waited {elapsed_wait:.1f}s)")
+          cloudlog.warning(f"udp_bridge: first packet seq={seq} "
+                           f"curv={action['desired_curvature']:.4f} "
+                           f"accel={action['desired_acceleration']:.2f} "
+                           f"stop={action['should_stop']}")
+          udp_connected = True
+
+    # log waiting status every 2 seconds before connection
+    if not udp_connected:
+      now = time.monotonic()
+      if now - last_log_time > 2.0:
+        waiting_log_count += 1
+        elapsed_wait = now - start_time
+        cloudlog.warning(f"udp_bridge: waiting for UDP... ({elapsed_wait:.0f}s elapsed, publishing defaults at {PUBLISH_HZ}Hz)")
+        last_log_time = now
+
+    # always publish at 20Hz (even without new UDP data)
     modelv2_send = messaging.new_message('modelV2')
     drivingdata_send = messaging.new_message('drivingModelData')
+    posenet_send = messaging.new_message('cameraOdometry')
 
-    fill_model_msg_from_udp(modelv2_send, drivingdata_send, action, trajectory, frame_id)
+    fill_model_msg_from_udp(modelv2_send, drivingdata_send, current_action, current_trajectory, frame_id)
+    fill_camera_odometry(posenet_send, frame_id)
 
     pm.send('modelV2', modelv2_send)
     pm.send('drivingModelData', drivingdata_send)
+    pm.send('cameraOdometry', posenet_send)
 
     frame_id += 1
 
-    # periodic logging
+    # periodic logging after connected
     now = time.monotonic()
-    if now - last_log_time > 5.0:
-      cloudlog.info(f"udp_bridge: seq={seq} frame={frame_id} from {addr} "
-                    f"curv={action['desired_curvature']:.4f} accel={action['desired_acceleration']:.2f}")
+    if udp_connected and now - last_log_time > 5.0:
+      cloudlog.warning(f"udp_bridge [LIVE]: seq={last_seq} frame={frame_id} "
+                       f"curv={current_action['desired_curvature']:.4f} "
+                       f"accel={current_action['desired_acceleration']:.2f} "
+                       f"new_data={got_new}")
       last_log_time = now
+
+    # maintain 20Hz
+    elapsed = time.monotonic() - t_start
+    if elapsed < DT:
+      time.sleep(DT - elapsed)
 
 
 if __name__ == "__main__":
