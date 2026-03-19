@@ -1256,7 +1256,7 @@ struct LongitudinalPlan @0xe00b5b3eba12876c {
   shouldStop @37: Bool;
   allowThrottle @38: Bool;
   allowBrake @39: Bool;
-
+  desiredCurvature @40 :Float32;
 
   solverExecutionTime @35 :Float32;
 
