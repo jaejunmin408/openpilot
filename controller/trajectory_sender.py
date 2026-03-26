@@ -24,7 +24,7 @@ import time
 import threading
 
 # -- Config --
-COMMA_IP = "192.168.217.253"
+COMMA_IP = "10.200.147.253"
 UDP_PORT = 5005
 SEND_HZ = 20
 
@@ -55,13 +55,37 @@ def sender_loop(sock, state: TrajectoryState):
     """20Hz UDP send loop (runs in background thread)."""
     seq = 0
     dt = 1.0 / SEND_HZ
+    log_interval = 5.0  # seconds
+    last_log = time.monotonic()
+    send_errors = 0
+    max_jitter_ms = 0.0
 
     while True:
         t_start = time.monotonic()
         packet = pack_packet(seq, state)
-        sock.sendto(packet, (COMMA_IP, UDP_PORT))
+        try:
+            sock.sendto(packet, (COMMA_IP, UDP_PORT))
+        except OSError as e:
+            send_errors += 1
+            if send_errors <= 3:
+                print(f"  [UDP ERROR] sendto failed: {e}")
         seq += 1
         elapsed = time.monotonic() - t_start
+        jitter_ms = abs(elapsed * 1000 - dt * 1000)
+        if jitter_ms > max_jitter_ms:
+            max_jitter_ms = jitter_ms
+
+        now = time.monotonic()
+        if now - last_log >= log_interval:
+            with state.lock:
+                curv = state.curvature
+                accel = state.acceleration
+                stop = state.should_stop
+            print(f"  [UDP] seq={seq} curv={curv:+.4f} accel={accel:+.2f} stop={stop} "
+                  f"max_jitter={max_jitter_ms:.1f}ms errors={send_errors}")
+            max_jitter_ms = 0.0
+            last_log = now
+
         if elapsed < dt:
             time.sleep(dt - elapsed)
 
