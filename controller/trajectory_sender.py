@@ -1,184 +1,173 @@
 #!/usr/bin/env python3
 """
-External PC → comma UDP control sender
+External PC → comma UDP trajectory replay sender
 
-Interactive commands:
-  straight              - go straight (curvature=0)
-  right <curvature>     - right turn (e.g. "right 0.02")
-  left <curvature>      - left turn  (e.g. "left 0.05")
-  accel <m/s^2>         - set desired acceleration (e.g. "accel 1.0")
-  stop                  - send shouldStop=True, accel=0
-  go                    - resume (shouldStop=False)
-  status                - show current state
-  quit / q              - exit
+Reads a trajectory JSON file (0.1s waypoints), interpolates to 0.05s,
+computes curvature & acceleration, and sends them sequentially via UDP.
 
-Packet format (little-endian):
+Packet format (little-endian) — same as trajectory_sender.py:
   Header (16 bytes):  magic(uint32) + seq(uint32) + timestamp(float64)
   Payload (9 bytes):  desiredCurvature(f32) + acceleration(f32) + shouldStop(uint8)
   Total: 25 bytes per packet
 """
 
+import argparse
+import json
+import math
 import struct
 import socket
 import time
-import threading
 
 # -- Config --
 COMMA_IP = "10.200.147.253"
 UDP_PORT = 5005
-SEND_HZ = 20
+SEND_HZ = 20  # 0.05s interval
 
 MAGIC = 0x4F505431
 HEADER_FMT = "<IId"
 PAYLOAD_FMT = "<ffB"
 
 
-class TrajectoryState:
-    def __init__(self):
-        self.curvature = 0.0
-        self.acceleration = 0.0
-        self.should_stop = False
-        self.lock = threading.Lock()
+def load_waypoints(json_path: str) -> list[dict]:
+    with open(json_path, "r") as f:
+        data = json.load(f)
+    return data["waypoints"]
 
 
-def pack_packet(seq: int, state: TrajectoryState) -> bytes:
-    with state.lock:
-        curvature = state.curvature
-        acceleration = state.acceleration
-        should_stop = state.should_stop
+def compute_commands(waypoints: list[dict]) -> list[dict]:
+    """
+    1. Compute curvature & acceleration from original 0.1s waypoints.
+    2. Interpolate the command values to 0.05s by inserting midpoints (averages).
+    """
+    orig_dt = 0.1
+    n = len(waypoints)
+
+    # Compute speed at each 0.1s segment
+    speeds = []
+    for i in range(n - 1):
+        dx = waypoints[i + 1]["x_m"] - waypoints[i]["x_m"]
+        dy = waypoints[i + 1]["y_m"] - waypoints[i]["y_m"]
+        ds = math.sqrt(dx * dx + dy * dy)
+        speeds.append(ds / orig_dt)
+
+    # Compute curvature & acceleration at each original waypoint
+    orig_commands = []
+    for i in range(n - 1):
+        # curvature = dyaw / ds
+        dyaw = waypoints[i + 1]["yaw_rad"] - waypoints[i]["yaw_rad"]
+        dx = waypoints[i + 1]["x_m"] - waypoints[i]["x_m"]
+        dy = waypoints[i + 1]["y_m"] - waypoints[i]["y_m"]
+        ds = math.sqrt(dx * dx + dy * dy)
+        curvature = dyaw / ds if ds > 1e-6 else 0.0
+
+        # acceleration = dv / dt
+        if i < len(speeds) - 1:
+            accel = (speeds[i + 1] - speeds[i]) / orig_dt
+        else:
+            accel = 0.0
+
+        orig_commands.append({
+            "time_s": waypoints[i]["time_from_t0_s"],
+            "curvature": curvature,
+            "acceleration": accel,
+        })
+
+    # Interpolate commands to 0.05s: [cmd0, avg(cmd0,cmd1), cmd1, avg(cmd1,cmd2), ...]
+    commands = []
+    for i, cmd in enumerate(orig_commands):
+        commands.append({
+            "time_s": cmd["time_s"],
+            "curvature": cmd["curvature"],
+            "acceleration": cmd["acceleration"],
+            "should_stop": False,
+        })
+        if i < len(orig_commands) - 1:
+            nxt = orig_commands[i + 1]
+            commands.append({
+                "time_s": (cmd["time_s"] + nxt["time_s"]) / 2.0,
+                "curvature": (cmd["curvature"] + nxt["curvature"]) / 2.0,
+                "acceleration": (cmd["acceleration"] + nxt["acceleration"]) / 2.0,
+                "should_stop": False,
+            })
+
+    # Final command: stop
+    if commands:
+        commands[-1]["should_stop"] = True
+        commands[-1]["acceleration"] = 0.0
+
+    return commands
+
+
+def pack_packet(seq: int, curvature: float, acceleration: float, should_stop: bool) -> bytes:
     header = struct.pack(HEADER_FMT, MAGIC, seq, time.time())
     payload = struct.pack(PAYLOAD_FMT, curvature, acceleration, int(should_stop))
     return header + payload
 
 
-def sender_loop(sock, state: TrajectoryState):
-    """20Hz UDP send loop (runs in background thread)."""
-    seq = 0
-    dt = 1.0 / SEND_HZ
-    log_interval = 5.0  # seconds
-    last_log = time.monotonic()
-    send_errors = 0
-    max_jitter_ms = 0.0
-
-    while True:
-        t_start = time.monotonic()
-        packet = pack_packet(seq, state)
-        try:
-            sock.sendto(packet, (COMMA_IP, UDP_PORT))
-        except OSError as e:
-            send_errors += 1
-            if send_errors <= 3:
-                print(f"  [UDP ERROR] sendto failed: {e}")
-        seq += 1
-        elapsed = time.monotonic() - t_start
-        jitter_ms = abs(elapsed * 1000 - dt * 1000)
-        if jitter_ms > max_jitter_ms:
-            max_jitter_ms = jitter_ms
-
-        now = time.monotonic()
-        if now - last_log >= log_interval:
-            with state.lock:
-                curv = state.curvature
-                accel = state.acceleration
-                stop = state.should_stop
-            print(f"  [UDP] seq={seq} curv={curv:+.4f} accel={accel:+.2f} stop={stop} "
-                  f"max_jitter={max_jitter_ms:.1f}ms errors={send_errors}")
-            max_jitter_ms = 0.0
-            last_log = now
-
-        if elapsed < dt:
-            time.sleep(dt - elapsed)
-
-
-def print_status(state: TrajectoryState):
-    with state.lock:
-        direction = "straight"
-        if state.curvature > 0:
-            direction = f"left {state.curvature:.4f}"
-        elif state.curvature < 0:
-            direction = f"right {abs(state.curvature):.4f}"
-        print(f"\n  curvature:    {state.curvature:+.4f} ({direction})")
-        print(f"  acceleration: {state.acceleration:+.2f} m/s^2")
-        print(f"  should_stop:  {state.should_stop}\n")
-
-
 def main():
+    parser = argparse.ArgumentParser(description="Replay trajectory as UDP commands")
+    parser.add_argument("json_path", help="Path to trajectory JSON file")
+    parser.add_argument("--ip", default=COMMA_IP, help=f"comma IP (default: {COMMA_IP})")
+    parser.add_argument("--port", type=int, default=UDP_PORT, help=f"UDP port (default: {UDP_PORT})")
+    parser.add_argument("--dry-run", action="store_true", help="Print commands without sending UDP")
+    args = parser.parse_args()
+
+    # Load and process
+    waypoints = load_waypoints(args.json_path)
+    print(f"Loaded {len(waypoints)} waypoints (0.1s interval, {waypoints[-1]['time_from_t0_s']:.1f}s total)")
+
+    commands = compute_commands(waypoints)
+    print(f"Generated {len(commands)} commands (0.05s interval)")
+
+    if not commands:
+        print("No commands to send.")
+        return
+
+    # Setup UDP
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    state = TrajectoryState()
+    target_ip = args.ip
+    target_port = args.port
+    dt = 1.0 / SEND_HZ  # 0.05s
 
-    # start sender thread
-    t = threading.Thread(target=sender_loop, args=(sock, state), daemon=True)
-    t.start()
-
-    print(f"Sending to {COMMA_IP}:{UDP_PORT} at {SEND_HZ}Hz (25-byte packets)")
-    print("Commands: right/left <curv>, straight, accel <val>, stop, go, status, quit")
-    print_status(state)
+    print(f"\n{'[DRY RUN] ' if args.dry_run else ''}Sending to {target_ip}:{target_port} at {SEND_HZ}Hz")
+    print(f"Total duration: {len(commands) * dt:.2f}s")
+    print("Press Ctrl+C to abort\n")
 
     try:
-        while True:
-            try:
-                cmd = input("> ").strip()
-            except EOFError:
-                break
+        time.sleep(1)  # brief pause before starting
+        for seq, cmd in enumerate(commands):
+            t_start = time.monotonic()
 
-            if not cmd:
-                continue
+            packet = pack_packet(seq, cmd["curvature"], cmd["acceleration"], cmd["should_stop"])
 
-            parts = cmd.split()
-            command = parts[0].lower()
+            if not args.dry_run:
+                try:
+                    sock.sendto(packet, (target_ip, target_port))
+                except OSError as e:
+                    print(f"  [UDP ERROR] {e}")
 
-            try:
-                if command in ("quit", "q"):
-                    break
+            # Log every 1 second (every 20 packets)
+            if seq % 20 == 0 or cmd["should_stop"]:
+                elapsed_total = seq * dt
+                print(f"  [{elapsed_total:6.2f}s] seq={seq:4d}  "
+                      f"curv={cmd['curvature']:+.5f}  "
+                      f"accel={cmd['acceleration']:+.3f}  "
+                      f"stop={cmd['should_stop']}")
 
-                elif command == "right":
-                    curv = float(parts[1]) if len(parts) > 1 else 0.02
-                    with state.lock:
-                        state.curvature = abs(curv)
-                    print(f"  -> right turn, curvature={abs(curv):+.4f}")
-
-                elif command == "left":
-                    curv = float(parts[1]) if len(parts) > 1 else 0.02
-                    with state.lock:
-                        state.curvature = -abs(curv)
-                    print(f"  -> left turn, curvature={-abs(curv):+.4f}")
-
-                elif command == "straight":
-                    with state.lock:
-                        state.curvature = 0.0
-                    print("  -> straight, curvature=0")
-
-                elif command == "accel":
-                    val = float(parts[1]) if len(parts) > 1 else 0.0
-                    with state.lock:
-                        state.acceleration = val
-                    print(f"  -> acceleration={val:+.2f} m/s^2")
-
-                elif command == "stop":
-                    with state.lock:
-                        state.should_stop = True
-                        state.acceleration = 0.0
-                    print("  -> STOP")
-
-                elif command == "go":
-                    with state.lock:
-                        state.should_stop = False
-                    print("  -> GO (shouldStop=False)")
-
-                elif command == "status":
-                    print_status(state)
-
-                else:
-                    print(f"  unknown command: {command}")
-                    print("  commands: right/left <curv>, straight, accel <val>, stop, go, status, quit")
-
-            except (ValueError, IndexError):
-                print("  invalid input. example: 'right 0.02', 'accel 1.0'")
+            # Wait for next tick
+            elapsed = time.monotonic() - t_start
+            if elapsed < dt:
+                time.sleep(dt - elapsed)
 
     except KeyboardInterrupt:
-        pass
+        print(f"\n  Aborted at seq={seq}")
+        # Send stop packet
+        if not args.dry_run:
+            stop_pkt = pack_packet(seq + 1, 0.0, 0.0, True)
+            sock.sendto(stop_pkt, (target_ip, target_port))
+            print("  Sent stop packet")
 
-    print("\nStopped.")
+    print("\nDone.")
     sock.close()
 
 
