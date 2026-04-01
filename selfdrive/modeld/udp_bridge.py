@@ -286,8 +286,8 @@ def publish_messages(pm, interp, deriv, action, frame_id, adcm_meta):
     dp.gasPressProbs = [1.0] * n_meta
     dp.brakePressProbs = [0.0] * n_meta
 
-    meta.laneChangeState = log.ModelDataV2.MetaData.LaneChangeState.off
-    meta.laneChangeDirection = log.ModelDataV2.MetaData.LaneChangeDirection.none
+    meta.laneChangeState = log.LaneChangeState.off
+    meta.laneChangeDirection = log.LaneChangeDirection.none
     meta.hardBrakePredicted = False
 
     mv2.confidence = log.ModelDataV2.ConfidenceClass.green
@@ -316,8 +316,8 @@ def publish_messages(pm, interp, deriv, action, frame_id, adcm_meta):
     dmd.laneLineMeta.rightY = 1.8
     dmd.laneLineMeta.rightProb = 0.0
 
-    dmd.meta.laneChangeState = log.ModelDataV2.MetaData.LaneChangeState.off
-    dmd.meta.laneChangeDirection = log.ModelDataV2.MetaData.LaneChangeDirection.none
+    dmd.meta.laneChangeState = log.LaneChangeState.off
+    dmd.meta.laneChangeDirection = log.LaneChangeDirection.none
 
     # ── send ──
     pm.send('modelV2', modelv2_send)
