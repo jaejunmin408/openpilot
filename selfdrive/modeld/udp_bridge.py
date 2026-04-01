@@ -364,7 +364,7 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(('0.0.0.0', UDP_PORT))
-    sock.settimeout(UDP_TIMEOUT_S)
+    sock.setblocking(False)
     cloudlog.warning(f"udp_bridge listening on port {UDP_PORT}")
 
     frame_id = 0
@@ -395,8 +395,6 @@ def main():
                             cur_deriv = compute_derivatives(cur_interp)
                             cur_meta = meta
                             packet_received = True
-        except socket.timeout:
-            pass
         except BlockingIOError:
             pass
 
