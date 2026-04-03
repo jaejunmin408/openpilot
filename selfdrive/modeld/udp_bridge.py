@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
-ADCM UDP Bridge
-Orin ADCM에서 UDP로 전송한 궤적 패킷을 수신하여
-modelV2 / drivingModelData 메시지로 변환/발행한다.
+Alpamayo UDP Bridge
+Alpamayo에서 UDP로 전송한 궤적 패킷을 수신하여
+modelV2 / drivingModelData / longitudinalPlan / driverAssistance 메시지로 변환/발행한다.
 cameraOdometry는 modeld가 카메라 기반으로 발행한다.
+
+패킷 포맷 (PACKET_SPEC.md 참조):
+  Header 44B: magic('ALPA') + version(u16) + flags(u16) + tx_seq(u32) + plan_seq(u32)
+              + sample_id(u32) + source_t0_us(u64) + tx_time_us(u64)
+              + coord_mode(u16) + num_points(u16) + dt_s(f32)
+  Points: num_points x 20B (x_m, y_m, yaw_rad, v_mps, curvature as f32)
+  Trailer 4B: CRC32
 """
 import socket
 import struct
 import time
+import zlib
 import numpy as np
 
 import cereal.messaging as messaging
@@ -22,10 +30,7 @@ from openpilot.selfdrive.controls.lib.drive_helpers import (
 
 # ── 설정 ──────────────────────────────────────────────
 UDP_PORT = 5005
-UDP_TIMEOUT_S = 0.05          # 50 ms
-PACKET_SIZE = 1659
-MAGIC = 0x41444301
-MAX_POINTS = 50
+MAX_POINTS = 64
 
 LONG_SMOOTH_SECONDS = 0.3
 LAT_SMOOTH_SECONDS = 0.0
@@ -35,98 +40,89 @@ T_IDXS = np.array(ModelConstants.T_IDXS, dtype=np.float64)
 X_IDXS = np.array(ModelConstants.X_IDXS, dtype=np.float64)
 IDX_N = ModelConstants.IDX_N   # 33
 
+# Alpamayo 패킷 상수
+ALPA_MAGIC = b'ALPA'
+HEADER_FMT = '<4sHHIIIQQHHf'
+HEADER_SIZE = struct.calcsize(HEADER_FMT)  # 44
+POINT_FMT = '<5f'
+POINT_SIZE = struct.calcsize(POINT_FMT)    # 20
+CRC_SIZE = 4
+
+FLAG_VALID = 1 << 0
+FLAG_END_OF_STREAM = 1 << 2
+
 
 # ── 패킷 파싱 ────────────────────────────────────────
 def parse_packet(data: bytes):
-    """1659 byte ADCM UDP 패킷 파싱.
-    Returns (points, ego, meta) or None on failure.
-      points: (n_valid, 4) float64  -- x, y, yaw, velocity per point
-      ego:    dict  -- ego_x, ego_y, ego_yaw
-      meta:   dict  -- target_accel, drive_mode, emergency, turn_signal
+    """Alpamayo UDP 패킷 파싱.
+    Returns dict with 'x', 'y', 'yaw', 'vel', 'curvature', 'dt_s', 'flags', 'num_points', 'seq'
+    or None on failure.
+    좌표는 이미 로컬(차량 기준)이므로 변환 불필요.
     """
-    if len(data) != PACKET_SIZE:
+    if len(data) < HEADER_SIZE + CRC_SIZE:
         return None
 
-    # Header (16B)
-    magic, seq, timestamp = struct.unpack_from('<IId', data, 0)
-    if magic != MAGIC:
+    # Header
+    hdr = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
+    magic = hdr[0]
+    if magic != ALPA_MAGIC:
         return None
 
-    offset = 16
+    flags = hdr[2]
+    tx_seq = hdr[3]
+    num_points = hdr[9]
+    dt_s = hdr[10]
 
-    # Points (1600B = 50 x 4 x float64)
-    points = np.frombuffer(data, dtype=np.float64, count=MAX_POINTS * 4, offset=offset).reshape(MAX_POINTS, 4).copy()
-    offset += MAX_POINTS * 4 * 8
+    # 패킷 크기 검증
+    expected_size = HEADER_SIZE + num_points * POINT_SIZE + CRC_SIZE
+    if len(data) != expected_size:
+        return None
 
-    # Ego (24B)
-    ego_x, ego_y, ego_yaw = struct.unpack_from('<ddd', data, offset)
-    offset += 24
+    # CRC32 검증
+    crc_expected = struct.unpack('<I', data[-CRC_SIZE:])[0]
+    crc_actual = zlib.crc32(data[:-CRC_SIZE]) & 0xFFFFFFFF
+    if crc_actual != crc_expected:
+        return None
 
-    # Meta (18B): target_accel(8) + drive_mode(1) + emergency(8) + turn_signal(1)
-    target_accel = struct.unpack_from('<d', data, offset)[0]
-    offset += 8
-    drive_mode = struct.unpack_from('<?', data, offset)[0]
-    offset += 1
-    emergency = struct.unpack_from('<d', data, offset)[0]
-    offset += 8
-    turn_signal = struct.unpack_from('<B', data, offset)[0]
-    offset += 1
+    if num_points == 0:
+        return None
 
-    # Footer (1B)
-    n_valid = struct.unpack_from('<B', data, offset)[0]
-    n_valid = min(n_valid, MAX_POINTS)
+    # 포인트 파싱 (float32 x 5 per point)
+    points_data = np.frombuffer(data, dtype=np.float32,
+                                count=num_points * 5,
+                                offset=HEADER_SIZE).reshape(num_points, 5).copy()
 
-    ego = {'x': ego_x, 'y': ego_y, 'yaw': ego_yaw}
-    meta = {
-        'target_accel': target_accel,
-        'drive_mode': drive_mode,
-        'emergency': emergency,
-        'turn_signal': turn_signal,
-        'n_valid': n_valid,
-        'seq': seq,
-        'timestamp': timestamp,
+    return {
+        'x': points_data[:, 0],           # meters, local frame
+        'y': points_data[:, 1],           # meters, local frame
+        'yaw': points_data[:, 2],         # radians
+        'vel': points_data[:, 3],         # m/s
+        'curvature': points_data[:, 4],   # 1/m
+        'dt_s': dt_s,
+        'num_points': num_points,
+        'flags': flags,
+        'seq': tx_seq,
     }
-    return points[:n_valid], ego, meta
-
-
-# ── 좌표 변환 ────────────────────────────────────────
-def to_relative(points: np.ndarray, ego: dict):
-    """글로벌 좌표 -> 차량 기준 좌표 변환."""
-    dx = points[:, 0] - ego['x']
-    dy = points[:, 1] - ego['y']
-    c = np.cos(-ego['yaw'])
-    s = np.sin(-ego['yaw'])
-    rel_x = dx * c - dy * s
-    rel_y = dx * s + dy * c
-    rel_yaw = points[:, 2] - ego['yaw']
-    velocity = points[:, 3]
-    return rel_x, rel_y, rel_yaw, velocity
-
-
-# ── 시간축 생성 ──────────────────────────────────────
-def build_cumulative_time(rel_x: np.ndarray, rel_y: np.ndarray, velocity: np.ndarray):
-    """거리 + 속도 -> 누적 시간 배열 생성."""
-    n = len(rel_x)
-    cum_time = np.zeros(n, dtype=np.float64)
-    for i in range(1, n):
-        ds = np.hypot(rel_x[i] - rel_x[i - 1], rel_y[i] - rel_y[i - 1])
-        v_avg = max((velocity[i] + velocity[i - 1]) / 2.0, 0.1)
-        cum_time[i] = cum_time[i - 1] + ds / v_avg
-    return cum_time
 
 
 # ── T_IDXS 보간 ──────────────────────────────────────
-def interpolate_to_tidxs(rel_x, rel_y, rel_yaw, velocity, cum_time):
-    """원본 포인트를 T_IDXS 33개로 보간."""
-    ix = np.interp(T_IDXS, cum_time, rel_x)
-    iy = np.interp(T_IDXS, cum_time, rel_y)
-    iyaw = np.interp(T_IDXS, cum_time, rel_yaw)
-    ivel = np.interp(T_IDXS, cum_time, velocity)
+def interpolate_to_tidxs(packet):
+    """Alpamayo 포인트(등간격 dt_s)를 T_IDXS 33개로 보간."""
+    n = packet['num_points']
+    dt_s = packet['dt_s']
+    # 시간축: [0, dt_s, 2*dt_s, ...]
+    src_time = np.arange(n, dtype=np.float64) * dt_s
+
+    ix = np.interp(T_IDXS, src_time, packet['x']).astype(np.float32)
+    iy = np.interp(T_IDXS, src_time, packet['y']).astype(np.float32)
+    iyaw = np.interp(T_IDXS, src_time, packet['yaw']).astype(np.float32)
+    ivel = np.interp(T_IDXS, src_time, packet['vel']).astype(np.float32)
+
     return {
-        'x': ix.astype(np.float32),
-        'y': iy.astype(np.float32),
-        'yaw': iyaw.astype(np.float32),
-        'vel': ivel.astype(np.float32),
+        'x': ix,
+        'y': iy,
+        'yaw': iyaw,
+        'vel': ivel,
     }
 
 
@@ -150,7 +146,7 @@ def compute_derivatives(interp: dict):
 
 
 # ── action 계산 ──────────────────────────────────────
-def compute_action(interp, deriv, prev_action, v_ego, lat_delay, long_delay, adcm_meta):
+def compute_action(interp, deriv, prev_action, v_ego, lat_delay, long_delay, flags):
     """desiredCurvature, desiredAcceleration, shouldStop 계산."""
     plan_vel_x = deriv['vx']
     plan_acc_x = deriv['ax']
@@ -163,7 +159,8 @@ def compute_action(interp, deriv, prev_action, v_ego, lat_delay, long_delay, adc
     )
     desired_accel = smooth_value(desired_accel, prev_action.desiredAcceleration, LONG_SMOOTH_SECONDS)
 
-    if not adcm_meta['drive_mode'] or adcm_meta['n_valid'] == 0:
+    # FLAG_VALID가 없거나 END_OF_STREAM이면 정지
+    if not (flags & FLAG_VALID) or (flags & FLAG_END_OF_STREAM):
         should_stop = True
 
     # 횡방향
@@ -196,7 +193,7 @@ def fill_xyzt(builder, t, x, y, z, x_std=None, y_std=None, z_std=None):
         builder.zStd = z_std.tolist()
 
 
-def publish_messages(pm, interp, deriv, action, frame_id, adcm_meta, v_ego):
+def publish_messages(pm, interp, deriv, action, frame_id, v_ego):
     """modelV2 + drivingModelData + longitudinalPlan + driverAssistance 발행."""
     now_ns = int(time.monotonic() * 1e9)
     t_list = ModelConstants.T_IDXS
@@ -359,59 +356,42 @@ def get_default_deriv():
         'yaw_rate': np.zeros(IDX_N, dtype=np.float32),
     }
 
-DEFAULT_META = {
-    'target_accel': 0.0,
-    'drive_mode': False,
-    'emergency': 0.0,
-    'turn_signal': 0,
-    'n_valid': 0,
-    'seq': 0,
-    'timestamp': 0.0,
-}
-
 
 # ── main ──────────────────────────────────────────────
 def main():
-    cloudlog.warning("udp_bridge init")
+    cloudlog.warning("udp_bridge init (Alpamayo mode)")
 
     pm = PubMaster(["modelV2", "drivingModelData", "longitudinalPlan", "driverAssistance"])
     sm = SubMaster(["carState", "carControl", "liveDelay"])
 
-    # UDP 소켓 설정
+    # UDP 소켓 설정 (non-blocking)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(('0.0.0.0', UDP_PORT))
     sock.setblocking(False)
-    cloudlog.warning(f"udp_bridge listening on port {UDP_PORT}")
+    cloudlog.warning(f"udp_bridge listening on port {UDP_PORT} (Alpamayo packet format)")
 
     frame_id = 0
     prev_action = log.ModelDataV2.Action()
 
     cur_interp = get_default_interp()
     cur_deriv = get_default_deriv()
-    cur_meta = DEFAULT_META.copy()
+    cur_flags = 0
 
     loop_period = 1.0 / ModelConstants.MODEL_RUN_FREQ  # 50ms = 20Hz
 
     while True:
         loop_start = time.monotonic()
 
-        # 1. UDP 패킷 수신 (timeout 내에 최신 패킷 사용)
-        packet_received = False
+        # 1. UDP 패킷 수신 (non-blocking, 최신 패킷만 사용)
         try:
             while True:
-                data, addr = sock.recvfrom(2048)
-                result = parse_packet(data)
-                if result is not None:
-                    points, ego, meta = result
-                    if meta['n_valid'] >= 2:
-                        rel_x, rel_y, rel_yaw, velocity = to_relative(points, ego)
-                        cum_time = build_cumulative_time(rel_x, rel_y, velocity)
-                        if cum_time[-1] > 0.1:
-                            cur_interp = interpolate_to_tidxs(rel_x, rel_y, rel_yaw, velocity, cum_time)
-                            cur_deriv = compute_derivatives(cur_interp)
-                            cur_meta = meta
-                            packet_received = True
+                data, addr = sock.recvfrom(HEADER_SIZE + MAX_POINTS * POINT_SIZE + CRC_SIZE + 64)
+                packet = parse_packet(data)
+                if packet is not None and packet['num_points'] >= 2:
+                    cur_interp = interpolate_to_tidxs(packet)
+                    cur_deriv = compute_derivatives(cur_interp)
+                    cur_flags = packet['flags']
         except BlockingIOError:
             pass
 
@@ -428,11 +408,11 @@ def main():
 
         # 3. action 계산
         action = compute_action(cur_interp, cur_deriv, prev_action,
-                                v_ego, lat_delay, long_delay, cur_meta)
+                                v_ego, lat_delay, long_delay, cur_flags)
         prev_action = action
 
         # 4. 메시지 발행
-        publish_messages(pm, cur_interp, cur_deriv, action, frame_id, cur_meta, v_ego)
+        publish_messages(pm, cur_interp, cur_deriv, action, frame_id, v_ego)
 
         frame_id += 1
 
