@@ -1,0 +1,15 @@
+{
+  "chunk_id": 11,
+  "num_samples": 597,
+  "plan_dt_s": 0.10000000149011612,
+  "plan_points": 64,
+  "plan_horizon_s": 6.3000000938773155,
+  "control_dt_default_s": 0.02,
+  "control_points_default": 25,
+  "control_horizon_s": 0.5,
+  "coord_mode_default": "local",
+  "plan_bank_npz": "/root/TensorRT-Edge-LLM-v060/output/deliverables/control_team/chunk0011_udp_replay_package/chunk0011_model_plan_bank.npz",
+  "preview_json": "/root/TensorRT-Edge-LLM-v060/output/deliverables/control_team/chunk0011_udp_replay_package/packet_preview_first_packets.json",
+  "viewer_dir": "/root/TensorRT-Edge-LLM-v060/output/dashboards/real_rutuime/chunk0011_model_timeline_replay",
+  "viewer_html": "/root/TensorRT-Edge-LLM-v060/output/dashboards/real_rutuime/chunk0011_model_timeline_replay/chunk0011_model_timeline_viewer.html"
+}

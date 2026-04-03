@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Chunk Model Timeline Replay</title>
+  <style>
+    :root {
+      --bg: #f6f2e8;
+      --panel: rgba(255,255,255,0.94);
+      --ink: #202124;
+      --muted: #6e695f;
+      --line: #dccfb9;
+    }
+    body {
+      margin: 0;
+      padding: 18px;
+      background: radial-gradient(circle at top right, #fffaf1 0%, var(--bg) 62%);
+      color: var(--ink);
+      font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 440px 1fr;
+      gap: 18px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 16px;
+      box-shadow: 0 18px 38px rgba(80, 63, 27, 0.08);
+    }
+    .images {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .image-card img {
+      width: 100%;
+      border-radius: 12px;
+      display: block;
+      border: 1px solid rgba(0, 0, 0, 0.08);
+    }
+    .label {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .plots {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+    canvas {
+      width: 100%;
+      height: 420px;
+      border-radius: 14px;
+      background: #fffdf8;
+      border: 1px solid rgba(0, 0, 0, 0.08);
+    }
+    .controls {
+      display: grid;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    input[type=range] {
+      width: 100%;
+    }
+    button {
+      border: 1px solid var(--line);
+      background: #fff;
+      border-radius: 999px;
+      padding: 8px 14px;
+      cursor: pointer;
+    }
+    .meta {
+      font-size: 14px;
+      line-height: 1.55;
+      color: var(--ink);
+      white-space: pre-line;
+    }
+    .legend {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .swatch {
+      display: inline-block;
+      width: 18px;
+      height: 3px;
+      vertical-align: middle;
+      margin-right: 6px;
+      border-radius: 999px;
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <div class="panel">
+      <h2 id="title">Chunk Model Timeline Replay</h2>
+      <div class="controls">
+        <div>
+          <input id="slider" type="range" min="0" max="0" value="0" />
+        </div>
+        <div class="row">
+          <button id="play">Play</button>
+          <button id="prev">Prev</button>
+          <button id="next">Next</button>
+          <span id="counter"></span>
+        </div>
+        <div class="legend">
+          <span><span class="swatch" style="background:#6d7b8d"></span>history</span>
+          <span><span class="swatch" style="background:#1f77b4"></span>model plan</span>
+          <span><span class="swatch" style="background:#d62728"></span>50Hz packet</span>
+          <span><span class="swatch" style="background:#333"></span>ego now</span>
+        </div>
+      </div>
+      <div id="meta" class="meta"></div>
+      <div class="images" style="margin-top:14px">
+        <div class="image-card"><div class="label">Front Left</div><img id="img-0" /></div>
+        <div class="image-card"><div class="label">Front</div><img id="img-1" /></div>
+        <div class="image-card"><div class="label">Front Right</div><img id="img-2" /></div>
+        <div class="image-card"><div class="label">Front Tele</div><img id="img-6" /></div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="plots">
+        <div>
+          <div class="label">World ENU Replay</div>
+          <canvas id="world"></canvas>
+        </div>
+        <div>
+          <div class="label">Local Control View</div>
+          <canvas id="local"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script>
+    const dataUrl = "chunk0011_model_viewer_data.json";
+    const worldCanvas = document.getElementById("world");
+    const localCanvas = document.getElementById("local");
+    const slider = document.getElementById("slider");
+    const playBtn = document.getElementById("play");
+    const prevBtn = document.getElementById("prev");
+    const nextBtn = document.getElementById("next");
+    const counter = document.getElementById("counter");
+    const meta = document.getElementById("meta");
+    const title = document.getElementById("title");
+    let payload = null;
+    let idx = 0;
+    let timer = null;
+
+    function fitCanvas(canvas) {
+      const ratio = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.round(rect.width * ratio);
+      canvas.height = Math.round(rect.height * ratio);
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      return ctx;
+    }
+
+    function project(pt, bounds, width, height, pad) {
+      const w = bounds.max_x - bounds.min_x || 1;
+      const h = bounds.max_y - bounds.min_y || 1;
+      const sx = (width - pad * 2) / w;
+      const sy = (height - pad * 2) / h;
+      const s = Math.min(sx, sy);
+      const ox = pad + (width - pad * 2 - w * s) * 0.5;
+      const oy = pad + (height - pad * 2 - h * s) * 0.5;
+      return [ox + (pt[0] - bounds.min_x) * s, height - (oy + (pt[1] - bounds.min_y) * s)];
+    }
+
+    function drawPolyline(ctx, pts, bounds, color, width, dash) {
+      if (!pts || pts.length === 0) return;
+      const rect = ctx.canvas.getBoundingClientRect();
+      const pad = 22;
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.setLineDash(dash || []);
+      ctx.beginPath();
+      pts.forEach((pt, i) => {
+        const [x, y] = project(pt, bounds, rect.width, rect.height, pad);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawDot(ctx, pt, bounds, color, radius) {
+      const rect = ctx.canvas.getBoundingClientRect();
+      const pad = 22;
+      const [x, y] = project(pt, bounds, rect.width, rect.height, pad);
+      ctx.save();
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(x, y, radius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    function clearCanvas(ctx) {
+      const rect = ctx.canvas.getBoundingClientRect();
+      ctx.clearRect(0, 0, rect.width, rect.height);
+      ctx.fillStyle = "#fffdf8";
+      ctx.fillRect(0, 0, rect.width, rect.height);
+    }
+
+    function localBounds() {
+      const e = payload.local_extent_m || 1;
+      return { min_x: -e, max_x: e, min_y: -e, max_y: e };
+    }
+
+    function render() {
+      const sample = payload.samples[idx];
+      slider.value = String(idx);
+      counter.textContent = `${idx + 1} / ${payload.samples.length}`;
+
+      meta.textContent =
+        `chunk: ${payload.chunk_id}
+` +
+        `sample_id: ${sample.sample_id}
+` +
+        `t_rel: ${sample.t_rel_s.toFixed(2)} s
+` +
+        `t0_us: ${sample.t0_us}
+` +
+        `plan_dt: ${sample.plan_dt_s.toFixed(2)} s
+` +
+        `control: ${payload.control_points} pts @ ${payload.control_dt_s.toFixed(2)} s
+` +
+        `output_text: ${sample.output_text ?? ""}`;
+
+      for (const camId of [0, 1, 2, 6]) {
+        document.getElementById(`img-${camId}`).src = sample.images[String(camId)];
+      }
+
+      const worldCtx = fitCanvas(worldCanvas);
+      clearCanvas(worldCtx);
+      drawPolyline(worldCtx, payload.world_path_t0_xy, payload.world_bounds, "#d6d0c5", 2.0, []);
+      drawPolyline(worldCtx, sample.history_world_xy, payload.world_bounds, "#6d7b8d", 2.2, [6, 4]);
+      drawPolyline(worldCtx, sample.plan_world_xy, payload.world_bounds, "#1f77b4", 2.6, []);
+      drawPolyline(worldCtx, sample.packet_world_xy, payload.world_bounds, "#d62728", 3.2, []);
+      drawDot(worldCtx, sample.history_world_xy[sample.history_world_xy.length - 1], payload.world_bounds, "#222", 4.2);
+
+      const localCtx = fitCanvas(localCanvas);
+      clearCanvas(localCtx);
+      const lb = localBounds();
+      drawPolyline(localCtx, sample.history_local_xy, lb, "#6d7b8d", 2.2, [6, 4]);
+      drawPolyline(localCtx, sample.plan_local_xy, lb, "#1f77b4", 2.6, []);
+      drawPolyline(localCtx, sample.packet_local_xy, lb, "#d62728", 3.2, []);
+      drawDot(localCtx, [0, 0], lb, "#222", 4.2);
+    }
+
+    function setIndex(next) {
+      idx = Math.max(0, Math.min(payload.samples.length - 1, next));
+      render();
+    }
+
+    function togglePlay() {
+      if (timer) {
+        window.clearInterval(timer);
+        timer = null;
+        playBtn.textContent = "Play";
+      } else {
+        timer = window.setInterval(() => {
+          if (idx >= payload.samples.length - 1) {
+            togglePlay();
+            return;
+          }
+          setIndex(idx + 1);
+        }, 100);
+        playBtn.textContent = "Pause";
+      }
+    }
+
+    fetch(dataUrl)
+      .then((resp) => resp.json())
+      .then((data) => {
+        payload = data;
+        title.textContent = `Chunk ${String(payload.chunk_id).padStart(4, "0")} Model Timeline Replay`;
+        slider.max = String(payload.samples.length - 1);
+        slider.addEventListener("input", (ev) => setIndex(Number(ev.target.value)));
+        playBtn.addEventListener("click", togglePlay);
+        prevBtn.addEventListener("click", () => setIndex(idx - 1));
+        nextBtn.addEventListener("click", () => setIndex(idx + 1));
+        window.addEventListener("resize", render);
+        render();
+      })
+      .catch((err) => {
+        meta.textContent = `Failed to load viewer data: ${err}`;
+      });
+  </script>
+</body>
+</html>
