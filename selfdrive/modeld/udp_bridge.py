@@ -196,8 +196,8 @@ def fill_xyzt(builder, t, x, y, z, x_std=None, y_std=None, z_std=None):
         builder.zStd = z_std.tolist()
 
 
-def publish_messages(pm, interp, deriv, action, frame_id, adcm_meta):
-    """modelV2 + drivingModelData 발행. (cameraOdometry는 modeld가 담당)"""
+def publish_messages(pm, interp, deriv, action, frame_id, adcm_meta, v_ego):
+    """modelV2 + drivingModelData + longitudinalPlan + driverAssistance 발행."""
     now_ns = int(time.monotonic() * 1e9)
     t_list = ModelConstants.T_IDXS
 
@@ -319,9 +319,26 @@ def publish_messages(pm, interp, deriv, action, frame_id, adcm_meta):
     dmd.meta.laneChangeState = log.LaneChangeState.off
     dmd.meta.laneChangeDirection = log.LaneChangeDirection.none
 
+    # ── longitudinalPlan ──
+    plan_send = messaging.new_message('longitudinalPlan')
+    plan_send.valid = True
+    lp = plan_send.longitudinalPlan
+    lp.aTarget = float(action.desiredAcceleration)
+    lp.shouldStop = bool(action.shouldStop)
+    lp.allowBrake = True
+    lp.allowThrottle = True
+    lp.hasLead = False
+    lp.speeds = [float(v_ego)]
+
+    # ── driverAssistance ──
+    assist_send = messaging.new_message('driverAssistance')
+    assist_send.valid = True
+
     # ── send ──
     pm.send('modelV2', modelv2_send)
     pm.send('drivingModelData', dmd_send)
+    pm.send('longitudinalPlan', plan_send)
+    pm.send('driverAssistance', assist_send)
 
 
 # ── 기본 보간 결과 (패킷 수신 전 또는 실패 시) ────────
@@ -357,7 +374,7 @@ DEFAULT_META = {
 def main():
     cloudlog.warning("udp_bridge init")
 
-    pm = PubMaster(["modelV2", "drivingModelData"])
+    pm = PubMaster(["modelV2", "drivingModelData", "longitudinalPlan", "driverAssistance"])
     sm = SubMaster(["carState", "carControl", "liveDelay"])
 
     # UDP 소켓 설정
@@ -414,8 +431,8 @@ def main():
                                 v_ego, lat_delay, long_delay, cur_meta)
         prev_action = action
 
-        # 4. 메시지 발행 (modelV2 + drivingModelData only)
-        publish_messages(pm, cur_interp, cur_deriv, action, frame_id, cur_meta)
+        # 4. 메시지 발행
+        publish_messages(pm, cur_interp, cur_deriv, action, frame_id, cur_meta, v_ego)
 
         frame_id += 1
 

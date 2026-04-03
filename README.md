@@ -1,111 +1,206 @@
-<div align="center" style="text-align: center;">
+# openpilot External AI Control Fork
 
-<h1>openpilot</h1>
+외부 AI(AlphaMayo)가 생성한 주행 경로를 실제 차량(Hyundai Ioniq 5)에서 추종하도록 openpilot의 제어 모듈만을 활용하는 프로젝트입니다.
 
-<p>
-  <b>openpilot is an operating system for robotics.</b>
-  <br>
-  Currently, it upgrades the driver assistance system in 300+ supported cars.
-</p>
+openpilot의 인지/판단 기능을 제거하고, 외부 PC에서 수신한 경로 명령을 CAN 통신을 통해 차량의 횡/종방향을 직접 제어하는 구조로 재설계하였습니다.
 
-<h3>
-  <a href="https://docs.comma.ai">Docs</a>
-  <span> · </span>
-  <a href="https://docs.comma.ai/contributing/roadmap/">Roadmap</a>
-  <span> · </span>
-  <a href="https://github.com/commaai/openpilot/blob/master/docs/CONTRIBUTING.md">Contribute</a>
-  <span> · </span>
-  <a href="https://discord.comma.ai">Community</a>
-  <span> · </span>
-  <a href="https://comma.ai/shop">Try it on a comma 3X</a>
-</h3>
+## 프로젝트 배경
 
-Quick start: `bash <(curl -fsSL openpilot.comma.ai)`
+AI 기반 모델(AlphaMayo)이 외부 PC에서 주행 경로를 생성하면, 차량 내 comma 디바이스가 이를 UDP로 수신하여 조향 및 가감속 명령을 계산하고, CAN 통신을 통해 실제 차량의 횡/종방향을 제어하는 구조입니다.
 
-[![openpilot tests](https://github.com/commaai/openpilot/actions/workflows/tests.yaml/badge.svg)](https://github.com/commaai/openpilot/actions/workflows/tests.yaml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![X Follow](https://img.shields.io/twitter/follow/comma_ai)](https://x.com/comma_ai)
-[![Discord](https://img.shields.io/discord/469524606043160576)](https://discord.comma.ai)
+openpilot은 본래 자체 카메라 기반 인지(modeld)와 경로 판단을 내장하고 있지만, 본 프로젝트에서는 이를 의도적으로 분리하여 **인지/판단은 외부 AI(AlphaMayo)가 담당**하고, **openpilot은 순수 제어 실행기**로만 동작하도록 재설계했습니다. 이를 통해 외부에서 개발된 자율주행 알고리즘을 실차 환경에서 빠르게 검증할 수 있는 플랫폼을 구축했습니다.
 
-</div>
+### 곡선 구간 경로 추종 문제 분석 및 개선
 
-<table>
-  <tr>
-    <td><a href="https://youtu.be/NmBfgOanCyk" title="Video By Greer Viau"><img src="https://github.com/commaai/openpilot/assets/8762862/2f7112ae-f748-4f39-b617-fabd689c3772"></a></td>
-    <td><a href="https://youtu.be/VHKyqZ7t8Gw" title="Video By Logan LeGrand"><img src="https://github.com/commaai/openpilot/assets/8762862/92351544-2833-40d7-9e0b-7ef7ae37ec4c"></a></td>
-    <td><a href="https://youtu.be/SUIZYzxtMQs" title="A drive to Taco Bell"><img src="https://github.com/commaai/openpilot/assets/8762862/05ceefc5-2628-439c-a9b2-89ce77dc6f63"></a></td>
-  </tr>
-</table>
+개발 초기, 직선 구간에서는 경로를 안정적으로 추종했으나 **곡선 구간에서 차량이 목표 경로를 이탈하는 문제**가 발생했습니다. 처음에는 단순한 제어기 튜닝 문제로 판단했지만, CAN 데이터와 PlotJuggler를 활용해 원인을 추적한 결과 다음 두 가지 근본 원인을 확인했습니다:
 
+1. **횡가속도 한계 초과**: 곡선 구간에서 차량의 횡가속도가 안정 한계인 **3 m/s²을 초과**하여 타이어 그립 한계에 도달, 제어 명령 대비 실제 차량 거동이 괴리
+2. **경로 생성 모델의 한계**: AlphaMayo가 사용하는 Bicycle Model 기반 경로 생성이 실제 차량의 속도별 조향 한계와 최대 조향 토크를 충분히 반영하지 못함
 
-Using openpilot in a car
-------
+이를 해결하기 위해 다음과 같은 **선제적 감속 로직**을 설계하였습니다:
 
-To use openpilot in a car, you need four things:
-1. **Supported Device:** a comma 3X, available at [comma.ai/shop](https://comma.ai/shop/comma-3x).
-2. **Software:** The setup procedure for the comma 3X allows users to enter a URL for custom software. Use the URL `openpilot.comma.ai` to install the release version.
-3. **Supported Car:** Ensure that you have one of [the 275+ supported cars](docs/CARS.md).
-4. **Car Harness:** You will also need a [car harness](https://comma.ai/shop/car-harness) to connect your comma 3X to your car.
+- CAN 분석 도구(cabana)를 활용하여 **속도별 최대 조향 토크 및 횡가속도 한계를 사전 파악**
+- 수신된 미래 경로의 곡률(curvature)을 사전 스캔하여, 현재 속도 기준으로 **횡가속도가 3 m/s²을 초과할 것으로 예측되는 구간을 검출**
+- 해당 코너 진입 **이전에 선제적으로 감속**하여 곡률 추종이 가능한 속도까지 미리 낮추는 로직 적용
+- openpilot의 MPC(Model Predictive Control) 기반 종방향 제어와 연계하여 급감속 없이 부드러운 속도 프로파일 생성
 
-We have detailed instructions for [how to install the harness and device in a car](https://comma.ai/setup). Note that it's possible to run openpilot on [other hardware](https://blog.comma.ai/self-driving-car-for-free/), although it's not plug-and-play.
+이 개선을 통해 단순히 외부 경로를 "그대로 따라가는" 수준을 넘어, **차량 동역학 한계를 고려한 안전한 경로 추종**을 실현하였으며, 실차 시험에서 곡선 구간의 경로 이탈 문제를 해결했습니다.
 
+## 시스템 아키텍처
 
-### Branches
+```
+┌─────────────────────┐          UDP:5005          ┌──────────────────────────────────┐
+│  외부 PC (AlphaMayo) │  ──────────────────────→   │     comma 디바이스 (openpilot)    │
+│                     │   50개 궤적점              │                                  │
+│  · AI 경로 생성      │   (x, y, yaw, velocity)    │  ┌──────────┐   ┌──────────┐     │
+│  · 글로벌 좌표 출력   │   + 차량 상태              │  │  modeld   │   │udp_bridge│     │
+│                     │   + 메타데이터              │  │(카메라전용)│   │(경로변환) │     │
+└─────────────────────┘                            │  └─────┬────┘   └─────┬────┘     │
+                                                   │        │              │           │
+                                                   │  cameraOdometry   modelV2 (20Hz) │
+                                                   │        │        drivingModelData  │
+                                                   │        └──────┬───────┘           │
+                                                   │               ↓                   │
+                                                   │  ┌──────────────────────┐         │
+                                                   │  │  controlsd / plannerd │         │
+                                                   │  │  (횡/종방향 제어 실행)  │         │
+                                                   │  └──────────┬───────────┘         │
+                                                   │             ↓                     │
+                                                   │     panda (CAN 인터페이스)         │
+                                                   │             ↓                     │
+                                                   │   Hyundai Ioniq 5 (조향 + 가감속)  │
+                                                   └──────────────────────────────────┘
+```
 
-Running `master` and other branches directly is supported, but it's recommended to run one of the following prebuilt branches:
+### 핵심 설계 원칙
 
-| comma four branch      | comma 3X branch        | URL                                    | description                                                                         |
-|------------------------|------------------------|----------------------------------------|-------------------------------------------------------------------------------------|
-| `release-mici`         | `release-tizi`         | openpilot.comma.ai                     | This is openpilot's release branch.                                                 |
-| `release-mici-staging` | `release-tizi-staging` | openpilot-test.comma.ai                | This is the staging branch for releases. Use it to get new releases slightly early. |
-| `nightly`              | `nightly`              | openpilot-nightly.comma.ai             | This is the bleeding edge development branch. Do not expect this to be stable.      |
-| `nightly-dev`          | `nightly-dev`          | installer.comma.ai/commaai/nightly-dev | Same as nightly, but includes experimental development features for some cars.      |
+- **인지/판단 분리**: openpilot의 인지(modeld) 기능을 카메라 오도메트리 전용으로 축소하고, 판단은 외부 AI(AlphaMayo)에 위임
+- **모듈 분리**: modeld는 cameraOdometry만 발행, udp_bridge가 외부 경로를 modelV2/drivingModelData로 변환 발행
+- **인터페이스 호환**: controlsd, plannerd는 수정 없이 그대로 사용 (openpilot 표준 메시지 포맷 준수)
+- **실시간성 보장**: 20Hz 루프 주기 유지, non-blocking UDP 수신
+- **차량 동역학 반영**: 속도별 횡가속도 한계를 고려한 선제적 감속 로직
 
-To start developing openpilot
-------
+## 주요 구현 내용
 
-openpilot is developed by [comma](https://comma.ai/) and by users like you. We welcome both pull requests and issues on [GitHub](http://github.com/commaai/openpilot).
+### 1. UDP 통신 프로토콜 (`selfdrive/modeld/udp_bridge.py`)
 
-* Join the [community Discord](https://discord.comma.ai)
-* Check out [the contributing docs](docs/CONTRIBUTING.md)
-* Check out the [openpilot tools](tools/)
-* Code documentation lives at https://docs.comma.ai
-* Information about running openpilot lives on the [community wiki](https://github.com/commaai/openpilot/wiki)
+외부 PC(AlphaMayo)로부터 1659바이트 UDP 패킷을 수신하여 파싱합니다.
 
-Want to get paid to work on openpilot? [comma is hiring](https://comma.ai/jobs#open-positions) and offers lots of [bounties](https://comma.ai/bounties) for external contributors.
+| 영역 | 크기 | 내용 |
+|------|------|------|
+| Header | 16B | Magic(0x41444301) + Sequence + Timestamp |
+| Path Points | 1600B | 50개 궤적점 x 4 float64 (x, y, yaw, velocity) |
+| Ego State | 24B | 차량 현재 위치 (x, y, yaw) |
+| Metadata | 18B | 목표 가속도, 주행 모드, 비상 상태, 방향 지시등 |
+| Footer | 1B | 유효 포인트 수 |
 
-Safety and Testing
-----
+### 2. 좌표 변환
 
-* openpilot observes [ISO26262](https://en.wikipedia.org/wiki/ISO_26262) guidelines, see [SAFETY.md](docs/SAFETY.md) for more details.
-* openpilot has software-in-the-loop [tests](.github/workflows/tests.yaml) that run on every commit.
-* The code enforcing the safety model lives in panda and is written in C, see [code rigor](https://github.com/commaai/panda#code-rigor) for more details.
-* panda has software-in-the-loop [safety tests](https://github.com/commaai/panda/tree/master/tests/safety).
-* Internally, we have a hardware-in-the-loop Jenkins test suite that builds and unit tests the various processes.
-* panda has additional hardware-in-the-loop [tests](https://github.com/commaai/panda/blob/master/Jenkinsfile).
-* We run the latest openpilot in a testing closet containing 10 comma devices continuously replaying routes.
+AlphaMayo가 글로벌 좌표계로 출력한 궤적을 차량 기준 상대 좌표로 변환합니다.
 
-<details>
-<summary>MIT Licensed</summary>
+```python
+# 회전 행렬을 사용한 글로벌 → 차량 좌표 변환
+dx = points[:, 0] - ego['x']
+dy = points[:, 1] - ego['y']
+c = np.cos(-ego['yaw'])
+s = np.sin(-ego['yaw'])
+rel_x = dx * c - dy * s
+rel_y = dx * s + dy * c
+```
 
-openpilot is released under the MIT license. Some parts of the software are released under other licenses as specified.
+### 3. 시간축 보간
 
-Any user of this software shall indemnify and hold harmless Comma.ai, Inc. and its directors, officers, employees, agents, stockholders, affiliates, subcontractors and customers from and against all allegations, claims, actions, suits, demands, damages, liabilities, obligations, losses, settlements, judgments, costs and expenses (including without limitation attorneys’ fees and costs) which arise out of, relate to or result from any use of this software by user.
+수신된 50개 raw point를 openpilot 표준 33개 timestep(`T_IDXS`)으로 보간합니다.
 
-**THIS IS ALPHA QUALITY SOFTWARE FOR RESEARCH PURPOSES ONLY. THIS IS NOT A PRODUCT.
-YOU ARE RESPONSIBLE FOR COMPLYING WITH LOCAL LAWS AND REGULATIONS.
-NO WARRANTY EXPRESSED OR IMPLIED.**
-</details>
+- 거리/속도 기반 누적 시간 배열 생성
+- `np.interp`를 사용하여 T_IDXS 기준으로 x, y, yaw, velocity 보간
+- 보간된 데이터로부터 velocity, acceleration, yaw_rate 미분값 계산
 
-<details>
-<summary>User Data and comma Account</summary>
+### 4. 제어 명령 계산
 
-By default, openpilot uploads the driving data to our servers. You can also access your data through [comma connect](https://connect.comma.ai/). We use your data to train better models and improve openpilot for everyone.
+보간된 경로로부터 종방향/횡방향 제어 명령을 산출합니다.
 
-openpilot is open source software: the user is free to disable data collection if they wish to do so.
+- **종방향**: 속도 프로파일로부터 `desiredAcceleration` 계산, 스무딩 적용 (τ = 0.3s)
+- **횡방향**: yaw/yaw_rate로부터 `desiredCurvature` 계산
+- **선제적 감속**: 미래 경로 곡률 스캔 → 횡가속도 3 m/s² 초과 예측 시 코너 진입 전 감속
+- **안전 로직**: drive_mode OFF 또는 유효 포인트 부재 시 `shouldStop = True`
 
-openpilot logs the road-facing cameras, CAN, GPS, IMU, magnetometer, thermal sensors, crashes, and operating system logs.
-The driver-facing camera and microphone are only logged if you explicitly opt-in in settings.
+### 5. 메시지 발행
 
-By using openpilot, you agree to [our Privacy Policy](https://comma.ai/privacy). You understand that use of this software or its related services will generate certain types of user data, which may be logged and stored at the sole discretion of comma. By accepting this agreement, you grant an irrevocable, perpetual, worldwide right to comma for the use of this data.
-</details>
+openpilot 표준 메시지 포맷으로 변환하여 20Hz로 발행합니다.
+
+- **modelV2**: position, velocity, acceleration, orientation, action, lane lines(dummy), leads(dummy)
+- **drivingModelData**: 경로 다항식 계수 (3차), action, lane line meta
+
+## 프로세스 구성
+
+| 프로세스 | 역할 | 발행 메시지 |
+|----------|------|------------|
+| `modeld` | 카메라 inference (camera-only mode) | cameraOdometry |
+| `udp_bridge` | 외부 경로 수신, 변환, 곡률 기반 감속 판단 | modelV2, drivingModelData |
+| `controlsd` | 횡/종방향 제어 실행 (미수정) | carControl |
+| `plannerd` | MPC 기반 종방향 계획 (미수정) | longitudinalPlan |
+
+프로세스 등록: `system/manager/process_config.py`
+
+```python
+PythonProcess("modeld", "selfdrive.modeld.modeld", only_onroad),
+PythonProcess("udp_bridge", "selfdrive.modeld.udp_bridge", only_onroad),
+```
+
+## 개발 이력 및 문제 해결
+
+### 곡선 구간 경로 추종 실패 → 선제적 감속 로직 도입
+- **문제**: 곡선 구간에서 횡가속도가 3 m/s²을 초과하여 차량이 경로를 이탈
+- **원인 분석**: CAN 데이터 분석(cabana)으로 속도별 최대 조향 토크와 횡가속도 한계를 파악, AlphaMayo 경로가 차량 동역학 한계를 미반영
+- **해결**: 미래 경로 곡률을 사전 스캔하여 한계 초과 구간 진입 전 MPC 연계 감속 로직 적용
+
+### 발행 주기 동기화 문제
+- **문제**: UDP 수신 대기(blocking)로 인해 modelV2 발행 주기가 불안정하여 controlsd/plannerd가 기대하는 20Hz를 충족하지 못함
+- **해결**: `sock.setblocking(False)` + 독립 타이밍 루프로 전환하여 패킷 수신 여부와 무관하게 20Hz 발행 유지
+
+### modeld/udp_bridge 역할 분리
+- **문제**: 초기에 modeld를 완전히 대체하려 했으나 cameraOdometry가 누락되어 locationd에서 오류 발생
+- **해결**: modeld는 카메라 기반 cameraOdometry만 발행, udp_bridge는 경로 메시지만 발행하도록 분리
+
+### Lane State Enum 오류
+- **문제**: lane line 상태값에 잘못된 enum을 사용하여 controlsd에서 예외 발생
+- **해결**: openpilot 내부 enum 정의(`log.capnp`)를 확인하여 올바른 상태값으로 수정
+
+## 시험 및 데이터 분석
+
+PlotJuggler를 활용하여 실시간 데이터 모니터링 및 제어 성능 분석을 수행합니다.
+
+### 주요 모니터링 항목
+
+| 항목 | 메시지 | 용도 |
+|------|--------|------|
+| 실제 가속도 | `carState.aEgo` | 종방향 추종 성능 확인 |
+| 요청 가속도 | `carControl.actuatorsOutput.accel` | 명령값 대비 실제값 비교 |
+| 횡가속도 | `carState.aEgo` (횡방향 성분) | 곡선 구간 안정성 확인 (3 m/s² 한계) |
+| 목표 곡률 | `modelV2.action.desiredCurvature` | 횡방향 제어 입력 확인 |
+| 차량 속도 | `carState.vEgo` | 속도 프로파일 추종 및 감속 로직 검증 |
+| 조향각 | `carState.steeringAngleDeg` | 횡방향 추종 성능 확인 |
+
+## 설정 파라미터
+
+| 파라미터 | 값 | 설명 |
+|----------|-----|------|
+| `UDP_PORT` | 5005 | 외부 PC 경로 수신 포트 |
+| `PACKET_SIZE` | 1659 | UDP 패킷 크기 |
+| `MAGIC` | 0x41444301 | 패킷 검증 매직 넘버 |
+| `MAX_POINTS` | 50 | 최대 궤적 포인트 수 |
+| `LONG_SMOOTH_SECONDS` | 0.3 | 종방향 가속도 스무딩 시정수 |
+| `LAT_SMOOTH_SECONDS` | 0.0 | 횡방향 곡률 스무딩 시정수 |
+| `MODEL_RUN_FREQ` | 20Hz | 메시지 발행 주기 |
+
+## 기술 스택
+
+- **차량**: Hyundai Ioniq 5
+- **플랫폼**: comma 3X + openpilot (Python/C++)
+- **외부 AI**: AlphaMayo (경로 생성)
+- **통신**: UDP 소켓 (비동기 수신)
+- **데이터 처리**: NumPy (좌표 변환, 보간, 미분)
+- **메시지 직렬화**: Cap'n Proto (cereal)
+- **CAN 분석**: cabana, PlotJuggler
+- **차량 인터페이스**: panda (CAN)
+
+## 디렉토리 구조 (주요 수정 파일)
+
+```
+openpilot/
+├── selfdrive/
+│   ├── modeld/
+│   │   ├── modeld.py           # 카메라 전용 모드로 수정 (cameraOdometry만 발행)
+│   │   └── udp_bridge.py       # [신규] 외부 경로 수신, 변환, 곡률 기반 감속 판단
+│   └── controls/
+│       ├── controlsd.py        # 미수정 (modelV2 소비, 횡/종방향 제어 실행)
+│       └── plannerd.py         # 미수정 (modelV2 소비, MPC 종방향 계획)
+└── system/
+    └── manager/
+        └── process_config.py   # udp_bridge 프로세스 등록
+```
+
+## 기반 프로젝트
+
+이 프로젝트는 [comma.ai의 openpilot](https://github.com/commaai/openpilot)을 기반으로 합니다.

@@ -99,7 +99,7 @@ procs = [
   PythonProcess("lagd", "selfdrive.locationd.lagd", only_onroad),
   PythonProcess("ubloxd", "system.ubloxd.ubloxd", ublox, enabled=TICI),
   PythonProcess("pigeond", "system.ubloxd.pigeond", ublox, enabled=TICI),
-  PythonProcess("plannerd", "selfdrive.controls.plannerd", not_long_maneuver),
+  #PythonProcess("plannerd", "selfdrive.controls.plannerd", not_long_maneuver),  # udp_bridge가 longitudinalPlan 직접 발행
   PythonProcess("maneuversd", "tools.longitudinal_maneuvers.maneuversd", long_maneuver),
   PythonProcess("radard", "selfdrive.controls.radard", only_onroad),
   PythonProcess("hardwared", "system.hardware.hardwared", always_run),
