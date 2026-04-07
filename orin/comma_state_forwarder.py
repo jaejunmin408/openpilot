@@ -50,7 +50,7 @@ def main():
             cs = sm['controlsState']
             lp = sm['livePose']
 
-            yaw_rate = lp.angularVelocityDevice.z.value if sm.valid['livePose'] else 0.0
+            yaw_rate = lp.angularVelocityDevice.z if sm.valid['livePose'] else 0.0
 
             pkt = struct.pack(
                 PACKET_FMT,
