@@ -50,7 +50,7 @@ def main():
             cs = sm['controlsState']
             lp = sm['livePose']
 
-            yaw_rate = lp.angularVelocityDevice.z.value if lp.valid else 0.0
+            yaw_rate = lp.angularVelocityDevice.z.value if sm.valid['livePose'] else 0.0
 
             pkt = struct.pack(
                 PACKET_FMT,
@@ -63,10 +63,12 @@ def main():
             )
             sock.sendto(pkt, (args.ip, args.port))
 
-            if seq % SEND_HZ == 0:
-                print(f"[{seq}] v={car.vEgo * 3.6:.1f}km/h "
-                      f"steer={car.steeringAngleDeg:.1f}° "
-                      f"yaw_r={yaw_rate:.3f}")
+            if seq % (SEND_HZ // 4) == 0:  # 4Hz로 로그 출력
+                print(f"[{seq:5d}] des_curv={cs.desiredCurvature:+.5f}  "
+                      f"act_curv={cs.curvature:+.5f}  "
+                      f"err={cs.desiredCurvature - cs.curvature:+.5f}  "
+                      f"v={car.vEgo * 3.6:.1f}km/h  "
+                      f"steer={car.steeringAngleDeg:.1f}°")
 
             seq += 1
             elapsed = time.monotonic() - t_start
