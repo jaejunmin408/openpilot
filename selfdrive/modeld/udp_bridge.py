@@ -91,14 +91,16 @@ def parse_packet(data: bytes):
 
 # ── 좌표 변환 ────────────────────────────────────────
 def to_relative(points: np.ndarray, ego: dict):
-    """글로벌 좌표 -> 차량 기준 좌표 변환."""
+    """글로벌 좌표 -> 차량 기준 device frame 좌표 변환.
+    device frame: x=forward, y=RIGHT, z=down (openpilot 내부 좌표계)
+    """
     dx = points[:, 0] - ego['x']
     dy = points[:, 1] - ego['y']
     c = np.cos(-ego['yaw'])
     s = np.sin(-ego['yaw'])
-    rel_x = dx * c - dy * s
-    rel_y = dx * s + dy * c
-    rel_yaw = points[:, 2] - ego['yaw']
+    rel_x = dx * c - dy * s        # forward
+    rel_y = -(dx * s + dy * c)     # RIGHT (device frame: y=right)
+    rel_yaw = -(points[:, 2] - ego['yaw'])  # device frame: positive yaw = right turn
     velocity = points[:, 3]
     return rel_x, rel_y, rel_yaw, velocity
 
@@ -233,7 +235,7 @@ def publish_messages(pm, interp, deriv, action, frame_id, adcm_meta, v_ego):
 
     # lane lines (4, dummy)
     mv2.init('laneLines', 4)
-    default_lane_y = [-1.8, -1.8, 1.8, 1.8]
+    default_lane_y = [1.8, 1.8, -1.8, -1.8]
     for i in range(4):
         ll = mv2.laneLines[i]
         lane_y = np.full(IDX_N, default_lane_y[i], dtype=np.float32)
@@ -243,7 +245,7 @@ def publish_messages(pm, interp, deriv, action, frame_id, adcm_meta, v_ego):
 
     # road edges (2, dummy)
     mv2.init('roadEdges', 2)
-    default_edge_y = [-3.0, 3.0]
+    default_edge_y = [3.0, -3.0]
     for i in range(2):
         re = mv2.roadEdges[i]
         edge_y = np.full(IDX_N, default_edge_y[i], dtype=np.float32)
