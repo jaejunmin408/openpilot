@@ -83,7 +83,16 @@ def main():
     parser.add_argument("--port", type=int, default=5005, help="Target UDP port")
     parser.add_argument("--json", default="/home/a/orin/work/test_trajectory_left_turn.json", help="Trajectory JSON file")
     parser.add_argument("--loop", action="store_true", help="Loop trajectory continuously")
+    parser.add_argument("--viz", type=str, default=None,
+                        help="실시간 시각화 대상 IP:PORT (예: 127.0.0.1:5006)")
     args = parser.parse_args()
+
+    # Parse viz destination
+    viz_dest = None
+    if args.viz:
+        viz_host, viz_port = args.viz.rsplit(":", 1)
+        viz_dest = (viz_host, int(viz_port))
+        print(f"  Viz mirror: {viz_host}:{viz_port}")
 
     # Load JSON
     print(f"Loading: {args.json}")
@@ -110,6 +119,8 @@ def main():
 
                 pkt = pack_frame(seq, frame)
                 sock.sendto(pkt, (args.ip, args.port))
+                if viz_dest:
+                    sock.sendto(pkt, viz_dest)
 
                 if seq % SEND_HZ == 0:
                     ego = frame["ego_position"]
@@ -130,6 +141,8 @@ def main():
                 stop_frame["target_speed"] = 0.0
                 pkt = pack_frame(seq, stop_frame)
                 sock.sendto(pkt, (args.ip, args.port))
+                if viz_dest:
+                    sock.sendto(pkt, viz_dest)
                 print(f"\n[DONE] Sent {seq} frames. Final stop frame sent.")
                 break
 
@@ -142,6 +155,8 @@ def main():
         stop_frame["target_speed"] = 0.0
         pkt = pack_frame(seq, stop_frame)
         sock.sendto(pkt, (args.ip, args.port))
+        if viz_dest:
+            sock.sendto(pkt, viz_dest)
         print(f"\n[ABORT] Stop frame sent. Total: {seq} frames.")
 
 
