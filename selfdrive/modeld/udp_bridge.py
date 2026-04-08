@@ -110,6 +110,7 @@ def parse_packet(data: bytes):
 def slice_trajectory_at_age(packet, age):
     """저장된 경로에서 age 시점 기준 T_IDXS 33개를 잘라냄.
     현재 ego 위치를 원점으로 회전·평행이동 보정.
+    Alpamayo 좌표(y=LEFT, yaw=CCW) → openpilot calibrated(y=RIGHT, yaw=CW) 변환 포함.
     """
     n = packet['num_points']
     dt_s = packet['dt_s']
@@ -133,10 +134,11 @@ def slice_trajectory_at_age(packet, age):
     y_ego = sin_r * dx + cos_r * dy
     yaw_ego = yaw_raw - yaw_ref
 
+    # Alpamayo → openpilot 좌표 변환 (y, yaw 부호 반전)
     return {
         'x':    x_ego.astype(np.float32),
-        'y':    y_ego.astype(np.float32),
-        'yaw':  yaw_ego.astype(np.float32),
+        'y':  (-y_ego).astype(np.float32),
+        'yaw': (-yaw_ego).astype(np.float32),
         'vel':  vel_raw.astype(np.float32),
     }
 
@@ -245,7 +247,7 @@ def publish_messages(pm, interp, deriv, action, frame_id, v_ego):
 
     # lane lines (4, dummy)
     mv2.init('laneLines', 4)
-    default_lane_y = [-1.8, -1.8, 1.8, 1.8]
+    default_lane_y = [1.8, 1.8, -1.8, -1.8]
     for i in range(4):
         ll = mv2.laneLines[i]
         lane_y = np.full(IDX_N, default_lane_y[i], dtype=np.float32)
@@ -255,7 +257,7 @@ def publish_messages(pm, interp, deriv, action, frame_id, v_ego):
 
     # road edges (2, dummy)
     mv2.init('roadEdges', 2)
-    default_edge_y = [-3.0, 3.0]
+    default_edge_y = [3.0, -3.0]
     for i in range(2):
         re = mv2.roadEdges[i]
         edge_y = np.full(IDX_N, default_edge_y[i], dtype=np.float32)
