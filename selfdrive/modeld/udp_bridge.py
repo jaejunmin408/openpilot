@@ -31,6 +31,7 @@ from openpilot.selfdrive.controls.lib.drive_helpers import (
 # ── 설정 ──────────────────────────────────────────────
 UDP_PORT = 5005
 MAX_POINTS = 64
+PLAN_USE_SECONDS = 3.0   # 경로 수신 후 사용 시간 (초), 이후 정지
 
 LONG_SMOOTH_SECONDS = 0.3
 LAT_SMOOTH_SECONDS = 0.0
@@ -105,24 +106,38 @@ def parse_packet(data: bytes):
     }
 
 
-# ── T_IDXS 보간 ──────────────────────────────────────
-def interpolate_to_tidxs(packet):
-    """Alpamayo 포인트(등간격 dt_s)를 T_IDXS 33개로 보간."""
+# ── 시간 기반 경로 슬라이싱 ──────────────────────────
+def slice_trajectory_at_age(packet, age):
+    """저장된 경로에서 age 시점 기준 T_IDXS 33개를 잘라냄.
+    현재 ego 위치를 원점으로 회전·평행이동 보정.
+    """
     n = packet['num_points']
     dt_s = packet['dt_s']
-    # 시간축: [0, dt_s, 2*dt_s, ...]
     src_time = np.arange(n, dtype=np.float64) * dt_s
 
-    ix = np.interp(T_IDXS, src_time, packet['x']).astype(np.float32)
-    iy = np.interp(T_IDXS, src_time, packet['y']).astype(np.float32)
-    iyaw = np.interp(T_IDXS, src_time, packet['yaw']).astype(np.float32)
-    ivel = np.interp(T_IDXS, src_time, packet['vel']).astype(np.float32)
+    # age 시점부터의 미래 시간으로 보간
+    query_time = np.clip(T_IDXS + age, 0.0, src_time[-1])
+
+    x_raw   = np.interp(query_time, src_time, packet['x'])
+    y_raw   = np.interp(query_time, src_time, packet['y'])
+    yaw_raw = np.interp(query_time, src_time, packet['yaw'])
+    vel_raw = np.interp(query_time, src_time, packet['vel'])
+
+    # 현재 ego 위치·heading 기준으로 좌표 변환
+    x_ref, y_ref, yaw_ref = x_raw[0], y_raw[0], yaw_raw[0]
+    dx = x_raw - x_ref
+    dy = y_raw - y_ref
+    cos_r = np.cos(-yaw_ref)
+    sin_r = np.sin(-yaw_ref)
+    x_ego = cos_r * dx - sin_r * dy
+    y_ego = sin_r * dx + cos_r * dy
+    yaw_ego = yaw_raw - yaw_ref
 
     return {
-        'x': ix,
-        'y': iy,
-        'yaw': iyaw,
-        'vel': ivel,
+        'x':    x_ego.astype(np.float32),
+        'y':    y_ego.astype(np.float32),
+        'yaw':  yaw_ego.astype(np.float32),
+        'vel':  vel_raw.astype(np.float32),
     }
 
 
@@ -374,9 +389,8 @@ def main():
     frame_id = 0
     prev_action = log.ModelDataV2.Action()
 
-    cur_interp = get_default_interp()
-    cur_deriv = get_default_deriv()
-    cur_flags = 0
+    stored_packet = None    # 최근 수신한 6.4s 경로
+    t_recv = 0.0            # 수신 시각 (monotonic)
 
     loop_period = 1.0 / ModelConstants.MODEL_RUN_FREQ  # 50ms = 20Hz
 
@@ -389,13 +403,29 @@ def main():
                 data, addr = sock.recvfrom(HEADER_SIZE + MAX_POINTS * POINT_SIZE + CRC_SIZE + 64)
                 packet = parse_packet(data)
                 if packet is not None and packet['num_points'] >= 2:
-                    cur_interp = interpolate_to_tidxs(packet)
-                    cur_deriv = compute_derivatives(cur_interp)
-                    cur_flags = packet['flags']
+                    stored_packet = packet
+                    t_recv = time.monotonic()
+                    cloudlog.info(f"udp_bridge: new trajectory received (seq={packet['seq']}, "
+                                  f"pts={packet['num_points']}, dt={packet['dt_s']:.3f}s)")
         except BlockingIOError:
             pass
 
-        # 2. SubMaster 업데이트
+        # 2. 저장된 경로에서 현재 시점 기준 슬라이싱
+        if stored_packet is not None:
+            age = time.monotonic() - t_recv
+            cur_interp = slice_trajectory_at_age(stored_packet, age)
+            cur_deriv = compute_derivatives(cur_interp)
+            cur_flags = stored_packet['flags']
+
+            # 3초 경과 시 정지
+            if age >= PLAN_USE_SECONDS:
+                cur_flags = cur_flags & ~FLAG_VALID
+        else:
+            cur_interp = get_default_interp()
+            cur_deriv = get_default_deriv()
+            cur_flags = 0
+
+        # 3. SubMaster 업데이트
         sm.update(0)
         v_ego = max(sm["carState"].vEgo, 0.0)
 
@@ -406,17 +436,17 @@ def main():
         if sm.seen['liveDelay']:
             long_delay = sm["liveDelay"].lateralDelay + LONG_SMOOTH_SECONDS
 
-        # 3. action 계산
+        # 4. action 계산
         action = compute_action(cur_interp, cur_deriv, prev_action,
                                 v_ego, lat_delay, long_delay, cur_flags)
         prev_action = action
 
-        # 4. 메시지 발행
+        # 5. 메시지 발행
         publish_messages(pm, cur_interp, cur_deriv, action, frame_id, v_ego)
 
         frame_id += 1
 
-        # 5. 20Hz 타이밍 유지
+        # 6. 20Hz 타이밍 유지
         elapsed = time.monotonic() - loop_start
         sleep_time = loop_period - elapsed
         if sleep_time > 0:
