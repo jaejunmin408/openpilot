@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>Alpamayo Trajectory + openpilot Plant</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; color: #eee; font-family: 'Consolas', monospace; display: flex; height: 100vh; }
+  #canvas { flex: 1; display: block; }
+  #panel {
+    width: 280px; padding: 16px; background: #16213e; overflow-y: auto;
+    border-left: 1px solid #0f3460;
+  }
+  #panel h2 { color: #e94560; margin-bottom: 12px; font-size: 16px; }
+  .section { margin-bottom: 14px; }
+  .section h3 { font-size: 13px; color: #53c1de; margin-bottom: 6px; }
+  .info-row { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px solid #0f3460; font-size: 12px; }
+  .info-label { color: #999; }
+  .info-value { color: #53c1de; font-weight: bold; }
+  #status { padding: 6px; margin-bottom: 10px; border-radius: 4px; font-size: 11px; text-align: center; }
+  .connected { background: #1b4332; color: #95d5b2; }
+  .disconnected { background: #3d0000; color: #ff6b6b; }
+  .waiting { background: #3d3100; color: #ffd166; }
+  .legend-bar {
+    height: 12px; border-radius: 3px; margin: 4px 0;
+    background: linear-gradient(to right, #e94560, #ffd166, #06d6a0);
+  }
+  .legend-labels { display: flex; justify-content: space-between; font-size: 10px; color: #999; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="panel">
+  <h2>Alpamayo + openpilot</h2>
+  <div id="status" class="disconnected">Disconnected</div>
+
+  <div class="section">
+    <h3>Vehicle (plant_sim)</h3>
+    <div class="info-row"><span class="info-label">Position</span><span class="info-value" id="v-pos">-</span></div>
+    <div class="info-row"><span class="info-label">Heading</span><span class="info-value" id="v-hdg">-</span></div>
+    <div class="info-row"><span class="info-label">Speed</span><span class="info-value" id="v-speed">-</span></div>
+    <div class="info-row"><span class="info-label">Accel</span><span class="info-value" id="v-accel">-</span></div>
+    <div class="info-row"><span class="info-label">Curvature</span><span class="info-value" id="v-curv">-</span></div>
+    <div class="info-row"><span class="info-label">Should Stop</span><span class="info-value" id="v-stop">-</span></div>
+    <div class="info-row"><span class="info-label">Frame</span><span class="info-value" id="v-frame">-</span></div>
+  </div>
+
+  <div class="section">
+    <h3>Trajectory (Alpamayo)</h3>
+    <div class="info-row"><span class="info-label">Packets</span><span class="info-value" id="t-packets">0</span></div>
+    <div class="info-row"><span class="info-label">Points</span><span class="info-value" id="t-points">-</span></div>
+    <div class="info-row"><span class="info-label">Horizon</span><span class="info-value" id="t-horizon">-</span></div>
+    <div class="info-row"><span class="info-label">Sequence</span><span class="info-value" id="t-seq">-</span></div>
+  </div>
+
+  <div class="section">
+    <h3>Speed color</h3>
+    <div class="legend-bar"></div>
+    <div class="legend-labels"><span>0</span><span>10 km/h</span><span>20+</span></div>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+// ── state ──
+let vehicle = null;       // plant_sim 차량 상태 (global)
+let trajectory = null;    // Alpamayo 경로 (global)
+let trail = [];           // 차량 궤적 이력
+const MAX_TRAIL = 5000;
+const SCALE = 40;         // px/m
+
+// ── canvas resize ──
+function resize() {
+  canvas.width = canvas.clientWidth * devicePixelRatio;
+  canvas.height = canvas.clientHeight * devicePixelRatio;
+  ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  draw();
+}
+window.addEventListener('resize', resize);
+
+// ── speed color ──
+function speedColor(v_mps) {
+  const t = Math.min(v_mps / 5.6, 1.0);
+  if (t < 0.5) {
+    const s = t * 2;
+    return `rgb(${Math.round(233+(255-233)*s)},${Math.round(69+(209-69)*s)},${Math.round(96+(102-96)*s)})`;
+  } else {
+    const s = (t - 0.5) * 2;
+    return `rgb(${Math.round(255*(1-s)+6*s)},${Math.round(209*(1-s)+214*s)},${Math.round(102*(1-s)+160*s)})`;
+  }
+}
+
+// ── global → screen (카메라는 차량 추적) ──
+function toScreen(gx, gy, camX, camY, W, H) {
+  return {
+    sx: W / 2 + (gx - camX) * SCALE,
+    sy: H / 2 - (gy - camY) * SCALE,
+  };
+}
+
+// ── draw ──
+function draw() {
+  const W = canvas.clientWidth;
+  const H = canvas.clientHeight;
+
+  ctx.fillStyle = '#1a1a2e';
+  ctx.fillRect(0, 0, W, H);
+
+  // 카메라 중심 = 차량 위치 (없으면 원점)
+  const camX = vehicle ? vehicle.x : 0;
+  const camY = vehicle ? vehicle.y : 0;
+
+  // ── 격자 ──
+  drawGrid(W, H, camX, camY);
+
+  // ── trail (차량 궤적 이력) ──
+  if (trail.length > 1) {
+    ctx.beginPath();
+    let s0 = toScreen(trail[0].x, trail[0].y, camX, camY, W, H);
+    ctx.moveTo(s0.sx, s0.sy);
+    for (let i = 1; i < trail.length; i++) {
+      const s = toScreen(trail[i].x, trail[i].y, camX, camY, W, H);
+      ctx.lineTo(s.sx, s.sy);
+    }
+    ctx.strokeStyle = 'rgba(83,193,222,0.3)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // ── Alpamayo 경로 ──
+  if (trajectory && trajectory.points.length > 1) {
+    const pts = trajectory.points;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const sa = toScreen(pts[i].x, pts[i].y, camX, camY, W, H);
+      const sb = toScreen(pts[i+1].x, pts[i+1].y, camX, camY, W, H);
+      ctx.beginPath();
+      ctx.moveTo(sa.sx, sa.sy);
+      ctx.lineTo(sb.sx, sb.sy);
+      ctx.strokeStyle = speedColor(pts[i].vel);
+      ctx.lineWidth = 3;
+      ctx.stroke();
+    }
+
+    // 포인트 마커
+    for (let i = 0; i < pts.length; i += 5) {
+      const s = toScreen(pts[i].x, pts[i].y, camX, camY, W, H);
+      ctx.beginPath();
+      ctx.arc(s.sx, s.sy, 3, 0, Math.PI * 2);
+      ctx.fillStyle = speedColor(pts[i].vel);
+      ctx.fill();
+    }
+
+    // 시작점
+    const startS = toScreen(pts[0].x, pts[0].y, camX, camY, W, H);
+    ctx.beginPath();
+    ctx.arc(startS.sx, startS.sy, 5, 0, Math.PI * 2);
+    ctx.fillStyle = '#ffd166';
+    ctx.fill();
+
+    // 끝점
+    const endS = toScreen(pts[pts.length-1].x, pts[pts.length-1].y, camX, camY, W, H);
+    ctx.beginPath();
+    ctx.arc(endS.sx, endS.sy, 5, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff';
+    ctx.fill();
+    ctx.fillStyle = '#999';
+    ctx.font = '11px Consolas';
+    ctx.fillText('END', endS.sx + 8, endS.sy + 4);
+  }
+
+  // ── 차량 (plant_sim) ──
+  if (vehicle) {
+    const cs = toScreen(vehicle.x, vehicle.y, camX, camY, W, H);
+    drawCar(cs.sx, cs.sy, vehicle.heading);
+
+    // 속도 표시
+    ctx.fillStyle = speedColor(vehicle.speed);
+    ctx.font = 'bold 16px Consolas';
+    ctx.fillText(`${(vehicle.speed * 3.6).toFixed(1)} km/h`, cs.sx + 20, cs.sy - 18);
+
+    // 좌표 표시
+    ctx.fillStyle = '#666';
+    ctx.font = '10px Consolas';
+    ctx.fillText(`(${vehicle.x.toFixed(1)}, ${vehicle.y.toFixed(1)})`, cs.sx + 20, cs.sy - 4);
+  }
+
+  // ── 스케일 바 ──
+  drawScaleBar(W, H);
+}
+
+function drawGrid(W, H, camX, camY) {
+  let gridM = 1;
+  if (gridM * SCALE < 20) gridM = 2;
+  if (gridM * SCALE < 10) gridM = 5;
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 1;
+
+  const ox = (W / 2) - camX * SCALE;
+  const oy = (H / 2) + camY * SCALE;
+
+  const startGX = Math.floor((camX - W / 2 / SCALE) / gridM) * gridM;
+  for (let gx = startGX; ; gx += gridM) {
+    const sx = ox + gx * SCALE;
+    if (sx > W) break;
+    if (sx >= 0) { ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, H); ctx.stroke(); }
+  }
+  const startGY = Math.floor((camY - H / 2 / SCALE) / gridM) * gridM;
+  for (let gy = startGY; ; gy += gridM) {
+    const sy = oy - gy * SCALE;
+    if (sy < 0) break;
+    if (sy <= H) { ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(W, sy); ctx.stroke(); }
+  }
+
+  // 원점 축선
+  const o = toScreen(0, 0, camX, camY, W, H);
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  if (o.sx > 0 && o.sx < W) { ctx.beginPath(); ctx.moveTo(o.sx, 0); ctx.lineTo(o.sx, H); ctx.stroke(); }
+  if (o.sy > 0 && o.sy < H) { ctx.beginPath(); ctx.moveTo(0, o.sy); ctx.lineTo(W, o.sy); ctx.stroke(); }
+}
+
+function drawCar(cx, cy, yaw) {
+  const angle = -(yaw - Math.PI / 2);
+  const size = 10;
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(angle);
+  ctx.beginPath();
+  ctx.moveTo(0, -size * 1.5);
+  ctx.lineTo(-size, size);
+  ctx.lineTo(size, size);
+  ctx.closePath();
+  ctx.fillStyle = '#e94560';
+  ctx.fill();
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawScaleBar(W, H) {
+  const barM = SCALE > 30 ? 2 : SCALE > 15 ? 5 : 10;
+  const barPx = barM * SCALE;
+  const x = 20, y = H - 30;
+  ctx.strokeStyle = '#999'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x, y); ctx.lineTo(x + barPx, y);
+  ctx.moveTo(x, y - 4); ctx.lineTo(x, y + 4);
+  ctx.moveTo(x + barPx, y - 4); ctx.lineTo(x + barPx, y + 4);
+  ctx.stroke();
+  ctx.fillStyle = '#999'; ctx.font = '11px Consolas';
+  ctx.fillText(`${barM}m`, x + barPx / 2 - 8, y - 8);
+}
+
+// ── 패널 업데이트 ──
+function updateVehiclePanel(v) {
+  document.getElementById('v-pos').textContent = `(${v.x.toFixed(2)}, ${v.y.toFixed(2)})`;
+  document.getElementById('v-hdg').textContent = (v.heading * 180 / Math.PI).toFixed(1) + '\u00B0';
+  document.getElementById('v-speed').textContent = (v.speed * 3.6).toFixed(1) + ' km/h';
+  document.getElementById('v-accel').textContent = v.accel.toFixed(2) + ' m/s\u00B2';
+  document.getElementById('v-curv').textContent = v.curvature.toFixed(4) + ' 1/m';
+  document.getElementById('v-stop').textContent = v.should_stop ? 'YES' : 'no';
+  document.getElementById('v-frame').textContent = v.frame;
+}
+
+function updateTrajectoryPanel(t) {
+  document.getElementById('t-packets').textContent = t.packet_count;
+  document.getElementById('t-points').textContent = t.num_points;
+  document.getElementById('t-horizon').textContent = ((t.num_points - 1) * t.dt_s).toFixed(1) + 's';
+  document.getElementById('t-seq').textContent = t.seq;
+}
+
+// ── WebSocket ──
+function connect() {
+  const statusEl = document.getElementById('status');
+  const ws = new WebSocket(`ws://${location.hostname}:8765`);
+
+  ws.onopen = () => {
+    statusEl.textContent = 'Connected \u2014 waiting for data';
+    statusEl.className = 'waiting';
+  };
+
+  ws.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+
+    if (data.type === 'trajectory') {
+      trajectory = data;
+      updateTrajectoryPanel(data);
+      statusEl.textContent = 'Receiving';
+      statusEl.className = 'connected';
+      draw();
+    }
+
+    if (data.type === 'vehicle') {
+      vehicle = data;
+      // trail에 추가
+      trail.push({ x: data.x, y: data.y });
+      if (trail.length > MAX_TRAIL) trail.shift();
+      updateVehiclePanel(data);
+      draw();
+    }
+  };
+
+  ws.onclose = () => {
+    statusEl.textContent = 'Disconnected \u2014 reconnecting...';
+    statusEl.className = 'disconnected';
+    setTimeout(connect, 1000);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+resize();
+connect();
+</script>
+</body>
+</html>
