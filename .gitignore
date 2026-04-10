@@ -85,6 +85,9 @@ build/
 !.vscode/extensions.json
 !.vscode/*.code-snippets
 
+# docs
+docs/screenshot/
+
 # agents
 .claude/
 .context/

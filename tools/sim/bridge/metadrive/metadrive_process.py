@@ -108,8 +108,10 @@ def metadrive_process(dual_camera: bool, config: dict, camera_array, wide_camera
     vehicle_state_send.send(vehicle_state)
 
     if controls_recv.poll(0):
+      should_reset = False
       while controls_recv.poll(0):
-        steer_angle, gas, should_reset = controls_recv.recv()
+        steer_angle, gas, msg_reset = controls_recv.recv()
+        should_reset = should_reset or msg_reset
 
       steer_metadrive = steer_angle * 1 / (env.vehicle.MAX_STEERING * steer_ratio)
       steer_metadrive = np.clip(steer_metadrive, -1, 1)

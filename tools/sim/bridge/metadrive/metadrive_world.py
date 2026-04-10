@@ -125,6 +125,7 @@ class MetaDriveWorld(World):
 
   def reset(self):
     self.should_reset = True
+    self.reset_time = time.monotonic()
 
   def close(self, reason: str):
     self.status_q.put(QueueMessage(QueueMessageType.CLOSE_STATUS, reason))

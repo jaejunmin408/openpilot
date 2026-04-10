@@ -76,7 +76,7 @@ procs = [
   PythonProcess("micd", "system.micd", iscar),
   PythonProcess("timed", "system.timed", always_run, enabled=not PC),
 
-  PythonProcess("modeld", "selfdrive.modeld.modeld", only_onroad),
+  PythonProcess("modeld", "selfdrive.modeld.modeld" if not os.getenv("SIMULATION") else "selfdrive.modeld.camera_odometry_stub", only_onroad),
   PythonProcess("udp_bridge", "selfdrive.modeld.udp_bridge", only_onroad),
   PythonProcess("dmonitoringmodeld", "selfdrive.modeld.dmonitoringmodeld", driverview, enabled=(WEBCAM or not PC)),
 

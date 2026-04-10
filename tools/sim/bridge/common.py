@@ -58,6 +58,7 @@ class SimulatorBridge(ABC):
 
     self.past_startup_engaged = False
     self.startup_button_prev = True
+    self._engage_hold_counter = 0
 
     self.test_run = False
 
@@ -122,7 +123,10 @@ Ignition: {self.simulator_state.ignition} Engaged: {self.simulator_state.is_enga
       throttle_out = steer_out = brake_out = 0.0
       throttle_op = steer_op = brake_op = 0.0
 
-      self.simulator_state.cruise_button = 0
+      if self._engage_hold_counter <= 0:
+        self.simulator_state.cruise_button = 0
+      else:
+        self._engage_hold_counter -= 1
       self.simulator_state.left_blinker = False
       self.simulator_state.right_blinker = False
 
@@ -178,9 +182,10 @@ Ignition: {self.simulator_state.ignition} Engaged: {self.simulator_state.is_enga
         steer_op = self.simulated_car.sm['carControl'].actuators.steeringAngleDeg
 
         self.past_startup_engaged = True
-      elif not self.past_startup_engaged and self.simulated_car.sm['selfdriveState'].engageable:
-        self.simulator_state.cruise_button = CruiseButtons.DECEL_SET if self.startup_button_prev else CruiseButtons.MAIN # force engagement on startup
+      elif not self.past_startup_engaged and self.simulated_car.sm['selfdriveState'].engageable and self._engage_hold_counter <= 0:
+        self.simulator_state.cruise_button = CruiseButtons.DECEL_SET if self.startup_button_prev else CruiseButtons.MAIN
         self.startup_button_prev = not self.startup_button_prev
+        self._engage_hold_counter = 50  # hold button for 50 ticks (500ms at 100Hz)
 
       throttle_out = throttle_op if self.simulator_state.is_engaged else throttle_manual
       brake_out = brake_op if self.simulator_state.is_engaged else brake_manual
