@@ -3,7 +3,7 @@ import cereal.messaging as messaging
 
 from opendbc.can.packer import CANPacker
 from opendbc.can.parser import CANParser
-from opendbc.car.honda.values import HondaSafetyFlags
+from opendbc.car.honda.values import HondaSafetyFlags, CruiseButtons
 from openpilot.common.params import Params
 from openpilot.selfdrive.pandad.pandad_api_impl import can_list_to_can_capnp
 from openpilot.tools.sim.lib.common import SimulatorState
@@ -20,6 +20,7 @@ class SimulatedCar:
     self.idx = 0
     self.params = Params()
     self.obd_multiplexing = False
+    self.cruise_engaged = False
 
   @staticmethod
   def get_car_can_parser():
@@ -44,6 +45,14 @@ class SimulatedCar:
       "WHEEL_SPEED_RR": speed
     }))
 
+    # Track cruise state from button presses
+    if simulator_state.cruise_button == CruiseButtons.DECEL_SET or simulator_state.cruise_button == CruiseButtons.RES_ACCEL:
+      self.cruise_engaged = True
+    elif simulator_state.cruise_button == CruiseButtons.CANCEL:
+      self.cruise_engaged = False
+    if simulator_state.user_brake > 0:
+      self.cruise_engaged = False
+
     msg.append(self.packer.make_can_msg("SCM_BUTTONS", 0, {"CRUISE_BUTTONS": simulator_state.cruise_button}))
 
     msg.append(self.packer.make_can_msg("GEARBOX_AUTO", 0, {"GEAR_SHIFTER": 4}))
@@ -66,7 +75,7 @@ class SimulatedCar:
                                     }))
     msg.append(self.packer.make_can_msg("POWERTRAIN_DATA", 0,
                                     {
-                                    "ACC_STATUS": int(simulator_state.is_engaged),
+                                    "ACC_STATUS": int(self.cruise_engaged),
                                     "PEDAL_GAS": simulator_state.user_gas,
                                     "BRAKE_PRESSED": simulator_state.user_brake > 0
                                     }))
@@ -94,7 +103,7 @@ class SimulatedCar:
       'controlsAllowed': True,
       'safetyModel': 'hondaBosch',
       'alternativeExperience': self.sm["carParams"].alternativeExperience,
-      'safetyParam': HondaSafetyFlags.RADARLESS.value | HondaSafetyFlags.BOSCH_LONG.value,
+      'safetyParam': self.sm["carParams"].safetyConfigs[0].safetyParam if len(self.sm["carParams"].safetyConfigs) else 0,
     }
     self.pm.send('pandaStates', dat)
 
