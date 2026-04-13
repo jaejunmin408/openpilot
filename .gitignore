@@ -45,7 +45,11 @@ config.json
 compile_commands.json
 compare_runtime*.html
 
-# build artifacts
+# build artifacts (scons intermediates)
+**/c_generated_code/acados_ocp_solver_pyx.c
+selfdrive/locationd/models/generated/
+panda/board/obj/
+
 selfdrive/pandad/pandad
 cereal/services.h
 cereal/gen
