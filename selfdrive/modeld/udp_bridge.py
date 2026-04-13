@@ -21,10 +21,9 @@ from openpilot.selfdrive.controls.lib.drive_helpers import (
 )
 
 # ── 설정 ──────────────────────────────────────────────
-UDP_PORT = 5005
+UDP_PORT = 10002
 UDP_TIMEOUT_S = 0.05          # 50 ms
-PACKET_SIZE = 1659
-MAGIC = 0x41444301
+PACKET_SIZE = 1243            # 1200(points) + 24(ego) + 18(meta) + 1(n_valid)
 MAX_POINTS = 50
 
 LONG_SMOOTH_SECONDS = 0.3
@@ -38,41 +37,42 @@ IDX_N = ModelConstants.IDX_N   # 33
 
 # ── 패킷 파싱 ────────────────────────────────────────
 def parse_packet(data: bytes):
-    """1659 byte ADCM UDP 패킷 파싱.
+    """1243 byte ADCM UDP 패킷 파싱 (xDrivingTrajectory_UdpPacket, __packed).
     Returns (points, ego, meta) or None on failure.
-      points: (n_valid, 4) float64  -- x, y, yaw, velocity per point
-      ego:    dict  -- ego_x, ego_y, ego_yaw
-      meta:   dict  -- target_accel, drive_mode, emergency, turn_signal
+      points: (n_valid, 3) float64  -- x, y, yaw  (UTM 절대좌표, 점별 속도 없음)
+      ego:    dict  -- x, y, yaw
+      meta:   dict  -- target_accel, drive_mode, emergency, turn_signal, n_valid
     """
     if len(data) != PACKET_SIZE:
         return None
 
-    # Header (16B)
-    magic, seq, timestamp = struct.unpack_from('<IId', data, 0)
-    if magic != MAGIC:
-        return None
+    offset = 0
 
-    offset = 16
+    # Points (1200B = 50 x 3 x float64)  -- TrajectoryPoint[50], 각 점 = (x, y, yaw)
+    points = np.frombuffer(data, dtype=np.float64, count=MAX_POINTS * 3, offset=offset).reshape(MAX_POINTS, 3).copy()
+    offset += MAX_POINTS * 3 * 8   # 1200
 
-    # Points (1600B = 50 x 4 x float64)
-    points = np.frombuffer(data, dtype=np.float64, count=MAX_POINTS * 4, offset=offset).reshape(MAX_POINTS, 4).copy()
-    offset += MAX_POINTS * 4 * 8
-
-    # Ego (24B)
+    # Ego Position (24B) -- Vector3DStruct (x, y, yaw)
     ego_x, ego_y, ego_yaw = struct.unpack_from('<ddd', data, offset)
-    offset += 24
+    offset += 24                    # 1224
 
-    # Meta (18B): target_accel(8) + drive_mode(1) + emergency(8) + turn_signal(1)
+    # Target_speed 필드 (실제로는 목표 가속도 m/s²)
     target_accel = struct.unpack_from('<d', data, offset)[0]
-    offset += 8
-    drive_mode = struct.unpack_from('<?', data, offset)[0]
-    offset += 1
-    emergency = struct.unpack_from('<d', data, offset)[0]
-    offset += 8
-    turn_signal = struct.unpack_from('<B', data, offset)[0]
-    offset += 1
+    offset += 8                     # 1232
 
-    # Footer (1B)
+    # Drive_Mode (bool)
+    drive_mode = struct.unpack_from('<?', data, offset)[0]
+    offset += 1                     # 1233
+
+    # Emergency_acceleration (실제로는 전방 레이더 플래그 0.0/1.0)
+    emergency = struct.unpack_from('<d', data, offset)[0]
+    offset += 8                     # 1241
+
+    # Turn_Signal (uint8: 0=NONE, 1=LEFT, 2=RIGHT, 3=BOTH)
+    turn_signal = struct.unpack_from('<B', data, offset)[0]
+    offset += 1                     # 1242
+
+    # sizeof_trajectory (유효 점 개수)
     n_valid = struct.unpack_from('<B', data, offset)[0]
     n_valid = min(n_valid, MAX_POINTS)
 
@@ -83,8 +83,6 @@ def parse_packet(data: bytes):
         'emergency': emergency,
         'turn_signal': turn_signal,
         'n_valid': n_valid,
-        'seq': seq,
-        'timestamp': timestamp,
     }
     return points[:n_valid], ego, meta
 
@@ -93,6 +91,7 @@ def parse_packet(data: bytes):
 def to_relative(points: np.ndarray, ego: dict):
     """글로벌 좌표 -> 차량 기준 device frame 좌표 변환.
     device frame: x=forward, y=RIGHT, z=down (openpilot 내부 좌표계)
+    points: (n, 3) -- x, y, yaw  (ADCM은 점별 속도를 보내지 않음)
     """
     dx = points[:, 0] - ego['x']
     dy = points[:, 1] - ego['y']
@@ -101,8 +100,32 @@ def to_relative(points: np.ndarray, ego: dict):
     rel_x = dx * c - dy * s        # forward
     rel_y = -(dx * s + dy * c)     # RIGHT (device frame: y=right)
     rel_yaw = -(points[:, 2] - ego['yaw'])  # device frame: positive yaw = right turn
-    velocity = points[:, 3]
-    return rel_x, rel_y, rel_yaw, velocity
+    return rel_x, rel_y, rel_yaw
+
+
+# ── 속도 프로파일 생성 ──────────────────────────────
+def estimate_velocity(rel_x: np.ndarray, rel_y: np.ndarray,
+                      v_ego: float, target_accel: float):
+    """ADCM은 점별 속도를 보내지 않으므로, 등가속도 운동(v²=v₀²+2as)으로 추정.
+    Args:
+        rel_x, rel_y: 상대좌표 (to_relative 출력)
+        v_ego: 현재 차속 (carState.vEgo)
+        target_accel: ADCM 목표 가속도 (m/s²)
+    Returns:
+        velocity: (n,) float64 -- 각 점의 추정 속도
+    """
+    n = len(rel_x)
+    # 점 간 호길이 → 누적거리
+    ds = np.hypot(np.diff(rel_x), np.diff(rel_y))
+    cum_s = np.zeros(n, dtype=np.float64)
+    cum_s[1:] = np.cumsum(ds)
+
+    # v² = v₀² + 2·a·s  (음수 방지 후 sqrt)
+    v0_sq = max(v_ego, 0.1) ** 2
+    v_sq = v0_sq + 2.0 * target_accel * cum_s
+    v_sq = np.maximum(v_sq, 0.01)  # 속도 0 이하 방지
+    velocity = np.sqrt(v_sq)
+    return velocity
 
 
 # ── 시간축 생성 ──────────────────────────────────────
@@ -367,8 +390,6 @@ DEFAULT_META = {
     'emergency': 0.0,
     'turn_signal': 0,
     'n_valid': 0,
-    'seq': 0,
-    'timestamp': 0.0,
 }
 
 
@@ -398,7 +419,11 @@ def main():
     while True:
         loop_start = time.monotonic()
 
-        # 1. UDP 패킷 수신 (timeout 내에 최신 패킷 사용)
+        # 1. SubMaster 업데이트 (v_ego를 속도 추정에 사용하므로 패킷 처리 전에 수행)
+        sm.update(0)
+        v_ego = max(sm["carState"].vEgo, 0.0)
+
+        # 2. UDP 패킷 수신 (최신 패킷 사용)
         packet_received = False
         try:
             while True:
@@ -407,7 +432,8 @@ def main():
                 if result is not None:
                     points, ego, meta = result
                     if meta['n_valid'] >= 2:
-                        rel_x, rel_y, rel_yaw, velocity = to_relative(points, ego)
+                        rel_x, rel_y, rel_yaw = to_relative(points, ego)
+                        velocity = estimate_velocity(rel_x, rel_y, v_ego, meta['target_accel'])
                         cum_time = build_cumulative_time(rel_x, rel_y, velocity)
                         if cum_time[-1] > 0.1:
                             cur_interp = interpolate_to_tidxs(rel_x, rel_y, rel_yaw, velocity, cum_time)
@@ -416,10 +442,6 @@ def main():
                             packet_received = True
         except BlockingIOError:
             pass
-
-        # 2. SubMaster 업데이트
-        sm.update(0)
-        v_ego = max(sm["carState"].vEgo, 0.0)
 
         lat_delay = 0.0
         long_delay = 0.0
