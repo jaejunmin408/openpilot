@@ -1,214 +1,171 @@
 #!/usr/bin/env python3
 """
-Alpamayo UDP Bridge
-Alpamayo에서 UDP로 전송한 궤적 패킷을 수신하여
-modelV2 / drivingModelData / longitudinalPlan / driverAssistance 메시지로 변환/발행한다.
-cameraOdometry는 modeld가 카메라 기반으로 발행한다.
+Alpamayo UDP Bridge (ac_decoded_path.json 포맷)
 
-패킷 포맷 (PACKET_SPEC.md 참조):
-  Header 44B: magic('ALPA') + version(u16) + flags(u16) + tx_seq(u32) + plan_seq(u32)
-              + sample_id(u32) + source_t0_us(u64) + tx_time_us(u64)
-              + coord_mode(u16) + num_points(u16) + dt_s(f32)
-  Points: num_points x 20B (x_m, y_m, yaw_rad, v_mps, curvature as f32)
-  Trailer 4B: CRC32
+외부에서 UDP로 1회 전송한 ac_decoded_path.json 전체(JSON bytes)를 수신하여:
+  - raw_action.accel_mps2 / raw_action.curvature 를 0.1s 간격 N=64 샘플로 저장
+  - 20Hz 루프에서 수신 후 경과시간에 맞춰 선형 보간해 desiredAcceleration/desiredCurvature 생성
+  - pred_xyz / pred_yaw_rad / pred_v_mps 로 modelV2 경로 필드 채워 UI 표시
+  - horizon 종료(= (N-1)*dt ≈ 6.3s) 이후에는 shouldStop=True
+
+좌표 변환: Alpamayo(y=LEFT, yaw=CCW, curv=CCW) → openpilot(y=RIGHT, yaw=CW, curv=CW)
+           y, yaw, curvature 부호 반전.
 """
+import json
 import socket
-import struct
 import time
-import zlib
 import numpy as np
 
 import cereal.messaging as messaging
 from cereal import log
 from cereal.messaging import PubMaster, SubMaster
 from openpilot.common.swaglog import cloudlog
-from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
-from openpilot.selfdrive.controls.lib.drive_helpers import (
-  get_accel_from_plan, get_curvature_from_plan, smooth_value,
-)
 
 # ── 설정 ──────────────────────────────────────────────
 UDP_PORT = 5005
-MAX_POINTS = 64
-PLAN_USE_SECONDS = 3.0   # 경로 수신 후 사용 시간 (초), 이후 정지
-
-LONG_SMOOTH_SECONDS = 0.3
-LAT_SMOOTH_SECONDS = 0.0
-MIN_LAT_CONTROL_SPEED = 0.3
+RECV_BUF_SIZE = 65535
 
 T_IDXS = np.array(ModelConstants.T_IDXS, dtype=np.float64)
 X_IDXS = np.array(ModelConstants.X_IDXS, dtype=np.float64)
 IDX_N = ModelConstants.IDX_N   # 33
 
-# Alpamayo 패킷 상수
-ALPA_MAGIC = b'ALPA'
-HEADER_FMT = '<4sHHIIIQQHHf'
-HEADER_SIZE = struct.calcsize(HEADER_FMT)  # 44
-POINT_FMT = '<5f'
-POINT_SIZE = struct.calcsize(POINT_FMT)    # 20
-CRC_SIZE = 4
 
-FLAG_VALID = 1 << 0
-FLAG_END_OF_STREAM = 1 << 2
-
-
-# ── 패킷 파싱 ────────────────────────────────────────
-def parse_packet(data: bytes):
-    """Alpamayo UDP 패킷 파싱.
-    Returns dict with 'x', 'y', 'yaw', 'vel', 'curvature', 'dt_s', 'flags', 'num_points', 'seq'
-    or None on failure.
-    좌표는 이미 로컬(차량 기준)이므로 변환 불필요.
+# ── JSON 패킷 파싱 ───────────────────────────────────
+def parse_action_packet(data: bytes):
+    """ac_decoded_path.json 바이트를 파싱해 필요한 필드만 추출.
+    실패 시 None.
+    좌표계 변환(y, yaw, curvature 부호 반전)도 여기서 수행.
     """
-    if len(data) < HEADER_SIZE + CRC_SIZE:
+    try:
+        d = json.loads(data.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        cloudlog.warning(f"udp_bridge: invalid JSON ({e})")
         return None
 
-    # Header
-    hdr = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
-    magic = hdr[0]
-    if magic != ALPA_MAGIC:
+    try:
+        ra = d['raw_action']
+        a = np.asarray(ra['accel_mps2'], dtype=np.float32)
+        c = np.asarray(ra['curvature'], dtype=np.float32)
+        dt_s = float(d.get('plan_dt_s', 0.1))
+
+        pred_xyz = np.asarray(d['pred_xyz'], dtype=np.float32)       # (N,3)
+        pred_yaw = np.asarray(d['pred_yaw_rad'], dtype=np.float32)   # (N,)
+        pred_v = np.asarray(d['pred_v_mps'], dtype=np.float32)       # (N,)
+    except (KeyError, TypeError, ValueError) as e:
+        cloudlog.warning(f"udp_bridge: malformed packet ({e})")
         return None
 
-    flags = hdr[2]
-    tx_seq = hdr[3]
-    num_points = hdr[9]
-    dt_s = hdr[10]
-
-    # 패킷 크기 검증
-    expected_size = HEADER_SIZE + num_points * POINT_SIZE + CRC_SIZE
-    if len(data) != expected_size:
+    N = len(a)
+    if N < 2 or len(c) != N or pred_xyz.shape[0] != N or pred_yaw.shape[0] != N or pred_v.shape[0] != N:
+        cloudlog.warning(f"udp_bridge: length mismatch (a={N}, c={len(c)}, "
+                         f"xyz={pred_xyz.shape[0]}, yaw={pred_yaw.shape[0]}, v={pred_v.shape[0]})")
         return None
 
-    # CRC32 검증
-    crc_expected = struct.unpack('<I', data[-CRC_SIZE:])[0]
-    crc_actual = zlib.crc32(data[:-CRC_SIZE]) & 0xFFFFFFFF
-    if crc_actual != crc_expected:
-        return None
-
-    if num_points == 0:
-        return None
-
-    # 포인트 파싱 (float32 x 5 per point)
-    points_data = np.frombuffer(data, dtype=np.float32,
-                                count=num_points * 5,
-                                offset=HEADER_SIZE).reshape(num_points, 5).copy()
+    # 좌표 변환: Alpamayo → openpilot
+    path_x =  pred_xyz[:, 0].copy()
+    path_y = -pred_xyz[:, 1].copy()
+    path_z =  pred_xyz[:, 2].copy()
+    path_yaw = -pred_yaw.copy()
+    path_v = pred_v.copy()
+    c_op = -c.copy()
 
     return {
-        'x': points_data[:, 0],           # meters, local frame
-        'y': points_data[:, 1],           # meters, local frame
-        'yaw': points_data[:, 2],         # radians
-        'vel': points_data[:, 3],         # m/s
-        'curvature': points_data[:, 4],   # 1/m
+        'a': a,                  # (N,) m/s² (종방향, 부호 유지)
+        'c': c_op,               # (N,) 1/m (openpilot 부호)
         'dt_s': dt_s,
-        'num_points': num_points,
-        'flags': flags,
-        'seq': tx_seq,
+        'N': N,
+        'path_x': path_x,
+        'path_y': path_y,
+        'path_z': path_z,
+        'path_yaw': path_yaw,
+        'path_v': path_v,
     }
 
 
-# ── 시간 기반 경로 슬라이싱 ──────────────────────────
-def slice_trajectory_at_age(packet, age):
-    """저장된 경로에서 age 시점 기준 T_IDXS 33개를 잘라냄.
-    현재 ego 위치를 원점으로 회전·평행이동 보정.
-    Alpamayo 좌표(y=LEFT, yaw=CCW) → openpilot calibrated(y=RIGHT, yaw=CW) 변환 포함.
+# ── 경로 리샘플 (N점 0.1s 간격 → T_IDXS 33점) ────────
+def resample_path(stored):
+    """pred_xyz / pred_yaw / pred_v 를 T_IDXS(33점)에 선형 보간.
+    N-1 시점 초과분(T_IDXS는 10s까지) 은 마지막 값 유지.
+    반환: position/velocity/orientation 채우기용 dict.
     """
-    n = packet['num_points']
-    dt_s = packet['dt_s']
-    src_time = np.arange(n, dtype=np.float64) * dt_s
+    N = stored['N']
+    dt = stored['dt_s']
+    src_t = np.arange(N, dtype=np.float64) * dt  # [0, 0.1, ..., 6.3]
+    # np.interp는 bounds-outside 자동 ZOH (마지막 값 유지)
 
-    # age 시점부터의 미래 시간으로 보간
-    query_time = np.clip(T_IDXS + age, 0.0, src_time[-1])
+    x = np.interp(T_IDXS, src_t, stored['path_x']).astype(np.float32)
+    y = np.interp(T_IDXS, src_t, stored['path_y']).astype(np.float32)
+    z = np.interp(T_IDXS, src_t, stored['path_z']).astype(np.float32)
+    yaw = np.interp(T_IDXS, src_t, stored['path_yaw']).astype(np.float32)
+    v = np.interp(T_IDXS, src_t, stored['path_v']).astype(np.float32)
 
-    x_raw   = np.interp(query_time, src_time, packet['x'])
-    y_raw   = np.interp(query_time, src_time, packet['y'])
-    yaw_raw = np.interp(query_time, src_time, packet['yaw'])
-    vel_raw = np.interp(query_time, src_time, packet['vel'])
+    vx = (v * np.cos(yaw)).astype(np.float32)
+    vy = (v * np.sin(yaw)).astype(np.float32)
 
-    # 현재 ego 위치·heading 기준으로 좌표 변환
-    x_ref, y_ref, yaw_ref = x_raw[0], y_raw[0], yaw_raw[0]
-    dx = x_raw - x_ref
-    dy = y_raw - y_ref
-    cos_r = np.cos(-yaw_ref)
-    sin_r = np.sin(-yaw_ref)
-    x_ego = cos_r * dx - sin_r * dy
-    y_ego = sin_r * dx + cos_r * dy
-    yaw_ego = yaw_raw - yaw_ref
-
-    # Alpamayo → openpilot 좌표 변환 (y, yaw 부호 반전)
     return {
-        'x':    x_ego.astype(np.float32),
-        'y':  (-y_ego).astype(np.float32),
-        'yaw': (-yaw_ego).astype(np.float32),
-        'vel':  vel_raw.astype(np.float32),
+        'x': x, 'y': y, 'z': z,
+        'yaw': yaw, 'v': v,
+        'vx': vx, 'vy': vy,
     }
 
 
-# ── 미분값 계산 ──────────────────────────────────────
-def compute_derivatives(interp: dict):
-    """velocity_x/y, acceleration_x/y, yaw_rate 계산.
-
-    vx/vy/ax/ay는 car-body 프레임 벡터 성분 (modelV2.velocity/acceleration 용).
-    v_scalar/a_scalar는 속도의 크기와 그 미분 (종방향 플래너 용).
-    회전 중에는 vx가 cos(yaw)만큼 작아지므로, get_accel_from_plan에는
-    반드시 scalar 속도를 넘겨야 '경로가 감속 중'이라는 오해석을 피할 수 있다.
-    """
-    yaw = interp['yaw']
-    vel = interp['vel']
-    vx = vel * np.cos(yaw)
-    vy = vel * np.sin(yaw)
-    ax = np.gradient(vx, T_IDXS).astype(np.float32)
-    ay = np.gradient(vy, T_IDXS).astype(np.float32)
-    a_scalar = np.gradient(vel, T_IDXS).astype(np.float32)
-    yaw_rate = np.gradient(yaw, T_IDXS).astype(np.float32)
+def default_resampled():
+    zeros = np.zeros(IDX_N, dtype=np.float32)
     return {
-        'vx': vx.astype(np.float32),
-        'vy': vy.astype(np.float32),
-        'ax': ax,
-        'ay': ay,
-        'v_scalar': vel.astype(np.float32),
-        'a_scalar': a_scalar,
-        'yaw_rate': yaw_rate,
+        'x': zeros.copy(), 'y': zeros.copy(), 'z': zeros.copy(),
+        'yaw': zeros.copy(), 'v': zeros.copy(),
+        'vx': zeros.copy(), 'vy': zeros.copy(),
     }
 
 
-# ── action 계산 ──────────────────────────────────────
-def compute_action(interp, deriv, prev_action, v_ego, lat_delay, long_delay, flags):
-    """desiredCurvature, desiredAcceleration, shouldStop 계산."""
-    plan_yaw = interp['yaw']
-    plan_yaw_rate = deriv['yaw_rate']
+# ── action 샘플링 (선형 보간) ────────────────────────
+def sample_action(stored, t_rel):
+    """저장된 a,c 배열에서 t_rel 시점의 값을 선형 보간해 반환.
+    horizon((N-1)*dt) 종료 시 shouldStop=True."""
+    N = stored['N']
+    dt = stored['dt_s']
+    horizon = (N - 1) * dt
 
-    # 종방향: scalar 속도/가속도 사용 (회전 중에도 올바른 가/감속 산출)
-    desired_accel, should_stop = get_accel_from_plan(
-        deriv['v_scalar'], deriv['a_scalar'], T_IDXS, action_t=long_delay + DT_MDL,
-    )
-    desired_accel = smooth_value(desired_accel, prev_action.desiredAcceleration, LONG_SMOOTH_SECONDS)
+    if t_rel >= horizon:
+        return log.ModelDataV2.Action(
+            desiredCurvature=float(stored['c'][-1]),
+            desiredAcceleration=0.0,
+            shouldStop=True,
+        )
 
-    # FLAG_VALID가 없거나 END_OF_STREAM이면 정지
-    if not (flags & FLAG_VALID) or (flags & FLAG_END_OF_STREAM):
-        should_stop = True
-
-    # 횡방향
-    desired_curvature = get_curvature_from_plan(
-        plan_yaw, plan_yaw_rate, T_IDXS, v_ego, lat_delay + DT_MDL,
-    )
-    if v_ego > MIN_LAT_CONTROL_SPEED:
-        desired_curvature = smooth_value(desired_curvature, prev_action.desiredCurvature, LAT_SMOOTH_SECONDS)
+    idx = t_rel / dt
+    if idx <= 0.0:
+        i0 = 0; i1 = 1; f = 0.0
     else:
-        desired_curvature = prev_action.desiredCurvature
+        i0 = int(idx)
+        i1 = min(i0 + 1, N - 1)
+        f = idx - i0
+
+    a = (1.0 - f) * stored['a'][i0] + f * stored['a'][i1]
+    c = (1.0 - f) * stored['c'][i0] + f * stored['c'][i1]
 
     return log.ModelDataV2.Action(
-        desiredCurvature=float(desired_curvature),
-        desiredAcceleration=float(desired_accel),
-        shouldStop=bool(should_stop),
+        desiredCurvature=float(c),
+        desiredAcceleration=float(a),
+        shouldStop=False,
+    )
+
+
+def idle_action():
+    return log.ModelDataV2.Action(
+        desiredCurvature=0.0,
+        desiredAcceleration=0.0,
+        shouldStop=True,
     )
 
 
 # ── 메시지 발행 ──────────────────────────────────────
 def fill_xyzt(builder, t, x, y, z, x_std=None, y_std=None, z_std=None):
-    builder.t = t
-    builder.x = x.tolist()
-    builder.y = y.tolist()
-    builder.z = z.tolist()
+    builder.t = list(t) if not isinstance(t, list) else t
+    builder.x = x.tolist() if hasattr(x, 'tolist') else list(x)
+    builder.y = y.tolist() if hasattr(y, 'tolist') else list(y)
+    builder.z = z.tolist() if hasattr(z, 'tolist') else list(z)
     if x_std is not None:
         builder.xStd = x_std.tolist()
     if y_std is not None:
@@ -217,8 +174,10 @@ def fill_xyzt(builder, t, x, y, z, x_std=None, y_std=None, z_std=None):
         builder.zStd = z_std.tolist()
 
 
-def publish_messages(pm, interp, deriv, action, frame_id, v_ego):
-    """modelV2 + drivingModelData + longitudinalPlan + driverAssistance 발행."""
+def publish_messages(pm, rs, action, frame_id, v_ego):
+    """modelV2 + drivingModelData + longitudinalPlan + driverAssistance 발행.
+    rs: resample_path 결과 (또는 default_resampled)
+    """
     now_ns = int(time.monotonic() * 1e9)
     t_list = ModelConstants.T_IDXS
 
@@ -237,17 +196,17 @@ def publish_messages(pm, interp, deriv, action, frame_id, v_ego):
     mv2.timestampEof = now_ns
     mv2.modelExecutionTime = 0.0
 
-    # position
-    fill_xyzt(mv2.position, t_list, interp['x'], interp['y'], zeros_33,
+    # position — pred_xyz 기반
+    fill_xyzt(mv2.position, t_list, rs['x'], rs['y'], rs['z'],
               x_std=low_std, y_std=low_std, z_std=low_std)
-    # velocity
-    fill_xyzt(mv2.velocity, t_list, deriv['vx'], deriv['vy'], zeros_33)
-    # acceleration
-    fill_xyzt(mv2.acceleration, t_list, deriv['ax'], deriv['ay'], zeros_33)
+    # velocity — pred_v_mps · cos/sin(pred_yaw)
+    fill_xyzt(mv2.velocity, t_list, rs['vx'], rs['vy'], zeros_33)
+    # acceleration — 0
+    fill_xyzt(mv2.acceleration, t_list, zeros_33, zeros_33, zeros_33)
     # orientation (x=roll, y=pitch, z=yaw)
-    fill_xyzt(mv2.orientation, t_list, zeros_33, zeros_33, interp['yaw'])
-    # orientationRate
-    fill_xyzt(mv2.orientationRate, t_list, zeros_33, zeros_33, deriv['yaw_rate'])
+    fill_xyzt(mv2.orientation, t_list, zeros_33, zeros_33, rs['yaw'])
+    # orientationRate — 0
+    fill_xyzt(mv2.orientationRate, t_list, zeros_33, zeros_33, zeros_33)
 
     # action
     mv2.action = action
@@ -324,8 +283,8 @@ def publish_messages(pm, interp, deriv, action, frame_id, v_ego):
     dmd.modelExecutionTime = 0.0
     dmd.action = action
 
-    # path polynomial
-    xyz = np.stack([interp['x'], interp['y'], zeros_33], axis=1)
+    # path polynomial (pred_xyz 기반)
+    xyz = np.stack([rs['x'], rs['y'], rs['z']], axis=1)
     coeffs = np.polynomial.polynomial.polyfit(T_IDXS, xyz, deg=ModelConstants.POLY_PATH_DEGREE)
     dmd.path.xCoefficients = coeffs[:, 0].tolist()
     dmd.path.yCoefficients = coeffs[:, 1].tolist()
@@ -362,102 +321,63 @@ def publish_messages(pm, interp, deriv, action, frame_id, v_ego):
     pm.send('driverAssistance', assist_send)
 
 
-# ── 기본 보간 결과 (패킷 수신 전 또는 실패 시) ────────
-def get_default_interp():
-    return {
-        'x': np.zeros(IDX_N, dtype=np.float32),
-        'y': np.zeros(IDX_N, dtype=np.float32),
-        'yaw': np.zeros(IDX_N, dtype=np.float32),
-        'vel': np.zeros(IDX_N, dtype=np.float32),
-    }
-
-def get_default_deriv():
-    return {
-        'vx': np.zeros(IDX_N, dtype=np.float32),
-        'vy': np.zeros(IDX_N, dtype=np.float32),
-        'ax': np.zeros(IDX_N, dtype=np.float32),
-        'ay': np.zeros(IDX_N, dtype=np.float32),
-        'v_scalar': np.zeros(IDX_N, dtype=np.float32),
-        'a_scalar': np.zeros(IDX_N, dtype=np.float32),
-        'yaw_rate': np.zeros(IDX_N, dtype=np.float32),
-    }
-
-
 # ── main ──────────────────────────────────────────────
 def main():
-    cloudlog.warning("udp_bridge init (Alpamayo mode)")
+    cloudlog.warning("udp_bridge init (ac_decoded_path JSON mode)")
 
     pm = PubMaster(["modelV2", "drivingModelData", "longitudinalPlan", "driverAssistance"])
     sm = SubMaster(["carState", "carControl", "liveDelay"])
 
-    # UDP 소켓 설정 (non-blocking)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(('0.0.0.0', UDP_PORT))
     sock.setblocking(False)
-    cloudlog.warning(f"udp_bridge listening on port {UDP_PORT} (Alpamayo packet format)")
+    cloudlog.warning(f"udp_bridge listening on port {UDP_PORT} (JSON ac_decoded_path)")
 
     frame_id = 0
-    prev_action = log.ModelDataV2.Action()
-
-    stored_packet = None    # 최근 수신한 6.4s 경로
-    t_recv = 0.0            # 수신 시각 (monotonic)
+    stored = None        # 가장 최근 수신한 plan
+    t_recv = 0.0         # 수신 시각 (monotonic)
+    recv_count = 0
 
     loop_period = 1.0 / ModelConstants.MODEL_RUN_FREQ  # 50ms = 20Hz
 
     while True:
         loop_start = time.monotonic()
 
-        # 1. UDP 패킷 수신 (non-blocking, 최신 패킷만 사용)
+        # 1. UDP 패킷 수신 (non-blocking, 최신만 사용)
         try:
             while True:
-                data, addr = sock.recvfrom(HEADER_SIZE + MAX_POINTS * POINT_SIZE + CRC_SIZE + 64)
-                packet = parse_packet(data)
-                if packet is not None and packet['num_points'] >= 2:
-                    stored_packet = packet
+                data, _ = sock.recvfrom(RECV_BUF_SIZE)
+                pkt = parse_action_packet(data)
+                if pkt is not None:
+                    stored = pkt
                     t_recv = time.monotonic()
-                    cloudlog.info(f"udp_bridge: new trajectory received (seq={packet['seq']}, "
-                                  f"pts={packet['num_points']}, dt={packet['dt_s']:.3f}s)")
+                    recv_count += 1
+                    cloudlog.warning(f"udp_bridge: received action plan #{recv_count} "
+                                     f"(N={pkt['N']}, dt={pkt['dt_s']:.3f}s, "
+                                     f"{len(data)}B)")
         except BlockingIOError:
             pass
 
-        # 2. 저장된 경로에서 현재 시점 기준 슬라이싱
-        if stored_packet is not None:
-            age = time.monotonic() - t_recv
-            cur_interp = slice_trajectory_at_age(stored_packet, age)
-            cur_deriv = compute_derivatives(cur_interp)
-            cur_flags = stored_packet['flags']
-
-            # 3초 경과 시 정지
-            if age >= PLAN_USE_SECONDS:
-                cur_flags = cur_flags & ~FLAG_VALID
+        # 2. action + 리샘플된 경로 계산
+        if stored is not None:
+            t_rel = time.monotonic() - t_recv
+            action = sample_action(stored, t_rel)
+            rs = resample_path(stored)
         else:
-            cur_interp = get_default_interp()
-            cur_deriv = get_default_deriv()
-            cur_flags = 0
+            action = idle_action()
+            rs = default_resampled()
 
-        # 3. SubMaster 업데이트
+        # 3. SubMaster 업데이트 (v_ego만 사용)
         sm.update(0)
         v_ego = max(sm["carState"].vEgo, 0.0)
 
-        lat_delay = 0.0
-        long_delay = 0.0
-        if sm.seen['liveDelay']:
-            lat_delay = sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
-        if sm.seen['liveDelay']:
-            long_delay = sm["liveDelay"].lateralDelay + LONG_SMOOTH_SECONDS
-
-        # 4. action 계산
-        action = compute_action(cur_interp, cur_deriv, prev_action,
-                                v_ego, lat_delay, long_delay, cur_flags)
-        prev_action = action
-
-        # 5. 메시지 발행
-        publish_messages(pm, cur_interp, cur_deriv, action, frame_id, v_ego)
+        # 4. 메시지 발행
+        publish_messages(pm, rs, action, frame_id, v_ego)
 
         frame_id += 1
 
-        # 6. 20Hz 타이밍 유지
+        # 5. 20Hz 타이밍 유지
         elapsed = time.monotonic() - loop_start
         sleep_time = loop_period - elapsed
         if sleep_time > 0:
