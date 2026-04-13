@@ -7,6 +7,7 @@ UDP로 ALPA 패킷 수신 → global 좌표 그대로 WebSocket으로 브라우�
 import asyncio
 import json
 import math
+import os
 import struct
 import zlib
 from pathlib import Path
@@ -213,11 +214,14 @@ async def main():
 
     loop = asyncio.get_event_loop()
 
-    # UDP — Alpamayo 경로
-    await loop.create_datagram_endpoint(
-        lambda: UDPProtocol(loop),
-        local_addr=('0.0.0.0', UDP_PORT),
-    )
+    # UDP — Alpamayo 경로 (openpilot udp_bridge가 5005를 점유하는 경우 VIZ_DISABLE_ALPA=1 로 스킵)
+    if os.environ.get('VIZ_DISABLE_ALPA') != '1':
+        await loop.create_datagram_endpoint(
+            lambda: UDPProtocol(loop),
+            local_addr=('0.0.0.0', UDP_PORT),
+        )
+    else:
+        print(f"[Server] ALPA UDP(:{UDP_PORT}) disabled via VIZ_DISABLE_ALPA")
 
     # UDP — plant_sim 차량 상태
     await loop.create_datagram_endpoint(

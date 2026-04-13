@@ -1,7 +1,11 @@
 import ctypes
 import functools
+import json
+import math
 import multiprocessing
 import numpy as np
+import os
+import socket
 import time
 
 from multiprocessing import Pipe, Array
@@ -58,6 +62,13 @@ class MetaDriveWorld(World):
     self.reset_time = 0
     self.should_reset = False
 
+    viz_host = os.environ.get("SIM_VIZ_HOST", "127.0.0.1")
+    viz_port = int(os.environ.get("SIM_VIZ_PORT", "5006"))
+    self._viz_addr = (viz_host, viz_port)
+    self._viz_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    self._viz_last_tx = 0.0
+    self._viz_frame = 0
+
   def apply_controls(self, steer_angle, throttle_out, brake_out):
     if (time.monotonic() - self.reset_time) > 2:
       self.vc[0] = steer_angle
@@ -90,6 +101,30 @@ class MetaDriveWorld(World):
       state.steering_angle = md_vehicle.steering_angle
       state.gps.from_xy(curr_pos)
       state.valid = True
+
+      now = time.monotonic()
+      if now - self._viz_last_tx >= 0.05:  # 20Hz
+        self._viz_last_tx = now
+        vx = float(md_vehicle.velocity.x)
+        vy = float(md_vehicle.velocity.y)
+        speed = math.hypot(vx, vy)
+        heading_rad = math.radians(md_vehicle.bearing)
+        msg = {
+          'type': 'vehicle',
+          'x': round(float(curr_pos[0]), 4),
+          'y': round(float(curr_pos[1]), 4),
+          'heading': round(heading_rad, 4),
+          'speed': round(speed, 3),
+          'accel': 0.0,
+          'curvature': 0.0,
+          'should_stop': False,
+          'frame': self._viz_frame,
+        }
+        try:
+          self._viz_sock.sendto(json.dumps(msg).encode(), self._viz_addr)
+        except OSError:
+          pass
+        self._viz_frame += 1
 
       is_engaged = state.is_engaged
       if is_engaged and self.first_engage is None:
