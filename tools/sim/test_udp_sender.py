@@ -1,106 +1,107 @@
 #!/usr/bin/env python3
 """
-Test UDP sender for Alpamayo udp_bridge.
-Sends a straight-line trajectory at constant speed to verify the full pipeline:
-  UDP → udp_bridge → [modelV2, longitudinalPlan] → controlsd → carControl → SimulatedCar
+Test UDP sender for ADCM udp_bridge.
+Sends a trajectory at constant speed to verify the full pipeline:
+  UDP -> udp_bridge -> [modelV2, drivingModelData, longitudinalPlan] -> controlsd -> carControl -> SimulatedCar
+
+Packet format (1243 bytes, must match udp_bridge.py / xDrivingTrajectory_UdpPacket):
+  Points (1200B): 50 x 3 x float64  (x, y, yaw)  -- UTM global coords, no velocity
+  Ego     (24B): ego_x(8) + ego_y(8) + ego_yaw(8)
+  Meta    (18B): target_accel(8) + drive_mode(1) + emergency(8) + turn_signal(1)
+  Footer   (1B): sizeof_trajectory (n_valid)
+  Total = 1243
 """
 import socket
 import struct
 import time
-import zlib
 import argparse
 import numpy as np
 
 # Packet constants (must match udp_bridge.py)
-ALPA_MAGIC = b'ALPA'
-HEADER_FMT = '<4sHHIIIQQHHf'
-HEADER_SIZE = struct.calcsize(HEADER_FMT)
-POINT_FMT = '<5f'
-POINT_SIZE = struct.calcsize(POINT_FMT)
-
-FLAG_VALID = 1 << 0
-FLAG_END_OF_STREAM = 1 << 2
+PACKET_SIZE = 1243
+MAX_POINTS = 50
 
 
-def build_packet(points_x, points_y, points_yaw, points_vel, points_curvature,
-                 dt_s, tx_seq, flags=FLAG_VALID):
-    """Build a complete ALPA UDP packet with CRC."""
-    num_points = len(points_x)
-    now_us = int(time.time() * 1e6)
+def build_packet(points_xyz, ego, meta):
+    """Build a 1243-byte ADCM UDP packet.
 
-    # Header
-    header = struct.pack(HEADER_FMT,
-        ALPA_MAGIC,    # magic
-        1,             # version
-        flags,         # flags
-        tx_seq,        # tx_seq
-        0,             # plan_seq
-        0,             # sample_id
-        now_us,        # source_t0_us
-        now_us,        # tx_time_us
-        0,             # coord_mode (local)
-        num_points,    # num_points
-        dt_s,          # dt_s
-    )
-
-    # Points
-    points_data = b''
-    for i in range(num_points):
-        points_data += struct.pack(POINT_FMT,
-            float(points_x[i]),
-            float(points_y[i]),
-            float(points_yaw[i]),
-            float(points_vel[i]),
-            float(points_curvature[i]),
-        )
-
-    # CRC32
-    payload = header + points_data
-    crc = zlib.crc32(payload) & 0xFFFFFFFF
-    trailer = struct.pack('<I', crc)
-
-    return payload + trailer
-
-
-def make_straight_trajectory(speed_mps, v_ego=0.0, a_max=2.0, dt_s=0.1, num_points=50):
-    """Generate a straight-line trajectory that ramps from v_ego to speed_mps."""
-    t = np.arange(num_points) * dt_s
-    vel = np.minimum(v_ego + a_max * t, speed_mps)
-    x = np.cumsum(vel) * dt_s
-    x -= x[0]
-    y = np.zeros(num_points)
-    yaw = np.zeros(num_points)
-    curvature = np.zeros(num_points)
-    return x, y, yaw, vel, curvature, dt_s
-
-
-def make_curve_trajectory(speed_mps, radius, v_ego=0.0, a_max=2.0, dt_s=0.1, num_points=50):
-    """Generate a curved trajectory (constant radius) that ramps from v_ego to speed_mps.
-
-    속도가 가변이므로 각도는 arc length s = ∫v dt 에서 theta = s/radius 로 계산한다.
-    (단순히 theta = omega*t 로 하면 정지 상태에서 출발이 불가능해짐)
+    Args:
+        points_xyz: (n, 3) float64 array -- x, y, yaw (global coords, no velocity)
+        ego:        dict with keys x, y, yaw
+        meta:       dict with keys target_accel, drive_mode, emergency, turn_signal
     """
-    t = np.arange(num_points) * dt_s
-    vel = np.minimum(v_ego + a_max * t, speed_mps)
-    s = np.cumsum(vel) * dt_s
-    s -= s[0]
-    theta = s / radius
-    x = radius * np.sin(theta)
-    y = radius * (1 - np.cos(theta))
-    yaw = theta
-    curvature = np.full(num_points, 1.0 / radius)
-    return x, y, yaw, vel, curvature, dt_s
+    n_valid = min(len(points_xyz), MAX_POINTS)
+
+    # Points (1200B) -- pad to MAX_POINTS
+    pts = np.zeros((MAX_POINTS, 3), dtype=np.float64)
+    pts[:n_valid] = points_xyz[:n_valid]
+    points_data = pts.tobytes()
+
+    # Ego (24B)
+    ego_data = struct.pack('<ddd', ego['x'], ego['y'], ego['yaw'])
+
+    # Meta (18B): target_accel(8) + drive_mode(1) + emergency(8) + turn_signal(1)
+    meta_data = struct.pack('<d', meta['target_accel'])
+    meta_data += struct.pack('<?', meta['drive_mode'])
+    meta_data += struct.pack('<d', meta['emergency'])
+    meta_data += struct.pack('<B', meta['turn_signal'])
+
+    # Footer (1B)
+    footer = struct.pack('<B', n_valid)
+
+    pkt = points_data + ego_data + meta_data + footer
+    assert len(pkt) == PACKET_SIZE, f"Packet size mismatch: {len(pkt)} != {PACKET_SIZE}"
+    return pkt
+
+
+def make_straight_trajectory(ego_x, ego_y, ego_yaw, spacing, num_points=50):
+    """Generate a straight-line trajectory in global coordinates.
+    Arc-length spacing (like real ADCM): each point is 'spacing' meters apart.
+    """
+    s = np.arange(num_points) * spacing
+    x = ego_x + s * np.cos(ego_yaw)
+    y = ego_y + s * np.sin(ego_yaw)
+    yaw = np.full(num_points, ego_yaw)
+    return np.column_stack([x, y, yaw])
+
+
+def make_curve_trajectory(radius, ego_x, ego_y, ego_yaw, spacing, num_points=50):
+    """Generate a curved trajectory (constant radius) in global coordinates.
+    Arc-length spacing. Positive radius = left turn, negative = right turn.
+    """
+    s = np.arange(num_points) * spacing
+    theta = s / abs(radius)
+    sign = 1.0 if radius > 0 else -1.0
+
+    cx = ego_x - sign * abs(radius) * np.sin(ego_yaw)
+    cy = ego_y + sign * abs(radius) * np.cos(ego_yaw)
+
+    angle = ego_yaw - sign * np.pi / 2 + sign * theta
+    x = cx + abs(radius) * np.cos(angle)
+    y = cy + abs(radius) * np.sin(angle)
+    yaw = ego_yaw + sign * theta
+    return np.column_stack([x, y, yaw])
+
+
+def compute_spacing(v_ego):
+    """Replicate ADCM spacing logic: horizon = clamp(v * clamp(0.2*v, 2, 5), 20, 200).
+    spacing = horizon / 79, but only first 50 points are sent via UDP.
+    """
+    lookahead_time = np.clip(0.2 * v_ego, 2.0, 5.0)
+    horizon = np.clip(v_ego * lookahead_time, 20.0, 200.0)
+    return horizon / 79.0
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Test UDP sender for Alpamayo udp_bridge')
+    parser = argparse.ArgumentParser(description='Test UDP sender for ADCM udp_bridge')
     parser.add_argument('--speed', type=float, default=10.0, help='Target speed m/s (default: 10 = 36km/h)')
+    parser.add_argument('--accel', type=float, default=2.0, help='Target acceleration m/s^2 (default: 2.0)')
     parser.add_argument('--duration', type=float, default=30.0, help='Send duration in seconds')
-    parser.add_argument('--hz', type=float, default=20.0, help='Send rate Hz')
+    parser.add_argument('--hz', type=float, default=10.0, help='Send rate Hz (ADCM ~10Hz)')
     parser.add_argument('--host', default='127.0.0.1', help='Target host')
-    parser.add_argument('--port', type=int, default=5005, help='Target port')
-    parser.add_argument('--curve', type=float, default=0.0, help='Turn radius (0=straight)')
-    parser.add_argument('--stop-at-end', action='store_true', help='Send stop signal at end')
+    parser.add_argument('--port', type=int, default=10002, help='Target port')
+    parser.add_argument('--curve', type=float, default=0.0, help='Turn radius in meters (0=straight, positive=left, negative=right)')
+    parser.add_argument('--stop-at-end', action='store_true', help='Send stop signal at end (drive_mode=False)')
     args = parser.parse_args()
 
     import cereal.messaging as messaging
@@ -109,12 +110,15 @@ def main():
     target = (args.host, args.port)
     sm = messaging.SubMaster(['carState'])
 
-    print(f"Sending trajectory: speed={args.speed}m/s ({args.speed*3.6:.0f}km/h), "
+    print(f"Sending ADCM trajectory: speed={args.speed}m/s ({args.speed*3.6:.0f}km/h), "
+          f"accel={args.accel}m/s^2, "
           f"{'curve r=' + str(args.curve) + 'm' if args.curve else 'straight'}")
     print(f"Target: {target}, Rate: {args.hz}Hz, Duration: {args.duration}s")
+    print(f"Packet size: {PACKET_SIZE}B (no header, ADCM native format)")
     print("---")
 
-    tx_seq = 0
+    ego_x, ego_y, ego_yaw = 0.0, 0.0, 0.0
+    seq = 0
     period = 1.0 / args.hz
     start = time.monotonic()
 
@@ -125,34 +129,70 @@ def main():
             sm.update(0)
             v_ego = max(sm['carState'].vEgo, 0.0)
 
-            if args.curve > 0:
-                x, y, yaw, vel, curv, dt_s = make_curve_trajectory(args.speed, args.curve, v_ego=v_ego)
-            else:
-                x, y, yaw, vel, curv, dt_s = make_straight_trajectory(args.speed, v_ego=v_ego)
+            # Update simulated ego position
+            dt = period
+            if seq > 0:
+                ego_x += v_ego * np.cos(ego_yaw) * dt
+                ego_y += v_ego * np.sin(ego_yaw) * dt
+                if args.curve != 0:
+                    ego_yaw += (v_ego / abs(args.curve)) * dt * (1.0 if args.curve > 0 else -1.0)
 
-            pkt = build_packet(x, y, yaw, vel, curv, dt_s, tx_seq, flags=FLAG_VALID)
+            # ADCM-style spacing based on current speed
+            spacing = compute_spacing(v_ego)
+
+            # Generate trajectory (x, y, yaw only -- no velocity, like real ADCM)
+            if args.curve != 0:
+                points = make_curve_trajectory(args.curve, ego_x, ego_y, ego_yaw, spacing)
+            else:
+                points = make_straight_trajectory(ego_x, ego_y, ego_yaw, spacing)
+
+            # target_accel: ramp up until speed reached, then 0
+            if v_ego < args.speed:
+                target_accel = args.accel
+            else:
+                target_accel = 0.0
+
+            ego = {'x': ego_x, 'y': ego_y, 'yaw': ego_yaw}
+            meta = {
+                'target_accel': target_accel,
+                'drive_mode': True,
+                'emergency': 0.0,
+                'turn_signal': 0,
+            }
+
+            pkt = build_packet(points, ego, meta)
             sock.sendto(pkt, target)
 
             elapsed_total = time.monotonic() - start
-            if tx_seq % int(args.hz * 2) == 0:  # print every 2 seconds
-                print(f"[{elapsed_total:6.1f}s] seq={tx_seq:5d} v_ego={v_ego*3.6:5.1f}km/h")
+            if seq % int(args.hz * 2) == 0:  # print every 2 seconds
+                print(f"[{elapsed_total:6.1f}s] seq={seq:5d} v_ego={v_ego*3.6:5.1f}km/h "
+                      f"accel={target_accel:+.1f}m/s^2 spacing={spacing:.2f}m "
+                      f"ego=({ego_x:.1f}, {ego_y:.1f}, {np.degrees(ego_yaw):.1f}deg)")
 
-            tx_seq += 1
+            seq += 1
 
             sleep_time = period - (time.monotonic() - loop_start)
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
         if args.stop_at_end:
-            print("Sending END_OF_STREAM...")
-            x, y, yaw, vel, curv, dt_s = make_straight_trajectory(0.0, v_ego=0.0)
-            pkt = build_packet(x, y, yaw, vel, curv, dt_s, tx_seq, flags=FLAG_END_OF_STREAM)
+            print("Sending stop (drive_mode=False)...")
+            spacing = compute_spacing(0.0)
+            points = make_straight_trajectory(ego_x, ego_y, ego_yaw, spacing)
+            ego = {'x': ego_x, 'y': ego_y, 'yaw': ego_yaw}
+            meta = {
+                'target_accel': 0.0,
+                'drive_mode': False,
+                'emergency': 0.0,
+                'turn_signal': 0,
+            }
+            pkt = build_packet(points, ego, meta)
             sock.sendto(pkt, target)
 
     except KeyboardInterrupt:
         print("\nInterrupted")
 
-    print(f"Done. Sent {tx_seq} packets in {time.monotonic() - start:.1f}s")
+    print(f"Done. Sent {seq} packets in {time.monotonic() - start:.1f}s")
     sock.close()
 
 
