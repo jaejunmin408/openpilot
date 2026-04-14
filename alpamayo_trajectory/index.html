@@ -67,9 +67,22 @@ const ctx = canvas.getContext('2d');
 // ── state ──
 let vehicle = null;       // plant_sim 차량 상태 (global)
 let trajectory = null;    // Alpamayo 경로 (global)
+let pendingLocal = null;  // 차량 상태가 아직 없을 때 보류된 local 경로
 let trail = [];           // 차량 궤적 이력
 const MAX_TRAIL = 5000;
 const SCALE = 40;         // px/m
+
+// local(ego: x=전방, y=좌측) → global. 도착 시점 pose(vx,vy,h)로 한 번만 고정.
+function localToGlobal(localPts, vx, vy, h) {
+  const cs = Math.cos(h), sn = Math.sin(h);
+  return localPts.map(p => ({
+    x: vx + cs * p.x - sn * p.y,
+    y: vy + sn * p.x + cs * p.y,
+    yaw: h + (p.yaw || 0),
+    vel: p.vel,
+    curvature: p.curvature,
+  }));
+}
 
 // ── canvas resize ──
 function resize() {
@@ -295,12 +308,50 @@ function connect() {
       draw();
     }
 
+    if (data.type === 'trajectory_local') {
+      // 도착 시점 차량 pose로 local→global 변환해 고정
+      if (vehicle) {
+        const pts = localToGlobal(data.points, vehicle.x, vehicle.y, vehicle.heading);
+        trajectory = {
+          type: 'trajectory',
+          seq: data.seq,
+          num_points: data.num_points,
+          dt_s: data.dt_s,
+          points: pts,
+          packet_count: data.packet_count,
+        };
+        pendingLocal = null;
+        updateTrajectoryPanel(trajectory);
+        statusEl.textContent = 'Receiving';
+        statusEl.className = 'connected';
+        draw();
+      } else {
+        // 차량 상태가 아직 없으면 첫 vehicle 도착 시 변환
+        pendingLocal = data;
+      }
+    }
+
     if (data.type === 'vehicle') {
       vehicle = data;
       // trail에 추가
       trail.push({ x: data.x, y: data.y });
       if (trail.length > MAX_TRAIL) trail.shift();
       updateVehiclePanel(data);
+
+      // 보류된 local 경로가 있으면 현재 pose로 변환해 고정
+      if (pendingLocal) {
+        const pts = localToGlobal(pendingLocal.points, data.x, data.y, data.heading);
+        trajectory = {
+          type: 'trajectory',
+          seq: pendingLocal.seq,
+          num_points: pendingLocal.num_points,
+          dt_s: pendingLocal.dt_s,
+          points: pts,
+          packet_count: pendingLocal.packet_count,
+        };
+        pendingLocal = null;
+        updateTrajectoryPanel(trajectory);
+      }
       draw();
     }
   };

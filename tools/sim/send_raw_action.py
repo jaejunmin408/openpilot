@@ -15,6 +15,8 @@ def main():
                     help='ac_decoded_path.json 경로')
     ap.add_argument('--host', default='127.0.0.1')
     ap.add_argument('--port', type=int, default=5005)
+    ap.add_argument('--viz-port', type=int, default=5007,
+                    help='viz 서버 미러 포트 (0이면 미전송)')
     args = ap.parse_args()
 
     path = Path(args.file)
@@ -30,6 +32,10 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.sendto(data, (args.host, args.port))
     print(f"sent {len(data)}B to {args.host}:{args.port} ({path.name})")
+
+    if args.viz_port:
+        sock.sendto(data, (args.host, args.viz_port))
+        print(f"sent {len(data)}B to {args.host}:{args.viz_port} (viz mirror)")
     return 0
 
 

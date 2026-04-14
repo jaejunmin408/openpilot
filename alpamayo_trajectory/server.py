@@ -26,6 +26,7 @@ CRC_SIZE = 4
 
 UDP_PORT = 5005       # Alpamayo 경로 패킷
 PLANT_UDP_PORT = 5006 # plant_sim 차량 상태
+AC_PATH_UDP_PORT = 5007 # ac_decoded_path.json 미러 (pred_xyz, local)
 WS_PORT = 8765
 HTTP_PORT = 8080
 
@@ -178,6 +179,53 @@ class UDPProtocol(asyncio.DatagramProtocol):
                   f"mode={'world' if packet['coord_mode'] == 1 else 'local'}")
 
 
+# ── ac_decoded_path.json 수신 (pred_xyz, local) ──
+class AcPathUDPProtocol(asyncio.DatagramProtocol):
+    def __init__(self):
+        self.count = 0
+
+    def datagram_received(self, data, addr):
+        try:
+            doc = json.loads(data.decode())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+
+        pred_xyz = doc.get('pred_xyz')
+        if not isinstance(pred_xyz, list) or not pred_xyz:
+            return
+        pred_yaw = doc.get('pred_yaw_rad') or []
+        pred_v = doc.get('pred_v_mps') or []
+        pred_curv = doc.get('pred_curvature') or []
+        dt_s = float(doc.get('plan_dt_s', 0.1))
+
+        self.count += 1
+        points = []
+        for i, xyz in enumerate(pred_xyz):
+            x = float(xyz[0]); y = float(xyz[1])
+            yaw = float(pred_yaw[i]) if i < len(pred_yaw) else 0.0
+            v = float(pred_v[i]) if i < len(pred_v) else 0.0
+            curv = float(pred_curv[i]) if i < len(pred_curv) else 0.0
+            points.append({
+                'x': round(x, 4),
+                'y': round(y, 4),
+                'yaw': round(yaw, 4),
+                'vel': round(v, 3),
+                'curvature': round(curv, 5),
+            })
+
+        msg = json.dumps({
+            'type': 'trajectory_local',
+            'seq': self.count,
+            'num_points': len(points),
+            'dt_s': dt_s,
+            'points': points,
+            'packet_count': self.count,
+        })
+        asyncio.ensure_future(broadcast(msg))
+        print(f"[AC_PATH] pkt#{self.count} pts={len(points)} dt={dt_s:.3f}s "
+              f"label={doc.get('label')}")
+
+
 # ── plant_sim 차량 상태 수신 ──
 class PlantUDPProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data, addr):
@@ -205,6 +253,7 @@ def start_http_server():
 async def main():
     print(f"[Server] UDP trajectory on port {UDP_PORT}")
     print(f"[Server] UDP plant_sim on port {PLANT_UDP_PORT}")
+    print(f"[Server] UDP ac_decoded_path on port {AC_PATH_UDP_PORT}")
     print(f"[Server] WebSocket on port {WS_PORT}")
     print(f"[Server] HTTP on port {HTTP_PORT}")
     print(f"[Server] Open http://localhost:{HTTP_PORT}/ in browser")
@@ -227,6 +276,12 @@ async def main():
     await loop.create_datagram_endpoint(
         lambda: PlantUDPProtocol(),
         local_addr=('0.0.0.0', PLANT_UDP_PORT),
+    )
+
+    # UDP — ac_decoded_path.json 미러
+    await loop.create_datagram_endpoint(
+        lambda: AcPathUDPProtocol(),
+        local_addr=('0.0.0.0', AC_PATH_UDP_PORT),
     )
 
     # WebSocket
