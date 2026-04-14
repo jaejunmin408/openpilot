@@ -263,14 +263,15 @@ async def main():
 
     loop = asyncio.get_event_loop()
 
-    # UDP — Alpamayo 경로 (openpilot udp_bridge가 5005를 점유하는 경우 VIZ_DISABLE_ALPA=1 로 스킵)
-    if os.environ.get('VIZ_DISABLE_ALPA') != '1':
+    # UDP — Alpamayo 바이너리 ALPA 경로 (기본 OFF: udp_bridge가 5005를 점유. VIZ_ENABLE_ALPA=1 로 활성)
+    if os.environ.get('VIZ_ENABLE_ALPA') == '1':
         await loop.create_datagram_endpoint(
             lambda: UDPProtocol(loop),
             local_addr=('0.0.0.0', UDP_PORT),
         )
+        print(f"[Server] ALPA UDP(:{UDP_PORT}) enabled via VIZ_ENABLE_ALPA")
     else:
-        print(f"[Server] ALPA UDP(:{UDP_PORT}) disabled via VIZ_DISABLE_ALPA")
+        print(f"[Server] ALPA UDP(:{UDP_PORT}) skipped (set VIZ_ENABLE_ALPA=1 to enable)")
 
     # UDP — plant_sim 차량 상태
     await loop.create_datagram_endpoint(
