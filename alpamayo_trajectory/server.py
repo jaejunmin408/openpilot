@@ -226,12 +226,14 @@ class AcPathUDPProtocol(asyncio.DatagramProtocol):
               f"label={doc.get('label')}")
 
 
-# ── plant_sim 차량 상태 수신 ──
+# ── plant_sim 차량 상태 + 외부 trajectory JSON 수신 ──
 class PlantUDPProtocol(asyncio.DatagramProtocol):
+    ALLOWED_TYPES = {'vehicle', 'trajectory', 'trajectory_local'}
+
     def datagram_received(self, data, addr):
         try:
             state = json.loads(data.decode())
-            if state.get('type') == 'vehicle':
+            if state.get('type') in self.ALLOWED_TYPES:
                 msg = json.dumps(state)
                 asyncio.ensure_future(broadcast(msg))
         except (json.JSONDecodeError, UnicodeDecodeError):
