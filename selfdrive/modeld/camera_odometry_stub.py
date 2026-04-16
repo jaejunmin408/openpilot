@@ -15,11 +15,15 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 
 def main():
   pm = messaging.PubMaster(["cameraOdometry"])
+  sm = messaging.SubMaster(['carState'])
   frame_id = 0
   period = 1.0 / ModelConstants.MODEL_RUN_FREQ  # 20Hz
 
   while True:
     loop_start = time.monotonic()
+
+    sm.update(0)
+    v_ego = sm['carState'].vEgo if sm.alive['carState'] else 0.0
 
     msg = messaging.new_message('cameraOdometry')
     msg.valid = True
@@ -28,11 +32,10 @@ def main():
     co.frameId = frame_id
     co.timestampEof = int(time.monotonic() * 1e9)
 
-    # Near-zero pose (stationary camera)
-    co.trans = [0.0, 0.0, 0.0]
+    co.trans = [v_ego, 0.0, 0.0]
     co.rot = [0.0, 0.0, 0.0]
-    co.transStd = [0.01, 0.01, 0.01]
-    co.rotStd = [0.01, 0.01, 0.01]
+    co.transStd = [0.5, 0.5, 0.5]
+    co.rotStd = [1.0, 1.0, 1.0]
     co.wideFromDeviceEuler = [0.0, 0.0, 0.0]
     co.wideFromDeviceEulerStd = [0.01, 0.01, 0.01]
     co.roadTransformTrans = [0.0, 0.0, 1.2]  # camera height ~1.2m

@@ -244,8 +244,16 @@ class PlantUDPProtocol(asyncio.DatagramProtocol):
 SERVE_DIR = Path(__file__).parent
 
 
+class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Expires', '0')
+        super().end_headers()
+
+
 def start_http_server():
-    handler = lambda *args, **kwargs: http.server.SimpleHTTPRequestHandler(
+    handler = lambda *args, **kwargs: NoCacheHandler(
         *args, directory=str(SERVE_DIR), **kwargs
     )
     httpd = http.server.HTTPServer(('0.0.0.0', HTTP_PORT), handler)

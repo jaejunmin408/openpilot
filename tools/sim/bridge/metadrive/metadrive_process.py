@@ -102,7 +102,15 @@ def metadrive_process(dual_camera: bool, config: dict, camera_array, wide_camera
     vehicle_state = metadrive_vehicle_state(
       velocity=vec3(x=float(env.vehicle.velocity[0]), y=float(env.vehicle.velocity[1]), z=0),
       position=env.vehicle.position,
-      bearing=float(math.degrees(env.vehicle.heading_theta)),
+      # heading_theta: math angle (CCW from sim +x). simulated_sensors 는 sim +x → East,
+      # sim +y → South 로 매핑(vNED=[-vy, vx, vz])하므로, sim world 는 표준 ENU 와 Y 축이
+      # 반전된 형태. 따라서 MetaDrive 의 CCW 회전은 지리적으로는 CW(compass 증가) 방향.
+      # 즉 bearing_compass(N=0°, CW+) = (θ_deg + 90) mod 360.
+      #   θ=0 (East) → bearing=90
+      #   θ=π/2 (world +Y = South) → bearing=180
+      #   θ=π (West) → bearing=270
+      #   θ=-π/2 (world -Y = North) → bearing=0
+      bearing=float((math.degrees(env.vehicle.heading_theta) + 90.0) % 360.0),
       steering_angle=env.vehicle.steering * env.vehicle.MAX_STEERING
     )
     vehicle_state_send.send(vehicle_state)
