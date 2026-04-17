@@ -5,10 +5,11 @@
 <title>Alpamayo Trajectory + openpilot Plant</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #1a1a2e; color: #eee; font-family: 'Consolas', monospace; display: flex; height: 100vh; }
-  #canvas { flex: 1; display: block; }
+  body { background: #1a1a2e; color: #eee; font-family: 'Consolas', monospace; display: flex; height: 100vh; overflow: hidden; }
+  #canvas { flex: 1 1 0; min-width: 0; display: block; }
   #panel {
-    width: 280px; padding: 16px; background: #16213e; overflow-y: auto;
+    flex: 0 0 280px;  /* grow:0 shrink:0 basis:280px — 어떤 zoom/DPI에서도 절대 안 줄어듦 */
+    padding: 16px; background: #16213e; overflow-y: auto;
     border-left: 1px solid #0f3460;
   }
   #panel h2 { color: #e94560; margin-bottom: 12px; font-size: 16px; }
@@ -35,7 +36,7 @@
   <div id="status" class="disconnected">Disconnected</div>
 
   <div class="section">
-    <h3>Vehicle (plant_sim)</h3>
+    <h3>Vehicle (LocalWorld)</h3>
     <div class="info-row"><span class="info-label">Position</span><span class="info-value" id="v-pos">-</span></div>
     <div class="info-row"><span class="info-label">Heading</span><span class="info-value" id="v-hdg">-</span></div>
     <div class="info-row"><span class="info-label">Speed</span><span class="info-value" id="v-speed">-</span></div>
@@ -65,12 +66,13 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 
 // ── state ──
-let vehicle = null;       // plant_sim 차량 상태 (global)
-let trajectory = null;    // Alpamayo 경로 (global)
-let pendingLocal = null;  // 차량 상태가 아직 없을 때 보류된 local 경로
-let trail = [];           // 차량 궤적 이력
+let vehicle = null;            // livepose_to_viz: LocalWorld 차량 상태 (type: 'vehicle')
+let egoPath = null;            // livepose_to_viz: LocalWorld 6초 실주행 이력 (type: 'trajectory')
+let plannedTrajectory = null;  // 외부 planner 계획 경로 (type: 'trajectory_local')
+let pendingLocal = null;       // 차량 상태가 아직 없을 때 보류된 local 경로
+let trail = [];                // 차량 궤적 이력 (client-side 누적)
 const MAX_TRAIL = 5000;
-const SCALE = 40;         // px/m
+const SCALE = 40;              // px/m
 
 // local(ego: x=전방, y=좌측) → global. 도착 시점 pose(vx,vy,h)로 한 번만 고정.
 function localToGlobal(localPts, vx, vy, h) {
@@ -144,9 +146,24 @@ function draw() {
     ctx.setLineDash([]);
   }
 
-  // ── Alpamayo 경로 ──
-  if (trajectory && trajectory.points.length > 1) {
-    const pts = trajectory.points;
+  // ── Ego Path (livepose_to_viz: LocalWorld 6초 실주행 이력) ──
+  if (egoPath && egoPath.points.length > 1) {
+    const pts = egoPath.points;
+    ctx.beginPath();
+    const s0 = toScreen(pts[0].x, pts[0].y, camX, camY, W, H);
+    ctx.moveTo(s0.sx, s0.sy);
+    for (let i = 1; i < pts.length; i++) {
+      const s = toScreen(pts[i].x, pts[i].y, camX, camY, W, H);
+      ctx.lineTo(s.sx, s.sy);
+    }
+    ctx.strokeStyle = 'rgba(6, 214, 160, 0.8)';  // 청록: 실주행 이력
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  // ── 계획 경로 (외부 planner, trajectory_local) ──
+  if (plannedTrajectory && plannedTrajectory.points.length > 1) {
+    const pts = plannedTrajectory.points;
     for (let i = 0; i < pts.length - 1; i++) {
       const sa = toScreen(pts[i].x, pts[i].y, camX, camY, W, H);
       const sb = toScreen(pts[i+1].x, pts[i+1].y, camX, camY, W, H);
@@ -185,7 +202,7 @@ function draw() {
     ctx.fillText('END', endS.sx + 8, endS.sy + 4);
   }
 
-  // ── 차량 (plant_sim) ──
+  // ── 차량 (LocalWorld) ──
   if (vehicle) {
     const cs = toScreen(vehicle.x, vehicle.y, camX, camY, W, H);
     drawCar(cs.sx, cs.sy, vehicle.heading);
@@ -301,19 +318,18 @@ function connect() {
     const data = JSON.parse(e.data);
 
     if (data.type === 'trajectory') {
-      trajectory = data;
-      updateTrajectoryPanel(data);
+      // livepose_to_viz: LocalWorld 실주행 이력 (egoPath). 계획 경로와 별도 slot.
+      egoPath = data;
       statusEl.textContent = 'Receiving';
       statusEl.className = 'connected';
       draw();
     }
 
     if (data.type === 'trajectory_local') {
-      // 도착 시점 차량 pose로 local→global 변환해 고정
+      // 외부 planner 계획 경로 — 도착 시점 차량 pose로 local→global 변환해 고정
       if (vehicle) {
         const pts = localToGlobal(data.points, vehicle.x, vehicle.y, vehicle.heading);
-        trajectory = {
-          type: 'trajectory',
+        plannedTrajectory = {
           seq: data.seq,
           num_points: data.num_points,
           dt_s: data.dt_s,
@@ -321,7 +337,7 @@ function connect() {
           packet_count: data.packet_count,
         };
         pendingLocal = null;
-        updateTrajectoryPanel(trajectory);
+        updateTrajectoryPanel(plannedTrajectory);
         statusEl.textContent = 'Receiving';
         statusEl.className = 'connected';
         draw();
@@ -341,8 +357,7 @@ function connect() {
       // 보류된 local 경로가 있으면 현재 pose로 변환해 고정
       if (pendingLocal) {
         const pts = localToGlobal(pendingLocal.points, data.x, data.y, data.heading);
-        trajectory = {
-          type: 'trajectory',
+        plannedTrajectory = {
           seq: pendingLocal.seq,
           num_points: pendingLocal.num_points,
           dt_s: pendingLocal.dt_s,
@@ -350,7 +365,7 @@ function connect() {
           packet_count: pendingLocal.packet_count,
         };
         pendingLocal = null;
-        updateTrajectoryPanel(trajectory);
+        updateTrajectoryPanel(plannedTrajectory);
       }
       draw();
     }

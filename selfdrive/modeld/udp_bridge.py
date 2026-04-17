@@ -24,6 +24,7 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 
 # ── 설정 ──────────────────────────────────────────────
 UDP_PORT = 5005
+VIZ_UDP_PORT = 5007  # 수신 패킷을 viz(server.py AcPathUDPProtocol)에 그대로 미러
 RECV_BUF_SIZE = 65535
 
 T_IDXS = np.array(ModelConstants.T_IDXS, dtype=np.float64)
@@ -356,6 +357,10 @@ def main():
                     cloudlog.warning(f"udp_bridge: received action plan #{recv_count} "
                                      f"(N={pkt['N']}, dt={pkt['dt_s']:.3f}s, "
                                      f"{len(data)}B)")
+                    try:
+                        sock.sendto(data, ('127.0.0.1', VIZ_UDP_PORT))
+                    except OSError:
+                        pass
         except BlockingIOError:
             pass
 
