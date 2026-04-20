@@ -65,6 +65,7 @@ def parse_action_packet(data: bytes):
         a = np.asarray(ra['accel_mps2'], dtype=np.float32)
         c = np.asarray(ra['curvature'], dtype=np.float32)
         dt_s = float(d.get('plan_dt_s', 0.1))
+        inference_time_s = float(d.get('inference_time_s', 0.0))
 
         pred_xyz = np.asarray(d['pred_xyz'], dtype=np.float32)       # (N,3)
         pred_yaw = np.asarray(d['pred_yaw_rad'], dtype=np.float32)   # (N,)
@@ -91,6 +92,7 @@ def parse_action_packet(data: bytes):
         'ego_x': ego_x, 'ego_y': ego_y, 'ego_z': ego_z,
         'ego_yaw': ego_yaw, 'path_v': path_v,
         'a_ff': a_ff, 'dt_s': dt_s, 'N': N,
+        'inference_time_s': inference_time_s,
     }
 
 
@@ -448,9 +450,11 @@ def main():
                 pkt = parse_action_packet(data)
                 if pkt is not None:
                     recv_count += 1
+                    pkt['recv_mono_ns'] = time.monotonic_ns()
                     pending_pkt = pkt       # anchor 잡기 전까지 보관
                     cloudlog.warning(f"udp_bridge: received plan #{recv_count} "
-                                     f"(N={pkt['N']}, dt={pkt['dt_s']:.3f}s, {len(data)}B) — awaiting anchor")
+                                     f"(N={pkt['N']}, dt={pkt['dt_s']:.3f}s, "
+                                     f"inference={pkt['inference_time_s']:.3f}s, {len(data)}B) — awaiting anchor")
         except BlockingIOError:
             pass
 
@@ -460,13 +464,20 @@ def main():
             world.update(sm["livePose"], sm.logMonoTime["livePose"])
 
         # 3. pending 패킷이 있고 LocalWorld 초기화되면 anchor 잡아 world frame으로 저장
+        #    inference_time_s 만큼 과거의 ego pose를 LocalWorld history에서 조회해 anchor로 사용
+        #    (path[0] = Alpamayo가 캡처한 시점의 ego 위치·방향에 맞물림)
         if pending_pkt is not None and world.is_initialized():
-            cur = world.current()
-            anchor = (cur[1], cur[2], cur[3])
+            inference_time_s = pending_pkt['inference_time_s']
+            past_t_ns = pending_pkt['recv_mono_ns'] - int(inference_time_s * 1e9)
+            past = world.at(past_t_ns)       # 범위 밖이면 가장 가까운 끝점으로 clamp
+            anchor = (past[1], past[2], past[3])
             stored = path_ego_to_world(pending_pkt, anchor)
             pending_pkt = None
+            clamped = (past[0] != past_t_ns)
             cloudlog.warning(f"udp_bridge: anchor set at "
-                             f"x={anchor[0]:.2f} y={anchor[1]:.2f} yaw={math.degrees(anchor[2]):.1f}°")
+                             f"x={anchor[0]:.2f} y={anchor[1]:.2f} yaw={math.degrees(anchor[2]):.1f}° "
+                             f"(inference={inference_time_s:.3f}s"
+                             f"{', CLAMPED' if clamped else ''})")
 
         v_ego = max(sm["carState"].vEgo, 0.0)
 
