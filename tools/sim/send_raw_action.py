@@ -2,8 +2,12 @@
 """
 ac_decoded_path.json을 UDP로 1회 전송 → udp_bridge가 수신.
 viz 미러는 udp_bridge가 담당하므로 여기서는 순수 발행만.
+
+--age-ns 로 Alpamayo 추론 지연(ns)을 시뮬레이션해 JSON top-level에 inference_age_ns 필드로 주입.
+udp_bridge가 이 값을 P_snap(과거 pose) 조회에 사용한다.
 """
 import argparse
+import json
 import socket
 import sys
 from pathlib import Path
@@ -15,6 +19,8 @@ def main():
                     help='ac_decoded_path.json 경로')
     ap.add_argument('--host', default='127.0.0.1')
     ap.add_argument('--port', type=int, default=5005)
+    ap.add_argument('--age-ns', dest='age_ns', type=int, default=0,
+                    help='simulated Alpamayo inference elapsed time (ns); injected as top-level inference_age_ns')
     args = ap.parse_args()
 
     path = Path(args.file)
@@ -22,14 +28,22 @@ def main():
         print(f"file not found: {path}", file=sys.stderr)
         return 1
 
-    data = path.read_bytes()
+    try:
+        doc = json.loads(path.read_text())
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        print(f"invalid JSON: {e}", file=sys.stderr)
+        return 1
+
+    doc['inference_age_ns'] = int(args.age_ns)
+    data = json.dumps(doc).encode()
+
     if len(data) > 65507:
         print(f"payload {len(data)}B exceeds UDP max 65507B", file=sys.stderr)
         return 1
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.sendto(data, (args.host, args.port))
-    print(f"sent {len(data)}B to {args.host}:{args.port} ({path.name})")
+    print(f"sent {len(data)}B to {args.host}:{args.port} ({path.name}, age_ns={args.age_ns})")
     return 0
 
 

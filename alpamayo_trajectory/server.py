@@ -3,10 +3,13 @@
 브라우저 시각화 서버.
 
 수신:
-  - UDP 5006 (VehicleStateUDPProtocol): livepose_to_viz.py 가 보내는
+  - UDP 5006 (VehicleStateUDPProtocol): udp_bridge.py 가 보내는
     LocalWorld pose + 6초 trail (type=vehicle, trajectory)
+    ※ 이전엔 livepose_to_viz.py 가 담당했으나 LocalWorld 원점 공유를 위해 udp_bridge 로 이관됨
   - UDP 5007 (AcPathUDPProtocol): udp_bridge.py 가 수신한 ac_decoded_path.json
     을 그대로 미러링한 것 (→ type=trajectory_local 로 변환 후 브로드캐스트)
+  - UDP 5008 (WorldPathUDPProtocol): udp_bridge.py 가 P_snap 으로 worldFrame
+    변환한 경로 (type=trajectory_world, 이미 world 좌표계)
 
 전송:
   - WebSocket 8765: 위 수신 JSON 을 연결된 모든 브라우저에 브로드캐스트
@@ -20,8 +23,9 @@ import websockets
 import http.server
 import threading
 
-VEHICLE_STATE_UDP_PORT = 5006  # livepose_to_viz → VehicleStateUDPProtocol
-AC_PATH_UDP_PORT = 5007        # udp_bridge 미러 → AcPathUDPProtocol
+VEHICLE_STATE_UDP_PORT = 5006  # udp_bridge → VehicleStateUDPProtocol (LocalWorld pose + trail)
+AC_PATH_UDP_PORT = 5007        # udp_bridge 미러 → AcPathUDPProtocol (ego-frame, trajectory_local)
+WORLD_PATH_UDP_PORT = 5008     # udp_bridge → WorldPathUDPProtocol (P_snap 으로 변환된 worldFrame 경로)
 WS_PORT = 8765
 HTTP_PORT = 8080
 
@@ -114,6 +118,26 @@ class VehicleStateUDPProtocol(asyncio.DatagramProtocol):
             pass
 
 
+# ── worldFrame trajectory (P_snap 으로 변환된 경로) JSON 수신 ──
+class WorldPathUDPProtocol(asyncio.DatagramProtocol):
+    """udp_bridge 가 보내는 type=trajectory_world 메시지를 그대로 WebSocket 브로드캐스트."""
+
+    def __init__(self):
+        self.count = 0
+
+    def datagram_received(self, data, addr):
+        try:
+            state = json.loads(data.decode())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        if state.get('type') != 'trajectory_world':
+            return
+        self.count += 1
+        asyncio.ensure_future(broadcast(json.dumps(state)))
+        print(f"[WORLD_PATH] pkt#{self.count} pts={state.get('num_points')} "
+              f"dt={state.get('dt_s')}")
+
+
 # ── HTTP 서버 (index.html 서빙, 별도 스레드) ──
 SERVE_DIR = Path(__file__).parent
 
@@ -137,6 +161,7 @@ def start_http_server():
 async def main():
     print(f"[Server] UDP vehicle state on port {VEHICLE_STATE_UDP_PORT}")
     print(f"[Server] UDP ac_decoded_path on port {AC_PATH_UDP_PORT}")
+    print(f"[Server] UDP world path on port {WORLD_PATH_UDP_PORT}")
     print(f"[Server] WebSocket on port {WS_PORT}")
     print(f"[Server] HTTP on port {HTTP_PORT}")
     print(f"[Server] Open http://localhost:{HTTP_PORT}/ in browser")
@@ -152,10 +177,16 @@ async def main():
         local_addr=('0.0.0.0', VEHICLE_STATE_UDP_PORT),
     )
 
-    # UDP — ac_decoded_path.json 미러 (udp_bridge 가 포워드)
+    # UDP — ac_decoded_path.json 미러 (udp_bridge 가 포워드, ego-frame 그대로)
     await loop.create_datagram_endpoint(
         lambda: AcPathUDPProtocol(),
         local_addr=('0.0.0.0', AC_PATH_UDP_PORT),
+    )
+
+    # UDP — worldFrame 변환된 경로 (udp_bridge 가 P_snap 으로 변환)
+    await loop.create_datagram_endpoint(
+        lambda: WorldPathUDPProtocol(),
+        local_addr=('0.0.0.0', WORLD_PATH_UDP_PORT),
     )
 
     # WebSocket
