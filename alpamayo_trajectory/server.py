@@ -25,8 +25,9 @@ POINT_SIZE = struct.calcsize(POINT_FMT)    # 20
 CRC_SIZE = 4
 
 UDP_PORT = 5005       # Alpamayo 경로 패킷
-PLANT_UDP_PORT = 5006 # plant_sim 차량 상태
+PLANT_UDP_PORT = 5006 # plant_sim 차량 상태 + LocalWorld vehicle/trail
 AC_PATH_UDP_PORT = 5007 # ac_decoded_path.json 미러 (pred_xyz, local)
+WORLD_PATH_UDP_PORT = 5008 # 과거 anchor로 월드에 박힌 경로 (trajectory_world)
 WS_PORT = 8765
 HTTP_PORT = 8080
 
@@ -240,6 +241,26 @@ class PlantUDPProtocol(asyncio.DatagramProtocol):
             pass
 
 
+# ── worldFrame trajectory (과거 anchor로 월드에 박힌 경로) 수신 ──
+class WorldPathUDPProtocol(asyncio.DatagramProtocol):
+    """udp_bridge가 보내는 type=trajectory_world 메시지를 그대로 WebSocket 브로드캐스트."""
+
+    def __init__(self):
+        self.count = 0
+
+    def datagram_received(self, data, addr):
+        try:
+            state = json.loads(data.decode())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        if state.get('type') != 'trajectory_world':
+            return
+        self.count += 1
+        asyncio.ensure_future(broadcast(json.dumps(state)))
+        print(f"[WORLD_PATH] pkt#{self.count} pts={state.get('num_points')} "
+              f"dt={state.get('dt_s')}")
+
+
 # ── HTTP 서버 (index.html 서빙, 별도 스레드) ──
 SERVE_DIR = Path(__file__).parent
 
@@ -264,6 +285,7 @@ async def main():
     print(f"[Server] UDP trajectory on port {UDP_PORT}")
     print(f"[Server] UDP plant_sim on port {PLANT_UDP_PORT}")
     print(f"[Server] UDP ac_decoded_path on port {AC_PATH_UDP_PORT}")
+    print(f"[Server] UDP world path on port {WORLD_PATH_UDP_PORT}")
     print(f"[Server] WebSocket on port {WS_PORT}")
     print(f"[Server] HTTP on port {HTTP_PORT}")
     print(f"[Server] Open http://localhost:{HTTP_PORT}/ in browser")
@@ -293,6 +315,12 @@ async def main():
     await loop.create_datagram_endpoint(
         lambda: AcPathUDPProtocol(),
         local_addr=('0.0.0.0', AC_PATH_UDP_PORT),
+    )
+
+    # UDP — worldFrame 변환된 경로 (udp_bridge가 과거 anchor로 월드에 박은 경로)
+    await loop.create_datagram_endpoint(
+        lambda: WorldPathUDPProtocol(),
+        local_addr=('0.0.0.0', WORLD_PATH_UDP_PORT),
     )
 
     # WebSocket

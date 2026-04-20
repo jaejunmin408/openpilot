@@ -66,9 +66,10 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 
 // ── state ──
-let vehicle = null;            // plant_sim 차량 상태 (global)
-let egoPath = null;            // livepose_to_viz: LocalWorld 6초 실주행 이력 (type: 'trajectory')
+let vehicle = null;            // udp_bridge: LocalWorld 차량 상태 (type: 'vehicle')
+let egoPath = null;            // udp_bridge: LocalWorld 6초 실주행 이력 (type: 'trajectory')
 let plannedTrajectory = null;  // 외부 planner 계획 경로 (type: 'trajectory_local')
+let worldTrajectory = null;    // udp_bridge가 과거 anchor로 월드에 박힌 경로 (type: 'trajectory_world')
 let pendingLocal = null;       // 차량 상태가 아직 없을 때 보류된 local 경로
 let trail = [];                // 차량 궤적 이력 (client-side 누적)
 const MAX_TRAIL = 5000;
@@ -200,6 +201,35 @@ function draw() {
     ctx.fillStyle = '#999';
     ctx.font = '11px Consolas';
     ctx.fillText('END', endS.sx + 8, endS.sy + 4);
+  }
+
+  // ── worldFrame 계획 경로 (과거 anchor, trajectory_world) ──
+  // 이미 world 좌표이므로 localToGlobal 불필요. plannedTrajectory 위에 덮어 그려 대조.
+  if (worldTrajectory && worldTrajectory.points.length > 1) {
+    const pts = worldTrajectory.points;
+    ctx.beginPath();
+    const s0 = toScreen(pts[0].x, pts[0].y, camX, camY, W, H);
+    ctx.moveTo(s0.sx, s0.sy);
+    for (let i = 1; i < pts.length; i++) {
+      const s = toScreen(pts[i].x, pts[i].y, camX, camY, W, H);
+      ctx.lineTo(s.sx, s.sy);
+    }
+    ctx.strokeStyle = 'rgba(255, 150, 0, 0.85)';  // 주황: 과거 anchor 월드 경로
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    // 앵커 시작점(= 추론 시작 시점 ego 위치) 강조
+    ctx.beginPath();
+    ctx.arc(s0.sx, s0.sy, 6, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255, 150, 0, 1.0)';
+    ctx.fill();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    ctx.fillStyle = 'rgba(255, 150, 0, 0.9)';
+    ctx.font = '11px Consolas';
+    ctx.fillText('P_snap', s0.sx + 10, s0.sy - 6);
   }
 
   // ── 차량 (plant_sim) ──
@@ -345,6 +375,15 @@ function connect() {
         // 차량 상태가 아직 없으면 첫 vehicle 도착 시 변환
         pendingLocal = data;
       }
+    }
+
+    if (data.type === 'trajectory_world') {
+      // udp_bridge가 과거 anchor로 월드에 박은 경로. 이미 world 좌표라 변환 없이 그대로 렌더.
+      worldTrajectory = data;
+      updateTrajectoryPanel(data);
+      statusEl.textContent = 'Receiving';
+      statusEl.className = 'connected';
+      draw();
     }
 
     if (data.type === 'vehicle') {

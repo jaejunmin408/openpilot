@@ -26,6 +26,9 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 
 # ── 설정 ──────────────────────────────────────────────
 UDP_PORT = 5005
+LOCAL_PATH_VIZ_PORT = 5007   # 수신한 Alpamayo JSON 원본을 viz에 미러 (ego-frame, trajectory_local)
+VEHICLE_VIZ_PORT = 5006      # LocalWorld 현재 pose + 6초 trail
+WORLD_PATH_VIZ_PORT = 5008   # 과거 anchor로 월드에 박힌 경로 (trajectory_world)
 RECV_BUF_SIZE = 65535
 
 T_IDXS = np.array(ModelConstants.T_IDXS, dtype=np.float64)
@@ -418,6 +421,92 @@ def publish_messages(pm, rs, action, frame_id, v_ego):
     pm.send('driverAssistance', assist_send)
 
 
+# ── viz 송신 ─────────────────────────────────────────
+def build_world_path(stored):
+    """stored(world frame)를 viz 렌더러가 기대하는 dict 리스트로 포장.
+    stored['world_x'/'world_y'/'world_yaw']는 이미 LocalWorld(LEFT/CCW) 좌표이므로
+    추가 변환 없이 그대로 직렬화만 수행. yaw는 [-π, π]로 wrap.
+    """
+    xs = np.asarray(stored['world_x'], dtype=np.float64)
+    ys = np.asarray(stored['world_y'], dtype=np.float64)
+    yaws = np.asarray(stored['world_yaw'], dtype=np.float64)
+    yaws_wrapped = np.arctan2(np.sin(yaws), np.cos(yaws))
+    path_v = np.asarray(stored['path_v'], dtype=np.float64)
+    N = int(stored['N'])
+    out = []
+    for i in range(N):
+        out.append({
+            "x": float(xs[i]),
+            "y": float(ys[i]),
+            "yaw": float(yaws_wrapped[i]),
+            "vel": float(path_v[i]),
+            "curvature": 0.0,
+        })
+    return out
+
+
+def send_vehicle_viz(viz_sock, world, lp, frame_id):
+    """LocalWorld 현재 pose + 6초 history를 viz(5006) 로 송신."""
+    cur = world.current()
+    if cur is None:
+        return
+    _, x, y, yaw = cur
+    speed = float(np.hypot(lp.velocityDevice.x, lp.velocityDevice.y))
+    accel = float(lp.accelerationDevice.x)
+
+    vehicle_msg = {
+        "type": "vehicle",
+        "x": float(x), "y": float(y),
+        "heading": float(yaw),
+        "speed": speed,
+        "accel": accel,
+        "curvature": 0.0,
+        "should_stop": False,
+        "frame": int(frame_id),
+    }
+    try:
+        viz_sock.sendto(json.dumps(vehicle_msg).encode(), ("127.0.0.1", VEHICLE_VIZ_PORT))
+    except OSError:
+        pass
+
+    hist = world.history()
+    if len(hist) >= 2:
+        pts = [
+            {"x": float(hx), "y": float(hy), "yaw": float(hyaw), "vel": speed, "curvature": 0.0}
+            for (_, hx, hy, hyaw) in hist
+        ]
+        traj_msg = {
+            "type": "trajectory",
+            "seq": int(frame_id),
+            "plan_seq": int(frame_id),
+            "coord_mode": 1,
+            "num_points": len(pts),
+            "dt_s": 0.05,
+            "points": pts,
+            "packet_count": int(frame_id),
+        }
+        try:
+            viz_sock.sendto(json.dumps(traj_msg).encode(), ("127.0.0.1", VEHICLE_VIZ_PORT))
+        except OSError:
+            pass
+
+
+def send_world_path_viz(viz_sock, points, dt_s, seq):
+    """과거 anchor로 월드에 박힌 경로를 viz(5008) 로 송신."""
+    msg = {
+        "type": "trajectory_world",
+        "seq": int(seq),
+        "num_points": len(points),
+        "dt_s": float(dt_s),
+        "points": points,
+        "packet_count": int(seq),
+    }
+    try:
+        viz_sock.sendto(json.dumps(msg).encode(), ("127.0.0.1", WORLD_PATH_VIZ_PORT))
+    except OSError:
+        pass
+
+
 # ── main ──────────────────────────────────────────────
 def main():
     cloudlog.warning("udp_bridge init (position-tracking mode)")
@@ -429,7 +518,13 @@ def main():
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(('0.0.0.0', UDP_PORT))
     sock.setblocking(False)
+
+    viz_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    viz_sock.setblocking(False)
+
     cloudlog.warning(f"udp_bridge listening on port {UDP_PORT} (JSON ac_decoded_path)")
+    cloudlog.warning(f"udp_bridge viz publish: vehicle/trail→{VEHICLE_VIZ_PORT}, "
+                     f"raw mirror→{LOCAL_PATH_VIZ_PORT}, worldFrame→{WORLD_PATH_VIZ_PORT}")
 
     world = LocalWorld()
     frame_id = 0
@@ -455,6 +550,11 @@ def main():
                     cloudlog.warning(f"udp_bridge: received plan #{recv_count} "
                                      f"(N={pkt['N']}, dt={pkt['dt_s']:.3f}s, "
                                      f"inference={pkt['inference_time_s']:.3f}s, {len(data)}B) — awaiting anchor")
+                    # raw mirror → viz (ego-frame 원본, trajectory_local)
+                    try:
+                        viz_sock.sendto(data, ('127.0.0.1', LOCAL_PATH_VIZ_PORT))
+                    except OSError:
+                        pass
         except BlockingIOError:
             pass
 
@@ -472,12 +572,15 @@ def main():
             past = world.at(past_t_ns)       # 범위 밖이면 가장 가까운 끝점으로 clamp
             anchor = (past[1], past[2], past[3])
             stored = path_ego_to_world(pending_pkt, anchor)
-            pending_pkt = None
             clamped = (past[0] != past_t_ns)
             cloudlog.warning(f"udp_bridge: anchor set at "
                              f"x={anchor[0]:.2f} y={anchor[1]:.2f} yaw={math.degrees(anchor[2]):.1f}° "
                              f"(inference={inference_time_s:.3f}s"
                              f"{', CLAMPED' if clamped else ''})")
+            # world path viz → 5008 (anchor에 박힌 상태 그대로 1회 송신)
+            world_points = build_world_path(stored)
+            send_world_path_viz(viz_sock, world_points, pending_pkt['dt_s'], recv_count)
+            pending_pkt = None
 
         v_ego = max(sm["carState"].vEgo, 0.0)
 
@@ -511,9 +614,13 @@ def main():
         # 5. 메시지 발행
         publish_messages(pm, rs, action, frame_id, v_ego)
 
+        # 6. viz 송신 — LocalWorld 현재 pose + 6초 trail (5006)
+        if world.is_initialized():
+            send_vehicle_viz(viz_sock, world, sm["livePose"], frame_id)
+
         frame_id += 1
 
-        # 6. 20Hz 타이밍 유지
+        # 7. 20Hz 타이밍 유지
         elapsed = time.monotonic() - loop_start
         sleep_time = loop_period - elapsed
         if sleep_time > 0:
