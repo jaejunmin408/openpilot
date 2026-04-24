@@ -70,10 +70,18 @@ python3 orin/web_viz/server.py
 - ADCM sender 는 UTM Zone 52N 절대좌표 (x=easting, y=northing, yaw=0→east, CCW+) 사용.
 - 서버는 **첫 ADCM 패킷의 ego 위치** 를 anchor 로 저장, 이후 모든 x/y 에서 anchor 를 빼서 브라우저에 보냄 (UTM 330km easting 의 float 정밀도 손실 회피).
 - 첫 ADCM 전까지 COMA 패킷은 드롭 (서버 stderr 에 rate-limited warn).
-- **Actual pose 소스 = livePose** (COMA 패킷).
-  - yaw: `orientationNED.z` 직접 사용 (PoseKalman 의 cameraOdometry + IMU fused 결과). 적분 없음.
-  - position: `velocityDevice.x` 를 fresh yaw 축으로 적분. yaw 와 동일 필터 state 에서 나오므로 좌표계 일관성 보장.
-- `heading` 은 ENU yaw. 현재 테스트 환경 (MetaDrive) 부호 관례 때문에 `yaw_enu = π/2 + yaw_ned` 로 받음 (일반 NED→ENU 는 `π/2 − yaw_ned`). 차량 화살표가 "0→동쪽, CCW+" 로 뜸.
+
+### Actual pose 소스 — 모드에 따라 분기
+
+| | Real-car (기본) | Sim (`--simulation`) |
+|---|---|---|
+| position / heading | **ADCM ego 직송** (Orin 의 자체 localization) | **livePose dead-reckon** (`orientationNED.z` + `velocityDevice.x` 적분) |
+| dynamics (속도/가속/yaw_rate) | livePose | livePose |
+| drift | 0 (적분 없음) | 1차 랜덤워크 (yaw 는 매 tick 리셋) |
+
+Sim 모드를 쓰는 이유: MetaDrive 에서는 sender 가 JSON 의 합성 ego 를 보내서 실차 위치가 아니므로, 실제 sim 차량 pose 를 복원하려면 livePose 가 필요.
+
+Heading 은 ENU yaw. Sim 모드에선 MetaDrive 부호 관례 때문에 `yaw_enu = π/2 + yaw_ned` 로 받음 (일반 NED→ENU 는 `π/2 − yaw_ned`). 차량 화살표가 "0→동쪽, CCW+" 로 뜸.
 
 ## 유지보수 노트
 
