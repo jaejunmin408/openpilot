@@ -5,6 +5,7 @@ Orin ADCM에서 UDP로 전송한 궤적 패킷을 수신하여
 modelV2 / drivingModelData 메시지로 변환/발행한다.
 cameraOdometry는 modeld가 카메라 기반으로 발행한다.
 """
+import os
 import socket
 import struct
 import time
@@ -25,6 +26,13 @@ UDP_PORT = 10002
 UDP_TIMEOUT_S = 0.05          # 50 ms
 PACKET_SIZE = 1243            # 1200(points) + 24(ego) + 18(meta) + 1(n_valid)
 MAX_POINTS = 50
+
+# ── viz 송신 설정 (stateless pass-through) ──────────────
+VIZ_PC_IP   = os.environ.get("VIZ_PC_IP", "127.0.0.1")
+COMA_PORT   = 5006                  # livePose 기반 차량 상태
+MIRROR_PORT = 5007                  # ADCM 원본 1243B 미러
+COMA_MAGIC  = 0x434F4D41            # 'COMA'
+COMA_FMT    = "<IIdddddd"           # 56B: magic, seq, ts, yaw_ned, v_fwd, v_right, yaw_rate, a_fwd
 
 LONG_SMOOTH_SECONDS = 0.3
 LAT_SMOOTH_SECONDS = 0.0
@@ -398,7 +406,9 @@ def main():
     cloudlog.warning("udp_bridge init")
 
     pm = PubMaster(["modelV2", "drivingModelData", "longitudinalPlan", "driverAssistance"])
-    sm = SubMaster(["carState", "carControl", "liveDelay"])
+    # carState/carControl/liveDelay: 기존 ADCM 파싱·제어 경로에서 이미 사용 중
+    # livePose: viz 송신용으로 추가 (실차/시뮬 단일 소스)
+    sm = SubMaster(["carState", "carControl", "liveDelay", "livePose"])
 
     # UDP 소켓 설정
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -406,6 +416,10 @@ def main():
     sock.bind(('0.0.0.0', UDP_PORT))
     sock.setblocking(False)
     cloudlog.warning(f"udp_bridge listening on port {UDP_PORT}")
+
+    # viz 송신 전용 소켓 (bind 안 함, pass-through)
+    viz_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cloudlog.warning(f"udp_bridge viz → {VIZ_PC_IP}:{COMA_PORT}(COMA) / {VIZ_PC_IP}:{MIRROR_PORT}(ADCM mirror)")
 
     frame_id = 0
     prev_action = log.ModelDataV2.Action()
@@ -428,6 +442,11 @@ def main():
         try:
             while True:
                 data, addr = sock.recvfrom(2048)
+                # viz: ADCM 원본 bytes 그대로 미러 (stateless)
+                try:
+                    viz_sock.sendto(data, (VIZ_PC_IP, MIRROR_PORT))
+                except OSError:
+                    pass
                 result = parse_packet(data)
                 if result is not None:
                     points, ego, meta = result
@@ -457,6 +476,23 @@ def main():
 
         # 4. 메시지 발행
         publish_messages(pm, cur_interp, cur_deriv, action, frame_id, cur_meta, v_ego)
+
+        # 4a. viz: livePose 기반 COMA 패킷 송신 (stateless, livePose only)
+        if sm.alive["livePose"]:
+            lp = sm["livePose"]
+            pkt = struct.pack(
+                COMA_FMT,
+                COMA_MAGIC, frame_id, time.time(),
+                float(lp.orientationNED.z),         # NED yaw (rad)
+                float(lp.velocityDevice.x),         # forward (body)
+                float(lp.velocityDevice.y),         # right (body)
+                float(lp.angularVelocityDevice.z),  # yaw rate
+                float(lp.accelerationDevice.x),     # a_fwd
+            )
+            try:
+                viz_sock.sendto(pkt, (VIZ_PC_IP, COMA_PORT))
+            except OSError:
+                pass
 
         frame_id += 1
 
