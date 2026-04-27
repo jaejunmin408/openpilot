@@ -58,6 +58,9 @@ selfdrive/ui/translations/tmp
 selfdrive/car/tests/cars_dump
 system/camerad/camerad
 system/camerad/test/ae_gray_test
+system/loggerd/loggerd
+system/loggerd/encoderd
+system/loggerd/bootlog
 
 .coverage*
 coverage.xml
