@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-ADCM 궤적 sender: JSON 테스트 파일을 읽어 ADCM 형식 UDP 패킷으로 전송
+ADCM 궤적 sender: JSON 테스트 파일을 읽어 ADCM 네이티브 UDP 패킷(1243B)으로 전송.
 
-패킷 구조 (ADCM 형식):
-  Header (16 bytes): magic(uint32) + seq(uint32) + timestamp(float64)
-  N points (N * 32 bytes each): x(f64) + y(f64) + yaw(f64) + velocity(f64)
-  Ego (24 bytes): ego_x(f64) + ego_y(f64) + ego_yaw(f64)
-  Meta (18 bytes): target_accel(f64) + drive_mode(uint8) + emergency(f64) + turn_signal(uint8)
-  Footer (1 byte): sizeof_trajectory(uint8)
+패킷 구조 (udp_bridge.py 및 tools/sim/test_udp_sender.py 와 일치해야 함):
+  Points (1200B): 50 × (x, y, yaw) × float64   -- global 좌표, velocity 없음
+  Ego     (24B) : ego_x, ego_y, ego_yaw        -- 각 float64
+  Meta    (18B) : target_accel(f64) + drive_mode(bool) + emergency(f64) + turn_signal(u8)
+  Footer   (1B) : sizeof_trajectory (uint8)
+  Total = 1243
 
 Usage:
-  python3 adcm_trajectory_sender.py [--ip COMMA_IP] [--port 5005] [--json test_trajectory_left_turn.json]
+  python3 adcm_trajectory_sender.py --json orin/test_trajectory_metadrive.json --loop
+  python3 adcm_trajectory_sender.py --ip 127.0.0.1 --port 10002 --json FILE
 """
 
 import argparse
@@ -19,102 +20,95 @@ import math
 import socket
 import struct
 import time
-import sys
+
+import numpy as np
 
 
-MAGIC = 0x41444301  # 'ADC\x01'
-HEADER_FMT = "<IId"       # magic, seq, timestamp
-POINT_FMT = "<dddd"       # x, y, yaw, velocity (4 doubles)
-EGO_FMT = "<ddd"          # ego_x, ego_y, ego_yaw
-META_FMT = "<d?dB"        # target_accel, drive_mode, emergency, turn_signal
-FOOTER_FMT = "<B"         # sizeof_trajectory
-
-HEADER_SIZE = struct.calcsize(HEADER_FMT)
-POINT_SIZE = struct.calcsize(POINT_FMT)
-EGO_SIZE = struct.calcsize(EGO_FMT)
-META_SIZE = struct.calcsize(META_FMT)
-FOOTER_SIZE = struct.calcsize(FOOTER_FMT)
-
+# 반드시 udp_bridge.py 의 상수와 일치
+PACKET_SIZE = 1243
 MAX_POINTS = 50
-SEND_HZ = 20
 
 
-def pack_frame(seq, frame):
-    """Pack one ADCM frame into UDP bytes."""
-    buf = bytearray()
+def pack_frame(frame):
+    """JSON 한 프레임을 1243B UDP 바이트로 패킹."""
+    traj = frame.get("trajectory", [])
+    n = min(len(traj), MAX_POINTS)
 
-    # Header
-    buf += struct.pack(HEADER_FMT, MAGIC, seq, time.time())
-
-    # Trajectory points (x, y, yaw, velocity)
-    traj = frame["trajectory"]
-    velocities = frame["target_velocity_per_point"]
-    n_pts = min(len(traj), MAX_POINTS)
-
-    for i in range(n_pts):
+    # Points (1200B): 50 × (x, y, yaw) × f64, 나머지는 0 패딩
+    pts = np.zeros((MAX_POINTS, 3), dtype=np.float64)
+    for i in range(n):
         p = traj[i]
-        v = velocities[i] if i < len(velocities) else 0.0
-        buf += struct.pack(POINT_FMT, p["x"], p["y"], p["yaw"], v)
+        pts[i, 0] = p["x"]
+        pts[i, 1] = p["y"]
+        pts[i, 2] = p["yaw"]
+    points_data = pts.tobytes()
 
-    # Pad remaining points with zeros
-    for _ in range(MAX_POINTS - n_pts):
-        buf += struct.pack(POINT_FMT, 0.0, 0.0, 0.0, 0.0)
-
-    # Ego position
+    # Ego (24B)
     ego = frame["ego_position"]
-    buf += struct.pack(EGO_FMT, ego["x"], ego["y"], ego["yaw"])
+    ego_data = struct.pack("<ddd", ego["x"], ego["y"], ego["yaw"])
 
-    # Metadata
-    buf += struct.pack(META_FMT,
-                       frame.get("target_speed", 0.0),
-                       frame.get("drive_mode", True),
-                       frame.get("emergency_acceleration", 1.0),
-                       frame.get("turn_signal", 0))
+    # Meta (18B): target_accel + drive_mode + emergency + turn_signal
+    meta_data = struct.pack("<d", float(frame.get("target_speed", 0.0)))
+    meta_data += struct.pack("<?", bool(frame.get("drive_mode", True)))
+    meta_data += struct.pack("<d", float(frame.get("emergency_acceleration", 0.0)))
+    meta_data += struct.pack("<B", int(frame.get("turn_signal", 0)))
 
-    # Footer
-    buf += struct.pack(FOOTER_FMT, n_pts)
+    # Footer (1B)
+    footer = struct.pack("<B", n)
 
-    return bytes(buf)
+    pkt = points_data + ego_data + meta_data + footer
+    assert len(pkt) == PACKET_SIZE, f"Packet size mismatch: {len(pkt)} != {PACKET_SIZE}"
+    return pkt
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ADCM trajectory sender")
-    parser.add_argument("--ip", default="10.200.147.253", help="Target IP (comma device)")
-    parser.add_argument("--port", type=int, default=5005, help="Target UDP port")
-    parser.add_argument("--json", default="/home/a/orin/work/test_trajectory_left_turn.json", help="Trajectory JSON file")
+    parser = argparse.ArgumentParser(description="ADCM trajectory JSON → UDP sender (1243B)")
+    parser.add_argument("--ip", default="127.0.0.1", help="Target IP (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=10002,
+                        help="Target UDP port (udp_bridge default: 10002)")
+    parser.add_argument("--json", required=True, help="Trajectory JSON file")
     parser.add_argument("--loop", action="store_true", help="Loop trajectory continuously")
+    parser.add_argument("--hz", type=float, default=None,
+                        help="Override send rate (default: JSON's sim_hz, fallback 20)")
     args = parser.parse_args()
 
-    # Load JSON
     print(f"Loading: {args.json}")
     with open(args.json) as f:
         data = json.load(f)
     frames = data["frames"]
-    print(f"  {len(frames)} frames, {data.get('sim_hz', 20)}Hz")
-    print(f"  Scenario: {data.get('description', 'N/A')}")
+    if not frames:
+        print("ERROR: JSON 에 frame 이 없습니다.")
+        return
 
-    # Compute packet size
-    pkt_size = HEADER_SIZE + POINT_SIZE * MAX_POINTS + EGO_SIZE + META_SIZE + FOOTER_SIZE
-    print(f"  Packet size: {pkt_size} bytes")
-    print(f"\nSending to {args.ip}:{args.port} at {SEND_HZ}Hz")
-    print("Press Ctrl+C to stop\n")
+    sim_hz = float(args.hz if args.hz is not None else data.get("sim_hz", 20))
+    dt = 1.0 / sim_hz
+
+    print(f"  {len(frames)} frames, {sim_hz:.1f}Hz")
+    print(f"  Scenario: {data.get('description', 'N/A')}")
+    print(f"  Packet size: {PACKET_SIZE} bytes (ADCM native, no header)")
+    print(f"\nSending to {args.ip}:{args.port}\nPress Ctrl+C to stop\n")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     seq = 0
-    dt = 1.0 / SEND_HZ
+
+    def send_stop_frame():
+        stop_frame = dict(frames[-1])
+        stop_frame["drive_mode"] = False
+        stop_frame["target_speed"] = 0.0
+        sock.sendto(pack_frame(stop_frame), (args.ip, args.port))
 
     try:
         while True:
-            for i, frame in enumerate(frames):
+            for frame in frames:
                 t_start = time.monotonic()
 
-                pkt = pack_frame(seq, frame)
-                sock.sendto(pkt, (args.ip, args.port))
+                sock.sendto(pack_frame(frame), (args.ip, args.port))
 
-                if seq % SEND_HZ == 0:
+                if seq % max(int(sim_hz), 1) == 0:
                     ego = frame["ego_position"]
-                    print(f"[t={frame['time']:.2f}s] seq={seq} "
-                          f"ego=({ego['x']:.1f}, {ego['y']:.1f}, yaw={math.degrees(ego['yaw']):.1f}°) "
+                    print(f"[t={frame.get('time', 0.0):6.2f}s] seq={seq:5d} "
+                          f"ego=({ego['x']:7.1f}, {ego['y']:7.1f}, "
+                          f"yaw={math.degrees(ego['yaw']):6.1f}°) "
                           f"turn_signal={frame.get('turn_signal', 0)}")
 
                 seq += 1
@@ -124,24 +118,13 @@ def main():
                     time.sleep(dt - elapsed)
 
             if not args.loop:
-                # Send stop frame
-                stop_frame = frames[-1].copy()
-                stop_frame["drive_mode"] = False
-                stop_frame["target_speed"] = 0.0
-                pkt = pack_frame(seq, stop_frame)
-                sock.sendto(pkt, (args.ip, args.port))
-                print(f"\n[DONE] Sent {seq} frames. Final stop frame sent.")
+                send_stop_frame()
+                print(f"\n[DONE] Sent {seq} frames. Stop frame sent.")
                 break
-
             print(f"\n--- Loop restart (seq={seq}) ---\n")
 
     except KeyboardInterrupt:
-        # Send stop frame on interrupt
-        stop_frame = frames[-1].copy()
-        stop_frame["drive_mode"] = False
-        stop_frame["target_speed"] = 0.0
-        pkt = pack_frame(seq, stop_frame)
-        sock.sendto(pkt, (args.ip, args.port))
+        send_stop_frame()
         print(f"\n[ABORT] Stop frame sent. Total: {seq} frames.")
 
 
