@@ -20,9 +20,11 @@ tg_flags = {
     'Darwin': f'DEV=CPU THREADS=0 HOME={os.path.expanduser("~")}', # tinygrad calls brew which needs a $HOME in the env
 }.get(arch, 'DEV=CPU CPU_LLVM=1 THREADS=0')
 
-# Get model metadata
+# Get model metadata (skip when .onnx missing — assume pre-built pkl already present)
 for model_name in ['driving_vision', 'driving_policy', 'dmonitoring_model']:
   fn = File(f"models/{model_name}").abspath
+  if not os.path.exists(fn + ".onnx"):
+    continue
   script_files = [File(Dir("#selfdrive/modeld").File("get_model_metadata.py").abspath)]
   cmd = f'{tg_flags} python3 {Dir("#selfdrive/modeld").abspath}/get_model_metadata.py {fn}.onnx'
   lenv.Command(fn + "_metadata.pkl", [fn + ".onnx"] + tinygrad_files + script_files, cmd)
@@ -54,8 +56,12 @@ def tg_compile(flags, model_name):
      do_chunk]
   )
 
-# Compile small models
+# Compile small models (skip when .onnx missing — pre-built pkl chunks already in models/)
 for model_name in ['driving_vision', 'driving_policy', 'dmonitoring_model']:
+  onnx_path = File(f"models/{model_name}").abspath + ".onnx"
+  if not os.path.exists(onnx_path):
+    print(f"[modeld SConscript] SKIP {model_name}: {onnx_path} missing — using pre-built pkl chunks")
+    continue
   tg_compile(tg_flags, model_name)
 
 # Compile BIG model if USB GPU is available
