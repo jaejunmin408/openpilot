@@ -89,6 +89,8 @@ class MetaDriveWorld(World):
       state.bearing = md_vehicle.bearing
       state.steering_angle = md_vehicle.steering_angle
       state.gps.from_xy(curr_pos)
+      # simulated_sensors.send_gps_message()가 bearingDeg로 읽어감 → locationd_sim의 yaw 소스
+      state.imu.bearing = md_vehicle.bearing
       state.valid = True
 
       is_engaged = state.is_engaged
