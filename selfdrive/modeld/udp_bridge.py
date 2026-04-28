@@ -32,7 +32,7 @@ VIZ_PC_IP   = os.environ.get("VIZ_PC_IP", "127.0.0.1")
 COMA_PORT   = 5006                  # livePose 기반 차량 상태
 MIRROR_PORT = 5007                  # ADCM 원본 1243B 미러
 COMA_MAGIC  = 0x434F4D41            # 'COMA'
-COMA_FMT    = "<IIdddddd"           # 56B: magic, seq, ts, yaw_ned, v_fwd, v_right, yaw_rate, a_fwd
+COMA_FMT    = "<Idddd"              # 36B: magic, v_fwd, v_right, yaw_rate, a_fwd  (dynamics 표시용)
 
 LONG_SMOOTH_SECONDS = 0.3
 LAT_SMOOTH_SECONDS = 0.0
@@ -482,8 +482,7 @@ def main():
             lp = sm["livePose"]
             pkt = struct.pack(
                 COMA_FMT,
-                COMA_MAGIC, frame_id, time.time(),
-                float(lp.orientationNED.z),         # NED yaw (rad)
+                COMA_MAGIC,
                 float(lp.velocityDevice.x),         # forward (body)
                 float(lp.velocityDevice.y),         # right (body)
                 float(lp.angularVelocityDevice.z),  # yaw rate

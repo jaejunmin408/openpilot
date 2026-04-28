@@ -96,3 +96,6 @@ docs/screenshot/
 .context/
 PLAN.md
 TASK.md
+
+# generated trajectory JSON outputs (generators in repo, outputs reproducible)
+orin/test_trajectory_*.json

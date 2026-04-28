@@ -3,13 +3,18 @@
 Browser-based trajectory visualizer for ADCM_test.
 
 Canvas/WebSocket UI consuming the binary UDP streams from selfdrive/modeld/udp_bridge.py:
-  - UDP 5006: COMA 56B (livePose-based vehicle state)
+  - UDP 5006: COMA 36B (livePose dynamics — speed/accel/yaw_rate 표시 전용)
   - UDP 5007: 1243B ADCM mirror (50 trajectory points + ego + meta)
+
+차량 위치/heading 은 항상 ADCM ego 직송 (실차/sim 동일). sim 모드에선 sender
+(test_udp_sender / adcm_trajectory_sender) 가 gpsLocationExternal + livePose 로
+실 ADCM 의 자체 localization 을 모방해 보내주므로 viz 측 분기 불필요.
 
 Publishes over WebSocket 8765 and serves index.html on HTTP 8080.
 
-Coordinate anchor: first ADCM ego (UTM Zone 52N) is subtracted from all x/y
-before emission so the browser works with small numbers.
+Coordinate anchor: first ADCM ego is subtracted from all x/y before emission
+so the browser works with small numbers (실차 UTM 330km easting 도, sim MetaDrive
+xy 도 양쪽 다 처리).
 
 Usage:
   python3 orin/web_viz/server.py
@@ -44,7 +49,7 @@ ADCM_META_SIZE = struct.calcsize(ADCM_META_FMT)
 ADCM_FOOTER_SIZE = struct.calcsize(ADCM_FOOTER_FMT)
 
 COMA_MAGIC = 0x434F4D41  # 'COMA'
-COMA_FMT = "<IIdddddd"   # magic, seq, ts, yaw_ned, v_fwd, v_right, yaw_rate, a_fwd
+COMA_FMT = "<Idddd"      # 36B: magic, v_fwd, v_right, yaw_rate, a_fwd
 COMA_PACKET_SIZE = struct.calcsize(COMA_FMT)
 
 
@@ -79,12 +84,10 @@ def parse_adcm(data: bytes):
 def parse_coma(data: bytes):
     if len(data) != COMA_PACKET_SIZE:
         return None
-    magic, seq, ts, yaw_ned, v_fwd, v_right, yaw_rate, a_fwd = struct.unpack(COMA_FMT, data)
+    magic, v_fwd, v_right, yaw_rate, a_fwd = struct.unpack(COMA_FMT, data)
     if magic != COMA_MAGIC:
         return None
     return {
-        "seq": int(seq), "ts": float(ts),
-        "yaw_ned": float(yaw_ned),
         "v_fwd": float(v_fwd), "v_right": float(v_right),
         "yaw_rate": float(yaw_rate), "a_fwd": float(a_fwd),
     }
@@ -92,23 +95,15 @@ def parse_coma(data: bytes):
 
 # ── Runtime state ────────────────────────────────────────────────────────────
 class State:
-    # Mode (set by --simulation CLI flag):
-    #   False → real-car. ADCM ego = Orin 의 자체 localization (GPS + IMU + camera
-    #                     fused) 결과라 실차 위치 그 자체. viz 측 적분 없이 직접 사용
-    #                     → drift 0.
-    #   True  → simulation. ADCM ego 는 JSON 합성값이라 신뢰 불가 → livePose 로
-    #                       dead-reckon 해서 pose 복원.
-    # 두 모드 모두 dynamics (speed / accel / yaw_rate / slip) 는 livePose (COMA) 에서 옴.
-    simulation: bool = False
+    # 차량 pose 는 항상 ADCM ego 직송 (실차/sim 동일). sender 가 gpsLocationExternal +
+    # livePose 로 진짜 ADCM localization 을 모방해 보내주므로 viz 측 적분/dead-reckon 없음.
+    # COMA 는 dynamics (speed / accel / yaw_rate) 표시 용도 only.
 
     anchor: tuple[float, float] | None = None  # set on first ADCM packet
-    first_planned_yaw: float | None = None     # ADCM ego_yaw at anchor
-    yaw_offset: float | None = None            # yaw_enu − first_planned_yaw, locked on first COMA post-anchor.
-                                                # Sim 전용: livePose yaw 축을 planner frame 에 정렬.
 
-    # Vehicle state in UTM frame (pre-anchor subtraction happens at broadcast time).
-    #   position/heading — real-car: ADCM ego 직송 | sim: livePose dead-reckon
-    #   dynamics         — 항상 COMA (livePose.velocityDevice / accelerationDevice / angularVelocityDevice)
+    # Vehicle state in global frame (pre-anchor subtraction at broadcast time).
+    #   position/heading — ADCM ego 직송
+    #   dynamics         — COMA (livePose.velocityDevice / accelerationDevice / angularVelocityDevice)
     vx: float = 0.0
     vy: float = 0.0
     vheading: float = 0.0
@@ -117,10 +112,7 @@ class State:
     vv_fwd: float = 0.0
     vv_right: float = 0.0
     vyaw_rate: float = 0.0
-    vts: float = 0.0
-    vframe: int = 0
 
-    actual_last_ts: float | None = None  # last COMA ts (dead-reckon dt)
     actual_initialized: bool = False     # flipped by first ADCM
 
     coma_drop_warn_last: float = 0.0  # rate-limit warn
@@ -176,8 +168,6 @@ def broadcast_vehicle():
         "v_fwd": round(State.vv_fwd, 4),
         "v_right": round(State.vv_right, 4),
         "yaw_rate": round(State.vyaw_rate, 5),
-        "ts": State.vts,
-        "frame": State.vframe,
     })
 
 
@@ -196,49 +186,14 @@ class ComaProtocol(asyncio.DatagramProtocol):
                 State.coma_drop_warn_last = now
             return
 
-        ts = parsed["ts"]
-
-        # Dynamics: always sourced from COMA regardless of mode (ADCM carries no speed/accel).
+        # Dynamics 만 갱신 (속도/가속/yaw_rate 표시용). 위치/heading 은 AdcmProtocol 담당.
+        # ADCM 자체에 speed/accel 없으므로 COMA 의 livePose 파생값을 쓰는 것.
         State.vspeed = math.hypot(parsed["v_fwd"], parsed["v_right"])
         State.vaccel = parsed["a_fwd"]
         State.vv_fwd = parsed["v_fwd"]
         State.vv_right = parsed["v_right"]
         State.vyaw_rate = parsed["yaw_rate"]
-        State.vts = ts
-        State.vframe = parsed["seq"]
 
-        # Position/heading: sim 전용.
-        # Real-car 에서는 AdcmProtocol 이 ADCM 패킷의 ego 를 State.vx/vy/vheading 에
-        # 직접 복사하므로 COMA 에서는 pose 를 건드리지 않음 (dynamics 만 업데이트).
-        # Sim 에서는 ADCM ego 가 JSON 합성값이라 실차 위치 아님 → livePose 로 dead-reckon.
-        if State.simulation:
-            # livePose 기반 dead-reckon
-            # yaw: livePose.orientationNED.z (PoseKalman 이 cameraOdometry+IMU 로 융합한
-            #      절대 yaw). 매 tick 절대값으로 덮어쓰므로 viz 측 적분 불필요 → drift 1차로 한정.
-            # position: livePose.velocityDevice.x 를 fresh yaw 축으로 투영 적분.
-            #           yaw 와 동일 PoseKalman state 에서 나와 좌표계·타이밍 정합.
-            #
-            # NED → ENU 부호: 일반 수식은 (π/2 − yaw_ned) 지만, MetaDrive heading_theta 는
-            # 수학 CCW + simulated_sensors 의 vNED = [-vy, vx] 매핑으로 bearing 이 실제
-            # rotation 과 한 번 더 반전되어 들어옴. 결과적으로 COMA 의 yaw_ned 부호가
-            # 기대와 뒤집혀 있어 `+` 로 받는 것이 실제 rotation 과 일치.
-            yaw_enu = math.pi / 2 + parsed["yaw_ned"]
-
-            # Lock yaw_offset on first COMA after anchor — aligns livePose yaw frame to planner frame
-            if State.yaw_offset is None:
-                State.yaw_offset = yaw_enu - (State.first_planned_yaw or 0.0)
-                print(f"[COMA] yaw offset locked at {State.yaw_offset:+.3f} rad "
-                      f"(first yaw_enu={yaw_enu:+.3f}, first planned yaw={State.first_planned_yaw:+.3f})")
-            corrected_yaw = yaw_enu - State.yaw_offset
-
-            if State.actual_last_ts is not None:
-                dt = max(0.001, min(ts - State.actual_last_ts, 0.2))
-                v = parsed["v_fwd"]
-                State.vx += v * math.cos(corrected_yaw) * dt
-                State.vy += v * math.sin(corrected_yaw) * dt
-            State.vheading = corrected_yaw
-
-        State.actual_last_ts = ts
         broadcast_vehicle()
 
 
@@ -254,7 +209,6 @@ class AdcmProtocol(asyncio.DatagramProtocol):
 
         if State.anchor is None:
             State.anchor = (ego_x, ego_y)
-            State.first_planned_yaw = ego_yaw
             State.vx = ego_x
             State.vy = ego_y
             State.vheading = ego_yaw
@@ -286,18 +240,13 @@ class AdcmProtocol(asyncio.DatagramProtocol):
             "frame": State.adcm_count,
         })
 
-        # Real-car: ADCM ego 를 실차 위치로 신뢰하고 직접 덮어씀.
-        # ADCM ego 는 Orin 의 자체 localization (GPS + IMU + camera fused) 결과물이라
-        # 이미 "가장 좋은 추정치" 임. Viz 에서 다시 livePose 로 dead-reckon 하는 건 downstream
-        # 에서 같은 일을 두 번 하는 것 → 적분 경로 생략으로 drift 자체가 사라짐.
-        # Sim 에서는 ADCM ego 가 JSON 합성값이므로 이 단락 건너뛰고 ComaProtocol 의
-        # livePose dead-reckon 에 맡김.
-        if not State.simulation:
-            State.vx = ego_x
-            State.vy = ego_y
-            State.vheading = ego_yaw
-            State.vframe = State.adcm_count
-            broadcast_vehicle()
+        # ADCM ego 를 그대로 차량 위치/heading 으로 신뢰. 실차에선 Orin 의 GPS+IMU+카메라
+        # 융합 결과, sim 에선 sender 가 gpsLocationExternal+livePose 로 모방한 값이라
+        # 어느 모드든 "가장 좋은 추정치" 임. 적분 경로 자체가 없으므로 drift 0.
+        State.vx = ego_x
+        State.vy = ego_y
+        State.vheading = ego_yaw
+        broadcast_vehicle()
 
 
 # ── HTTP (serves index.html) ─────────────────────────────────────────────────
@@ -326,9 +275,7 @@ def start_http_server(host: str, port: int) -> int:
 
 # ── main ─────────────────────────────────────────────────────────────────────
 async def run(args):
-    State.simulation = bool(args.simulation)
-    mode = "simulation (livePose dead-reckon)" if State.simulation else "real-car (ADCM ego 직송)"
-    print(f"[server] mode: {mode}")
+    print(f"[server] pose source: ADCM ego 직송 (sim/실차 동일)")
 
     # 1. HTTP
     http_port = start_http_server(args.host, args.http_port)
@@ -349,7 +296,7 @@ async def run(args):
 
     # 3. WebSocket
     print(f"[server] WS      ws://{args.host}:{args.ws_port}")
-    print(f"[server] waiting for first ADCM packet to set UTM anchor …")
+    print(f"[server] waiting for first ADCM packet to set anchor …")
     async with websockets.serve(ws_handler, args.host, args.ws_port):
         await asyncio.Future()
 
@@ -363,10 +310,6 @@ def main():
     parser.add_argument("--ws-port", type=int, default=8765)
     parser.add_argument("--http-port", type=int, default=8080,
                         help="0 = auto-pick free port (printed on startup)")
-    parser.add_argument("--simulation", action="store_true",
-                        help="livePose 기반 dead-reckon 으로 pose 복원 (sim 에서 필수 — "
-                             "ADCM ego 가 JSON 합성값). 기본(real-car)은 ADCM ego 를 "
-                             "Orin 의 localization 결과로 신뢰해 직접 사용.")
     args = parser.parse_args()
     try:
         asyncio.run(run(args))

@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
-Test UDP sender for ADCM udp_bridge.
+Test UDP sender for ADCM udp_bridge — sim 모드에서 실 ADCM 을 모방.
 Sends a trajectory at constant speed to verify the full pipeline:
   UDP -> udp_bridge -> [modelV2, drivingModelData, longitudinalPlan] -> controlsd -> carControl -> SimulatedCar
 
+Ego pose source (sim 모드, 실 ADCM 동작 모방):
+  - position: gpsLocationExternal.{latitude, longitude} → MetaDrive xy 환원
+  - heading : livePose.orientationNED.z → ENU yaw 변환
+
 Packet format (1243 bytes, must match udp_bridge.py / xDrivingTrajectory_UdpPacket):
-  Points (1200B): 50 x 3 x float64  (x, y, yaw)  -- UTM global coords, no velocity
+  Points (1200B): 50 x 3 x float64  (x, y, yaw)  -- global coords, no velocity
   Ego     (24B): ego_x(8) + ego_y(8) + ego_yaw(8)
   Meta    (18B): target_accel(8) + drive_mode(1) + emergency(8) + turn_signal(1)
   Footer   (1B): sizeof_trajectory (n_valid)
   Total = 1243
 """
+import math
 import socket
 import struct
 import time
@@ -20,6 +25,11 @@ import numpy as np
 # Packet constants (must match udp_bridge.py)
 PACKET_SIZE = 1243
 MAX_POINTS = 50
+
+# GPS lat/lon → m 환원 상수. tools/sim/lib/common.py GPSState.from_xy 와 일치 필수
+GPS_BASE_LAT = 32.75308505188913
+GPS_BASE_LON = -117.2095393365393
+GPS_DEG_TO_METERS = 100000
 
 
 def build_packet(points_xyz, ego, meta):
@@ -108,17 +118,20 @@ def main():
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     target = (args.host, args.port)
-    sm = messaging.SubMaster(['carState'])
+    sm = messaging.SubMaster(['carState', 'gpsLocationExternal', 'livePose'])
 
     print(f"Sending ADCM trajectory: speed={args.speed}m/s ({args.speed*3.6:.0f}km/h), "
           f"accel={args.accel}m/s^2, "
           f"{'curve r=' + str(args.curve) + 'm' if args.curve else 'straight'}")
     print(f"Target: {target}, Rate: {args.hz}Hz, Duration: {args.duration}s")
     print(f"Packet size: {PACKET_SIZE}B (no header, ADCM native format)")
+    print(f"Ego pose: gpsLocationExternal (position) + livePose.orientationNED (heading)")
     print("---")
 
-    ego_x, ego_y, ego_yaw = 0.0, 0.0, 0.0
+    ego_x = ego_y = ego_yaw = 0.0
     seq = 0
+    sent_count = 0
+    pose_warn_last = 0.0
     period = 1.0 / args.hz
     start = time.monotonic()
 
@@ -129,13 +142,24 @@ def main():
             sm.update(0)
             v_ego = max(sm['carState'].vEgo, 0.0)
 
-            # Update simulated ego position
-            dt = period
-            if seq > 0:
-                ego_x += v_ego * np.cos(ego_yaw) * dt
-                ego_y += v_ego * np.sin(ego_yaw) * dt
-                if args.curve != 0:
-                    ego_yaw += (v_ego / abs(args.curve)) * dt * (1.0 if args.curve > 0 else -1.0)
+            # Ego: GPS + livePose 직송 (실 ADCM 의 자체 localization 을 모방)
+            if not (sm.alive['gpsLocationExternal'] and sm.alive['livePose']):
+                if loop_start - pose_warn_last > 2.0:
+                    print(f"[t={loop_start-start:6.2f}s] waiting for gpsLocationExternal/livePose alive…")
+                    pose_warn_last = loop_start
+                seq += 1
+                sleep_time = period - (time.monotonic() - loop_start)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                continue
+
+            gps = sm['gpsLocationExternal']
+            lp = sm['livePose']
+            ego_x = (gps.latitude - GPS_BASE_LAT) * GPS_DEG_TO_METERS
+            ego_y = (gps.longitude - GPS_BASE_LON) * GPS_DEG_TO_METERS
+            # NED → ENU 변환: 절대값 맞추기 (East 시작에서 yaw=0) + 회전 방향 맞추기.
+            # 옛 viz 의 (π/2 + yaw_ned) + yaw_offset 잠금 (절대값 빼기) 와 등가.
+            ego_yaw = float(lp.orientationNED.z) - math.pi / 2
 
             # ADCM-style spacing based on current speed
             spacing = compute_spacing(v_ego)
