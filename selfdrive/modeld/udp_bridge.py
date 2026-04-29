@@ -165,19 +165,28 @@ def interpolate_to_tidxs(rel_x, rel_y, rel_yaw, velocity, cum_time):
 
 # ── 미분값 계산 ──────────────────────────────────────
 def compute_derivatives(interp: dict):
-    """velocity_x/y, acceleration_x/y, yaw_rate 계산."""
+    """velocity_x/y, acceleration_x/y, yaw_rate 계산.
+
+    vx/vy/ax/ay는 car-body 프레임 벡터 성분 (modelV2.velocity/acceleration 용).
+    v_scalar/a_scalar는 속도의 크기와 그 미분 (종방향 플래너 용).
+    회전 중에는 vx가 cos(yaw)만큼 작아지므로, get_accel_from_plan에는
+    반드시 scalar 속도를 넘겨야 '경로가 감속 중'이라는 오해석을 피할 수 있다.
+    """
     yaw = interp['yaw']
     vel = interp['vel']
     vx = vel * np.cos(yaw)
     vy = vel * np.sin(yaw)
     ax = np.gradient(vx, T_IDXS).astype(np.float32)
     ay = np.gradient(vy, T_IDXS).astype(np.float32)
+    a_scalar = np.gradient(vel, T_IDXS).astype(np.float32)
     yaw_rate = np.gradient(yaw, T_IDXS).astype(np.float32)
     return {
         'vx': vx.astype(np.float32),
         'vy': vy.astype(np.float32),
         'ax': ax,
         'ay': ay,
+        'v_scalar': vel.astype(np.float32),
+        'a_scalar': a_scalar,
         'yaw_rate': yaw_rate,
     }
 
@@ -185,14 +194,12 @@ def compute_derivatives(interp: dict):
 # ── action 계산 ──────────────────────────────────────
 def compute_action(interp, deriv, prev_action, v_ego, lat_delay, long_delay, adcm_meta):
     """desiredCurvature, desiredAcceleration, shouldStop 계산."""
-    plan_vel_x = deriv['vx']
-    plan_acc_x = deriv['ax']
     plan_yaw = interp['yaw']
     plan_yaw_rate = deriv['yaw_rate']
 
-    # 종방향
+    # 종방향: scalar 속도/가속도 사용 (회전 중에도 올바른 가/감속 산출)
     desired_accel, should_stop = get_accel_from_plan(
-        plan_vel_x, plan_acc_x, T_IDXS, action_t=long_delay + DT_MDL,
+        deriv['v_scalar'], deriv['a_scalar'], T_IDXS, action_t=long_delay + DT_MDL,
     )
     desired_accel = smooth_value(desired_accel, prev_action.desiredAcceleration, LONG_SMOOTH_SECONDS)
 
@@ -389,6 +396,8 @@ def get_default_deriv():
         'vy': np.zeros(IDX_N, dtype=np.float32),
         'ax': np.zeros(IDX_N, dtype=np.float32),
         'ay': np.zeros(IDX_N, dtype=np.float32),
+        'v_scalar': np.zeros(IDX_N, dtype=np.float32),
+        'a_scalar': np.zeros(IDX_N, dtype=np.float32),
         'yaw_rate': np.zeros(IDX_N, dtype=np.float32),
     }
 
