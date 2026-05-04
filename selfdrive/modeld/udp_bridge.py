@@ -4,7 +4,7 @@ Alpamayo UDP Bridge (ac_decoded_path.json 포맷) — 위치 기반 경로 추�
 
 외부에서 UDP로 1회 전송한 ac_decoded_path.json 전체(JSON bytes)를 수신하여:
   - pred_xyz / pred_yaw_rad / pred_v_mps 를 수신 시점 LocalWorld 앵커 기준 global 좌표로 변환해 저장
-  - 20Hz 루프에서 livePose를 LocalWorld에 적분 → 현재 pose에서 Pure Pursuit/종방향 추종기 실행
+  - 20Hz 루프에서 livePose를 LocalWorld에 적분 → 현재 pose에서 LateralMpc/종방향 추종기 실행
   - 결과 desiredCurvature / desiredAcceleration 을 modelV2.action 으로 발행
   - pred_xyz 는 현재 ego frame으로 재표현해 modelV2.position 에 실어 UI 표시
 
@@ -21,6 +21,8 @@ import cereal.messaging as messaging
 from cereal import log
 from cereal.messaging import PubMaster, SubMaster
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.controls.lib.drive_helpers import CAR_ROTATION_RADIUS
+from openpilot.selfdrive.controls.lib.lateral_mpc_lib.lat_mpc import LateralMpc
 from openpilot.selfdrive.controls.lib.local_world import LocalWorld
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
@@ -36,10 +38,13 @@ X_IDXS = np.array(ModelConstants.X_IDXS, dtype=np.float64)
 IDX_N = ModelConstants.IDX_N   # 33
 
 # ── 추종기 파라미터 ──────────────────────────────────
-WHEELBASE_M = 2.8                    # Pure Pursuit에 사용 (sim 기준 근사)
-LOOKAHEAD_MIN_M = 10.0               # 최소 lookahead
-LOOKAHEAD_K = 0.6                    # L_d = max(MIN, K * v_ego)  (≈0.6s 선행)
-LOOKAHEAD_MAX_M = 20.0
+MIN_SPEED = 1.0                      # psi_rate 계산 분모 보호 (m/s)
+
+MPC_PATH_WEIGHT       = 1.0
+MPC_HEADING_WEIGHT    = 0.1
+MPC_LAT_ACCEL_WEIGHT  = 0.0
+MPC_LAT_JERK_WEIGHT   = 0.05
+MPC_STEER_RATE_WEIGHT = 800.0
 
 CURV_CLAMP = 0.5                     # ±0.5 1/m
 ACCEL_MIN = -3.5
@@ -83,6 +88,13 @@ def parse_action_packet(data: bytes):
                          f"xyz={pred_xyz.shape[0]}, yaw={pred_yaw.shape[0]}, v={pred_v.shape[0]})")
         return None
 
+    # pred_curvature (optional) — Alpamayo CCW(LEFT+) → openpilot CW(RIGHT+)
+    pred_curv_raw = d.get('pred_curvature')
+    if isinstance(pred_curv_raw, list) and len(pred_curv_raw) == N:
+        kappa = -np.asarray(pred_curv_raw, dtype=np.float64)  # CCW → CW
+    else:
+        kappa = np.zeros(N, dtype=np.float64)
+
     # Alpamayo(y=LEFT) → openpilot(y=RIGHT) 변환
     ego_x =  pred_xyz[:, 0].astype(np.float64)
     ego_y = -pred_xyz[:, 1].astype(np.float64)
@@ -96,6 +108,7 @@ def parse_action_packet(data: bytes):
         'ego_yaw': ego_yaw, 'path_v': path_v,
         'a_ff': a_ff, 'dt_s': dt_s, 'N': N,
         'inference_time_s': inference_time_s,
+        'kappa': kappa,  # (N,) openpilot CW convention (RIGHT+ = positive)
     }
 
 
@@ -122,6 +135,7 @@ def path_ego_to_world(pkt, anchor):
         'a_ff': pkt['a_ff'],
         'N': pkt['N'],
         'dt_s': pkt['dt_s'],
+        'kappa': pkt['kappa'],          # (N,) curvature invariant, openpilot CW
     }
 
 
@@ -169,33 +183,35 @@ def nearest_index_ahead(x, y):
     return int(np.argmin(x * x + y * y))
 
 
-# ── lateral tracker: Pure Pursuit ────────────────────
-def pure_pursuit_curvature(x, y, v_ego):
-    """현재 ego-frame path 상에서 lookahead 점 찾아 curvature 반환.
-    x=fwd, y=right. curvature>0 이면 우회전(openpilot 규약).
+# ── lateral tracker: LateralMpc ──────────────────────
+def run_lat_mpc(path_ego, stored, v_ego, kappa_current, lat_mpc):
+    """LateralMpc로 desired curvature 계산.
+    MPC frame: y=LEFT+, psi=CCW+. path_ego frame: y=RIGHT+, yaw=CW+.
+    Returns float curvature (openpilot CW convention, RIGHT+=positive, clipped).
     """
-    L_d = max(LOOKAHEAD_MIN_M, min(LOOKAHEAD_MAX_M, LOOKAHEAD_K * max(v_ego, 0.0)))
-    # 원점 기준 전방 점 중 |p| >= L_d 인 첫 점
-    dist = np.hypot(x, y)
-    ahead = x > 0.0
-    cand = np.where(ahead & (dist >= L_d))[0]
-    if len(cand) > 0:
-        i = int(cand[0])
-    else:
-        # lookahead까지 못 미침 → 가장 먼 전방 점
-        ahead_idx = np.where(ahead)[0]
-        if len(ahead_idx) == 0:
-            return 0.0, L_d
-        i = int(ahead_idx[-1])
-    tx, ty = x[i], y[i]
-    Ld_actual = math.hypot(tx, ty)
-    if Ld_actual < 1e-3:
-        return 0.0, L_d
-    # Pure Pursuit: κ = 2·sin(α)/L_d, α=heading error to target
-    # body frame에서 target 각도 α = atan2(y_right, x_fwd) (오른쪽이면 α>0, 우회전)
-    alpha = math.atan2(ty, tx)
-    kappa = 2.0 * math.sin(alpha) / Ld_actual
-    return float(np.clip(kappa, -CURV_CLAMP, CURV_CLAMP)), L_d
+    v = max(v_ego, MIN_SPEED)
+    N_src = int(stored['N'])
+    dt_src = float(stored['dt_s'])
+    src_t = np.arange(N_src, dtype=np.float64) * dt_src
+
+    # Interpolate path to T_IDXS (N+1=33 points).  Sign-flip to MPC (LEFT+/CCW+) convention.
+    y_pts       = -np.interp(T_IDXS, src_t, path_ego['y'])    # RIGHT+ → LEFT+
+    heading_pts = -np.interp(T_IDXS, src_t, path_ego['yaw'])  # CW+ → CCW+
+    kappa_arr   = np.asarray(stored['kappa'], dtype=np.float64)  # (N_src,) CW+
+    yaw_rate_pts = -np.interp(T_IDXS, src_t, kappa_arr * stored['path_v'])  # CW→CCW ψ̇
+
+    # x0: ego at origin; x0[3]=psi_rate_ego (CCW+) = -kappa_current * v
+    x0 = np.array([0.0, 0.0, 0.0, -kappa_current * v], dtype=np.float64)
+
+    # p: (N+1, 2) = [v_ego, rotation_radius]
+    v_interp = np.clip(np.interp(T_IDXS, src_t, path_ego['v']), MIN_SPEED, None)
+    p = np.column_stack([v_interp, np.full(len(T_IDXS), CAR_ROTATION_RADIUS)])
+
+    lat_mpc.run(x0, p, y_pts, heading_pts, yaw_rate_pts)
+
+    # x_sol[1, 3] = psi_rate_ego at first predicted step (CCW+) → convert to CW+ curvature
+    kappa_mpc = -float(lat_mpc.x_sol[1, 3]) / v
+    return float(np.clip(kappa_mpc, -CURV_CLAMP, CURV_CLAMP))
 
 
 # ── longitudinal tracker ─────────────────────────────
@@ -526,6 +542,11 @@ def main():
     cloudlog.warning(f"udp_bridge viz publish: vehicle/trail→{VEHICLE_VIZ_PORT}, "
                      f"raw mirror→{LOCAL_PATH_VIZ_PORT}, worldFrame→{WORLD_PATH_VIZ_PORT}")
 
+    lat_mpc = LateralMpc()
+    lat_mpc.set_weights(MPC_PATH_WEIGHT, MPC_HEADING_WEIGHT,
+                        MPC_LAT_ACCEL_WEIGHT, MPC_LAT_JERK_WEIGHT, MPC_STEER_RATE_WEIGHT)
+    kappa_current = 0.0
+
     world = LocalWorld()
     frame_id = 0
     stored = None            # world 좌표 path
@@ -590,12 +611,13 @@ def main():
             cur = world.current()
             path_ego = path_world_to_current_ego(stored, cur)
 
-            kappa, L_d = pure_pursuit_curvature(path_ego['x'], path_ego['y'], v_ego)
+            kappa_mpc = run_lat_mpc(path_ego, stored, v_ego, kappa_current, lat_mpc)
+            kappa_current = kappa_mpc
             a_cmd, should_stop, v_ref, remaining = longitudinal_accel(
                 path_ego, v_ego, s_ref_total=None,
             )
             action = log.ModelDataV2.Action(
-                desiredCurvature=float(kappa),
+                desiredCurvature=float(kappa_mpc),
                 desiredAcceleration=float(a_cmd),
                 shouldStop=bool(should_stop),
             )
@@ -606,9 +628,11 @@ def main():
                 cte = float(path_ego['y'][nearest_index_ahead(path_ego['x'], path_ego['y'])])
                 cloudlog.warning(
                     f"track: v_ego={v_ego:.2f} v_ref={v_ref:.2f} cte={cte:+.2f}m "
-                    f"κ={kappa:+.4f} a={a_cmd:+.2f} Ld={L_d:.1f} rem={remaining:.1f} stop={should_stop}"
+                    f"κ={kappa_mpc:+.4f} a={a_cmd:+.2f} rem={remaining:.1f} stop={should_stop} "
+                    f"mpc_t={lat_mpc.solve_time*1000:.1f}ms"
                 )
         else:
+            kappa_current = 0.0
             action = idle_action()
             rs = default_resampled()
 
