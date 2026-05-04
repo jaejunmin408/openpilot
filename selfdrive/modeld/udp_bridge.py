@@ -37,11 +37,11 @@ IDX_N = ModelConstants.IDX_N   # 33
 
 # ── 추종기 파라미터 ──────────────────────────────────
 WHEELBASE_M = 2.8                    # Pure Pursuit에 사용 (sim 기준 근사)
-LOOKAHEAD_MIN_M = 3.0                # 최소 lookahead
+LOOKAHEAD_MIN_M = 10.0               # 최소 lookahead
 LOOKAHEAD_K = 0.6                    # L_d = max(MIN, K * v_ego)  (≈0.6s 선행)
 LOOKAHEAD_MAX_M = 20.0
 
-CURV_CLAMP = 0.2                     # ±0.2 1/m (R ≥ 5m)
+CURV_CLAMP = 0.5                     # ±0.5 1/m
 ACCEL_MIN = -3.5
 ACCEL_MAX = 2.0
 
@@ -567,7 +567,8 @@ def main():
         #    inference_time_s 만큼 과거의 ego pose를 LocalWorld history에서 조회해 anchor로 사용
         #    (path[0] = Alpamayo가 캡처한 시점의 ego 위치·방향에 맞물림)
         if pending_pkt is not None and world.is_initialized():
-            inference_time_s = pending_pkt['inference_time_s']
+            #inference_time_s = pending_pkt['inference_time_s']
+            inference_time_s = 1.0
             past_t_ns = pending_pkt['recv_mono_ns'] - int(inference_time_s * 1e9)
             past = world.at(past_t_ns)       # 범위 밖이면 가장 가까운 끝점으로 clamp
             anchor = (past[1], past[2], past[3])

@@ -32,7 +32,7 @@ def create_map(track_size=60):
   return dict(
     type=MapGenerateMethod.PG_MAP_FILE,
     lane_num=2,
-    lane_width=4.5,
+    lane_width=45,
     config=[
       None,
       straight_block(track_size),
