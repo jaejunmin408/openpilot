@@ -5,6 +5,7 @@ Orin ADCM에서 UDP로 전송한 궤적 패킷을 수신하여
 modelV2 / drivingModelData 메시지로 변환/발행한다.
 cameraOdometry는 modeld가 카메라 기반으로 발행한다.
 """
+import os
 import socket
 import struct
 import time
@@ -25,6 +26,13 @@ UDP_PORT = 10002
 UDP_TIMEOUT_S = 0.05          # 50 ms
 PACKET_SIZE = 1243            # 1200(points) + 24(ego) + 18(meta) + 1(n_valid)
 MAX_POINTS = 50
+
+# ── viz 송신 설정 (stateless pass-through) ──────────────
+VIZ_PC_IP   = os.environ.get("VIZ_PC_IP", "127.0.0.1")
+COMA_PORT   = 5006                  # livePose 기반 차량 상태
+MIRROR_PORT = 5007                  # ADCM 원본 1243B 미러
+COMA_MAGIC  = 0x434F4D41            # 'COMA'
+COMA_FMT    = "<Idddd"              # 36B: magic, v_fwd, v_right, yaw_rate, a_fwd  (dynamics 표시용)
 
 LONG_SMOOTH_SECONDS = 0.3
 LAT_SMOOTH_SECONDS = 0.0
@@ -157,19 +165,28 @@ def interpolate_to_tidxs(rel_x, rel_y, rel_yaw, velocity, cum_time):
 
 # ── 미분값 계산 ──────────────────────────────────────
 def compute_derivatives(interp: dict):
-    """velocity_x/y, acceleration_x/y, yaw_rate 계산."""
+    """velocity_x/y, acceleration_x/y, yaw_rate 계산.
+
+    vx/vy/ax/ay는 car-body 프레임 벡터 성분 (modelV2.velocity/acceleration 용).
+    v_scalar/a_scalar는 속도의 크기와 그 미분 (종방향 플래너 용).
+    회전 중에는 vx가 cos(yaw)만큼 작아지므로, get_accel_from_plan에는
+    반드시 scalar 속도를 넘겨야 '경로가 감속 중'이라는 오해석을 피할 수 있다.
+    """
     yaw = interp['yaw']
     vel = interp['vel']
     vx = vel * np.cos(yaw)
     vy = vel * np.sin(yaw)
     ax = np.gradient(vx, T_IDXS).astype(np.float32)
     ay = np.gradient(vy, T_IDXS).astype(np.float32)
+    a_scalar = np.gradient(vel, T_IDXS).astype(np.float32)
     yaw_rate = np.gradient(yaw, T_IDXS).astype(np.float32)
     return {
         'vx': vx.astype(np.float32),
         'vy': vy.astype(np.float32),
         'ax': ax,
         'ay': ay,
+        'v_scalar': vel.astype(np.float32),
+        'a_scalar': a_scalar,
         'yaw_rate': yaw_rate,
     }
 
@@ -177,14 +194,12 @@ def compute_derivatives(interp: dict):
 # ── action 계산 ──────────────────────────────────────
 def compute_action(interp, deriv, prev_action, v_ego, lat_delay, long_delay, adcm_meta):
     """desiredCurvature, desiredAcceleration, shouldStop 계산."""
-    plan_vel_x = deriv['vx']
-    plan_acc_x = deriv['ax']
     plan_yaw = interp['yaw']
     plan_yaw_rate = deriv['yaw_rate']
 
-    # 종방향
+    # 종방향: scalar 속도/가속도 사용 (회전 중에도 올바른 가/감속 산출)
     desired_accel, should_stop = get_accel_from_plan(
-        plan_vel_x, plan_acc_x, T_IDXS, action_t=long_delay + DT_MDL,
+        deriv['v_scalar'], deriv['a_scalar'], T_IDXS, action_t=long_delay + DT_MDL,
     )
     desired_accel = smooth_value(desired_accel, prev_action.desiredAcceleration, LONG_SMOOTH_SECONDS)
 
@@ -381,6 +396,8 @@ def get_default_deriv():
         'vy': np.zeros(IDX_N, dtype=np.float32),
         'ax': np.zeros(IDX_N, dtype=np.float32),
         'ay': np.zeros(IDX_N, dtype=np.float32),
+        'v_scalar': np.zeros(IDX_N, dtype=np.float32),
+        'a_scalar': np.zeros(IDX_N, dtype=np.float32),
         'yaw_rate': np.zeros(IDX_N, dtype=np.float32),
     }
 
@@ -398,7 +415,9 @@ def main():
     cloudlog.warning("udp_bridge init")
 
     pm = PubMaster(["modelV2", "drivingModelData", "longitudinalPlan", "driverAssistance"])
-    sm = SubMaster(["carState", "carControl", "liveDelay"])
+    # carState/carControl/liveDelay: 기존 ADCM 파싱·제어 경로에서 이미 사용 중
+    # livePose: viz 송신용으로 추가 (실차/시뮬 단일 소스)
+    sm = SubMaster(["carState", "carControl", "liveDelay", "livePose"])
 
     # UDP 소켓 설정
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -406,6 +425,10 @@ def main():
     sock.bind(('0.0.0.0', UDP_PORT))
     sock.setblocking(False)
     cloudlog.warning(f"udp_bridge listening on port {UDP_PORT}")
+
+    # viz 송신 전용 소켓 (bind 안 함, pass-through)
+    viz_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cloudlog.warning(f"udp_bridge viz → {VIZ_PC_IP}:{COMA_PORT}(COMA) / {VIZ_PC_IP}:{MIRROR_PORT}(ADCM mirror)")
 
     frame_id = 0
     prev_action = log.ModelDataV2.Action()
@@ -428,6 +451,11 @@ def main():
         try:
             while True:
                 data, addr = sock.recvfrom(2048)
+                # viz: ADCM 원본 bytes 그대로 미러 (stateless)
+                try:
+                    viz_sock.sendto(data, (VIZ_PC_IP, MIRROR_PORT))
+                except OSError:
+                    pass
                 result = parse_packet(data)
                 if result is not None:
                     points, ego, meta = result
@@ -457,6 +485,22 @@ def main():
 
         # 4. 메시지 발행
         publish_messages(pm, cur_interp, cur_deriv, action, frame_id, cur_meta, v_ego)
+
+        # 4a. viz: livePose 기반 COMA 패킷 송신 (stateless, livePose only)
+        if sm.alive["livePose"]:
+            lp = sm["livePose"]
+            pkt = struct.pack(
+                COMA_FMT,
+                COMA_MAGIC,
+                float(lp.velocityDevice.x),         # forward (body)
+                float(lp.velocityDevice.y),         # right (body)
+                float(lp.angularVelocityDevice.z),  # yaw rate
+                float(lp.accelerationDevice.x),     # a_fwd
+            )
+            try:
+                viz_sock.sendto(pkt, (VIZ_PC_IP, COMA_PORT))
+            except OSError:
+                pass
 
         frame_id += 1
 

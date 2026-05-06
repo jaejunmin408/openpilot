@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>ADCM Trajectory Viewer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; color: #eee; font-family: 'Consolas', monospace; display: flex; height: 100vh; overflow: hidden; }
+  #canvas { flex: 1 1 0; min-width: 0; display: block; }
+  #panel {
+    flex: 0 0 300px;
+    padding: 14px; background: #16213e; overflow-y: auto;
+    border-left: 1px solid #0f3460;
+  }
+  #panel h2 { color: #e94560; margin-bottom: 10px; font-size: 15px; }
+  .section { margin-bottom: 12px; }
+  .section h3 { font-size: 12px; color: #53c1de; margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .info-row { display: flex; justify-content: space-between; padding: 2px 0; border-bottom: 1px solid #0f3460; font-size: 11px; }
+  .info-label { color: #999; }
+  .info-value { color: #53c1de; font-weight: bold; }
+  #status { padding: 6px; margin-bottom: 10px; border-radius: 4px; font-size: 11px; text-align: center; }
+  .connected { background: #1b4332; color: #95d5b2; }
+  .disconnected { background: #3d0000; color: #ff6b6b; }
+  .waiting { background: #3d3100; color: #ffd166; }
+  .legend-entry { display: flex; align-items: center; gap: 6px; font-size: 10px; margin: 2px 0; color: #bbb; }
+  .legend-swatch { width: 18px; height: 3px; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="panel">
+  <h2>ADCM Trajectory</h2>
+  <div id="status" class="disconnected">Disconnected</div>
+
+  <div class="section">
+    <h3>ADCM planned</h3>
+    <div class="info-row"><span class="info-label">x</span><span class="info-value" id="p-x">-</span></div>
+    <div class="info-row"><span class="info-label">y</span><span class="info-value" id="p-y">-</span></div>
+    <div class="info-row"><span class="info-label">heading</span><span class="info-value" id="p-hdg">-</span></div>
+    <div class="info-row"><span class="info-label">target_accel</span><span class="info-value" id="p-accel">-</span></div>
+    <div class="info-row"><span class="info-label">drive</span><span class="info-value" id="p-drive">-</span></div>
+    <div class="info-row"><span class="info-label">turn_signal</span><span class="info-value" id="p-sig">-</span></div>
+    <div class="info-row"><span class="info-label">emergency</span><span class="info-value" id="p-emg">-</span></div>
+    <div class="info-row"><span class="info-label">n_valid</span><span class="info-value" id="p-nv">-</span></div>
+    <div class="info-row"><span class="info-label">frame</span><span class="info-value" id="p-frm">-</span></div>
+  </div>
+
+  <div class="section">
+    <h3>Actual vehicle (livePose)</h3>
+    <div class="info-row"><span class="info-label">x</span><span class="info-value" id="v-x">-</span></div>
+    <div class="info-row"><span class="info-label">y</span><span class="info-value" id="v-y">-</span></div>
+    <div class="info-row"><span class="info-label">heading</span><span class="info-value" id="v-hdg">-</span></div>
+    <div class="info-row"><span class="info-label">speed</span><span class="info-value" id="v-speed">-</span></div>
+    <div class="info-row"><span class="info-label">v_fwd</span><span class="info-value" id="v-vf">-</span></div>
+    <div class="info-row"><span class="info-label">v_right</span><span class="info-value" id="v-vr">-</span></div>
+    <div class="info-row"><span class="info-label">a_fwd</span><span class="info-value" id="v-af">-</span></div>
+    <div class="info-row"><span class="info-label">yaw_rate</span><span class="info-value" id="v-yr">-</span></div>
+  </div>
+
+  <div class="section">
+    <h3>Error (vs reference)</h3>
+    <div class="info-row"><span class="info-label">lat_err</span><span class="info-value" id="e-lat">-</span></div>
+    <div class="info-row"><span class="info-label">|lat_err|</span><span class="info-value" id="e-abs">-</span></div>
+    <div class="info-row"><span class="info-label">closest_idx</span><span class="info-value" id="e-idx">-</span></div>
+  </div>
+
+  <div class="section">
+    <h3>Legend</h3>
+    <div class="legend-entry"><span class="legend-swatch" style="background:repeating-linear-gradient(to right,rgba(233,69,96,0.55) 0 5px,transparent 5px 9px)"></span>내 위치 (ADCM UDP 기반)</div>
+    <div class="legend-entry"><span class="legend-swatch" style="background:rgba(233,69,96,0.85)"></span>경로 (ADCM 위치에서 이어짐)</div>
+    <div class="legend-entry"><span class="legend-swatch" style="background:repeating-linear-gradient(to right,rgba(6,214,160,0.9) 0 5px,transparent 5px 9px)"></span>내 위치 (livePose 기반)</div>
+    <div class="legend-entry"><span class="legend-swatch" style="background:rgba(6,214,160,0.85)"></span>경로 (livePose 위치에서 이어짐)</div>
+    <div class="legend-entry"><span class="legend-swatch" style="background:repeating-linear-gradient(to right,rgba(255,209,102,0.9) 0 6px,transparent 6px 10px)"></span>절대 ref path (--ref-json)</div>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+// ── state ──
+let vehicle = null;           // actual, dead-reckoned (type: 'vehicle')
+let vehiclePlanned = null;    // ADCM planned ego (type: 'vehicle_planned')
+let worldTrajectory = null;   // 50 ADCM planned points (type: 'trajectory_world')
+let referencePath = null;     // 절대 ref path (server --ref-json 지정 시 1회 도착)
+
+let actualTrail = [];         // accumulated from 'vehicle'
+let plannedTrail = [];        // accumulated from 'vehicle_planned'
+const MAX_TRAIL = 5000;
+const SCALE = 40;             // px/m
+
+// ── canvas resize ──
+function resize() {
+  canvas.width = canvas.clientWidth * devicePixelRatio;
+  canvas.height = canvas.clientHeight * devicePixelRatio;
+  ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  draw();
+}
+window.addEventListener('resize', resize);
+
+// ── global → screen (camera follows vehicle; falls back to planned, then origin) ──
+function getCamera() {
+  if (vehicle) return { x: vehicle.x, y: vehicle.y };
+  if (vehiclePlanned) return { x: vehiclePlanned.x, y: vehiclePlanned.y };
+  return { x: 0, y: 0 };
+}
+
+// Planner frame → actual pose rebase:
+// points are authored relative to planner ego (planned.x, planned.y, planned.yaw);
+// re-express them from the actual vehicle's pose so the path hugs the real car's nose.
+function rebaseTrajectoryToActual(points, planned, actual) {
+  const cp = Math.cos(-planned.yaw), sp = Math.sin(-planned.yaw);
+  const ca = Math.cos(actual.heading), sa = Math.sin(actual.heading);
+  const dYaw = actual.heading - planned.yaw;
+  return points.map(pt => {
+    const dx = pt.x - planned.x;
+    const dy = pt.y - planned.y;
+    const rx = dx * cp - dy * sp;
+    const ry = dx * sp + dy * cp;
+    return {
+      x: actual.x + rx * ca - ry * sa,
+      y: actual.y + rx * sa + ry * ca,
+      yaw: pt.yaw + dYaw,
+    };
+  });
+}
+
+function toScreen(gx, gy, cam, W, H) {
+  return {
+    sx: W / 2 + (gx - cam.x) * SCALE,
+    sy: H / 2 - (gy - cam.y) * SCALE,
+  };
+}
+
+// ── draw ──
+function draw() {
+  const W = canvas.clientWidth;
+  const H = canvas.clientHeight;
+
+  ctx.fillStyle = '#1a1a2e';
+  ctx.fillRect(0, 0, W, H);
+
+  const cam = getCamera();
+  drawGrid(W, H, cam);
+
+  // 0. reference path (절대 ref, --ref-json 지정 시) — 노랑 점선, 가장 아래 layer
+  if (referencePath && referencePath.points && referencePath.points.length > 1) {
+    const pts = referencePath.points;
+    ctx.beginPath();
+    let s0 = toScreen(pts[0].x, pts[0].y, cam, W, H);
+    ctx.moveTo(s0.sx, s0.sy);
+    for (let i = 1; i < pts.length; i++) {
+      const s = toScreen(pts[i].x, pts[i].y, cam, W, H);
+      ctx.lineTo(s.sx, s.sy);
+    }
+    ctx.setLineDash([6, 4]);
+    ctx.strokeStyle = 'rgba(255,209,102,0.7)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // 1. planned-ego trail (dashed red — already travelled)
+  if (plannedTrail.length > 1) {
+    ctx.beginPath();
+    let s0 = toScreen(plannedTrail[0].x, plannedTrail[0].y, cam, W, H);
+    ctx.moveTo(s0.sx, s0.sy);
+    for (let i = 1; i < plannedTrail.length; i++) {
+      const s = toScreen(plannedTrail[i].x, plannedTrail[i].y, cam, W, H);
+      ctx.lineTo(s.sx, s.sy);
+    }
+    ctx.setLineDash([5, 4]);
+    ctx.strokeStyle = 'rgba(233,69,96,0.55)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // 2. actual trail (dashed green — already travelled)
+  if (actualTrail.length > 1) {
+    ctx.beginPath();
+    let s0 = toScreen(actualTrail[0].x, actualTrail[0].y, cam, W, H);
+    ctx.moveTo(s0.sx, s0.sy);
+    for (let i = 1; i < actualTrail.length; i++) {
+      const s = toScreen(actualTrail[i].x, actualTrail[i].y, cam, W, H);
+      ctx.lineTo(s.sx, s.sy);
+    }
+    ctx.setLineDash([5, 4]);
+    ctx.strokeStyle = 'rgba(6,214,160,0.9)';
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // 3. planned trajectory (50 ADCM points, cyan — at planner ego)
+  if (worldTrajectory && worldTrajectory.points.length > 1) {
+    const pts = worldTrajectory.points;
+    ctx.beginPath();
+    const s0 = toScreen(pts[0].x, pts[0].y, cam, W, H);
+    ctx.moveTo(s0.sx, s0.sy);
+    for (let i = 1; i < pts.length; i++) {
+      const s = toScreen(pts[i].x, pts[i].y, cam, W, H);
+      ctx.lineTo(s.sx, s.sy);
+    }
+    ctx.strokeStyle = 'rgba(233,69,96,0.85)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    // point markers
+    ctx.fillStyle = 'rgba(233,69,96,0.55)';
+    for (let i = 0; i < pts.length; i++) {
+      const s = toScreen(pts[i].x, pts[i].y, cam, W, H);
+      ctx.beginPath();
+      ctx.arc(s.sx, s.sy, 1.8, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // 3b. same trajectory rebased to actual vehicle pose (amber — where the car will actually drive)
+  if (worldTrajectory && vehiclePlanned && vehicle && worldTrajectory.points.length > 1) {
+    const rebased = rebaseTrajectoryToActual(
+      worldTrajectory.points,
+      { x: vehiclePlanned.x, y: vehiclePlanned.y, yaw: vehiclePlanned.yaw },
+      { x: vehicle.x, y: vehicle.y, heading: vehicle.heading },
+    );
+    ctx.beginPath();
+    const s0 = toScreen(rebased[0].x, rebased[0].y, cam, W, H);
+    ctx.moveTo(s0.sx, s0.sy);
+    for (let i = 1; i < rebased.length; i++) {
+      const s = toScreen(rebased[i].x, rebased[i].y, cam, W, H);
+      ctx.lineTo(s.sx, s.sy);
+    }
+    ctx.strokeStyle = 'rgba(6,214,160,0.85)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(6,214,160,0.55)';
+    for (let i = 0; i < rebased.length; i++) {
+      const s = toScreen(rebased[i].x, rebased[i].y, cam, W, H);
+      ctx.beginPath();
+      ctx.arc(s.sx, s.sy, 1.8, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // 4. planned ego (arrow showing heading)
+  if (vehiclePlanned) {
+    const s = toScreen(vehiclePlanned.x, vehiclePlanned.y, cam, W, H);
+    drawPlannedArrow(s.sx, s.sy, vehiclePlanned.yaw);
+  }
+
+  // 5. actual vehicle (car glyph)
+  if (vehicle) {
+    const s = toScreen(vehicle.x, vehicle.y, cam, W, H);
+    drawCar(s.sx, s.sy, vehicle.heading);
+    ctx.fillStyle = '#06d6a0';
+    ctx.font = 'bold 14px Consolas';
+    ctx.fillText(`${(vehicle.speed * 3.6).toFixed(1)} km/h`, s.sx + 18, s.sy - 16);
+    ctx.fillStyle = '#666';
+    ctx.font = '10px Consolas';
+    ctx.fillText(`(${vehicle.x.toFixed(1)}, ${vehicle.y.toFixed(1)})`, s.sx + 18, s.sy - 2);
+  }
+
+  drawScaleBar(W, H);
+}
+
+function drawGrid(W, H, cam) {
+  let gridM = 1;
+  if (gridM * SCALE < 20) gridM = 2;
+  if (gridM * SCALE < 10) gridM = 5;
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 1;
+
+  const ox = (W / 2) - cam.x * SCALE;
+  const oy = (H / 2) + cam.y * SCALE;
+
+  const startGX = Math.floor((cam.x - W / 2 / SCALE) / gridM) * gridM;
+  for (let gx = startGX; ; gx += gridM) {
+    const sx = ox + gx * SCALE;
+    if (sx > W) break;
+    if (sx >= 0) { ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, H); ctx.stroke(); }
+  }
+  const startGY = Math.floor((cam.y - H / 2 / SCALE) / gridM) * gridM;
+  for (let gy = startGY; ; gy += gridM) {
+    const sy = oy - gy * SCALE;
+    if (sy < 0) break;
+    if (sy <= H) { ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(W, sy); ctx.stroke(); }
+  }
+
+  const o = toScreen(0, 0, cam, W, H);
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  if (o.sx > 0 && o.sx < W) { ctx.beginPath(); ctx.moveTo(o.sx, 0); ctx.lineTo(o.sx, H); ctx.stroke(); }
+  if (o.sy > 0 && o.sy < H) { ctx.beginPath(); ctx.moveTo(0, o.sy); ctx.lineTo(W, o.sy); ctx.stroke(); }
+}
+
+function drawCar(cx, cy, yaw) {
+  const angle = -(yaw - Math.PI / 2);
+  const size = 10;
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(angle);
+  ctx.beginPath();
+  ctx.moveTo(0, -size * 1.5);
+  ctx.lineTo(-size, size);
+  ctx.lineTo(size, size);
+  ctx.closePath();
+  ctx.fillStyle = '#06d6a0';
+  ctx.fill();
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawPlannedArrow(cx, cy, yaw) {
+  // 쐐기형 화살촉: 뾰족한 팁 + 양 날개 + 뒤쪽 V 컷 (삼각형과 달리 방향이 확연)
+  const angle = -(yaw - Math.PI / 2);
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(angle);
+  ctx.beginPath();
+  ctx.moveTo(0, -10);        // 팁 (전방)
+  ctx.lineTo(-7, 5);         // 왼쪽 날개
+  ctx.lineTo(0, 1);          // 뒤쪽 V 컷
+  ctx.lineTo(7, 5);          // 오른쪽 날개
+  ctx.closePath();
+  ctx.fillStyle = '#e94560';
+  ctx.fill();
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawScaleBar(W, H) {
+  const barM = SCALE > 30 ? 2 : SCALE > 15 ? 5 : 10;
+  const barPx = barM * SCALE;
+  const x = 20, y = H - 30;
+  ctx.strokeStyle = '#999'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x, y); ctx.lineTo(x + barPx, y);
+  ctx.moveTo(x, y - 4); ctx.lineTo(x, y + 4);
+  ctx.moveTo(x + barPx, y - 4); ctx.lineTo(x + barPx, y + 4);
+  ctx.stroke();
+  ctx.fillStyle = '#999'; ctx.font = '11px Consolas';
+  ctx.fillText(`${barM}m`, x + barPx / 2 - 8, y - 8);
+}
+
+// ── panel updates ──
+const SIG = {0: 'OFF', 1: 'LEFT', 2: 'RIGHT', 3: 'BOTH'};
+
+function updatePlannedPanel(p) {
+  document.getElementById('p-x').textContent = p.x.toFixed(2);
+  document.getElementById('p-y').textContent = p.y.toFixed(2);
+  document.getElementById('p-hdg').textContent = (p.yaw * 180 / Math.PI).toFixed(1) + '°';
+  document.getElementById('p-accel').textContent = p.target_accel.toFixed(2) + ' m/s²';
+  document.getElementById('p-drive').textContent = p.drive_mode ? 'AUTO' : 'MANUAL';
+  document.getElementById('p-sig').textContent = SIG[p.turn_signal] || String(p.turn_signal);
+  document.getElementById('p-emg').textContent = p.emergency.toFixed(2);
+  document.getElementById('p-nv').textContent = p.n_valid;
+  document.getElementById('p-frm').textContent = p.frame;
+}
+
+function updateVehiclePanel(v) {
+  document.getElementById('v-x').textContent = v.x.toFixed(2);
+  document.getElementById('v-y').textContent = v.y.toFixed(2);
+  document.getElementById('v-hdg').textContent = (v.heading * 180 / Math.PI).toFixed(1) + '°';
+  document.getElementById('v-speed').textContent = (v.speed * 3.6).toFixed(1) + ' km/h';
+  document.getElementById('v-vf').textContent = v.v_fwd.toFixed(2) + ' m/s';
+  document.getElementById('v-vr').textContent = v.v_right.toFixed(2) + ' m/s';
+  document.getElementById('v-af').textContent = v.accel.toFixed(2) + ' m/s²';
+  document.getElementById('v-yr').textContent = v.yaw_rate.toFixed(3) + ' rad/s';
+}
+
+function updateErrorPanel(planned) {
+  // server 가 vehicle_planned payload 에 lat_err / closest_idx 를 실어 보냄
+  // (--ref-json 미지정 시 필드 없음 → '-')
+  const latEl = document.getElementById('e-lat');
+  const absEl = document.getElementById('e-abs');
+  const idxEl = document.getElementById('e-idx');
+  if (planned && planned.lat_err !== undefined) {
+    const v = planned.lat_err;
+    latEl.textContent = (v >= 0 ? '+' : '') + v.toFixed(3) + ' m';
+    absEl.textContent = Math.abs(v).toFixed(3) + ' m';
+    idxEl.textContent = String(planned.closest_idx);
+  } else {
+    latEl.textContent = '-';
+    absEl.textContent = '-';
+    idxEl.textContent = '-';
+  }
+}
+
+// ── WebSocket ──
+function connect() {
+  const statusEl = document.getElementById('status');
+  const ws = new WebSocket(`ws://${location.hostname}:8765`);
+
+  ws.onopen = () => {
+    statusEl.textContent = 'Connected — waiting for data';
+    statusEl.className = 'waiting';
+  };
+
+  ws.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+
+    if (data.type === 'reference_path') {
+      referencePath = data;
+      statusEl.textContent = 'Receiving';
+      statusEl.className = 'connected';
+      draw();
+      return;
+    }
+
+    if (data.type === 'trajectory_world') {
+      worldTrajectory = data;
+      statusEl.textContent = 'Receiving';
+      statusEl.className = 'connected';
+      draw();
+      return;
+    }
+
+    if (data.type === 'vehicle_planned') {
+      vehiclePlanned = data;
+      plannedTrail.push({ x: data.x, y: data.y });
+      if (plannedTrail.length > MAX_TRAIL) plannedTrail.shift();
+      updatePlannedPanel(data);
+      updateErrorPanel(data);
+      statusEl.textContent = 'Receiving';
+      statusEl.className = 'connected';
+      draw();
+      return;
+    }
+
+    if (data.type === 'vehicle') {
+      vehicle = data;
+      actualTrail.push({ x: data.x, y: data.y });
+      if (actualTrail.length > MAX_TRAIL) actualTrail.shift();
+      updateVehiclePanel(data);
+      statusEl.textContent = 'Receiving';
+      statusEl.className = 'connected';
+      draw();
+      return;
+    }
+  };
+
+  ws.onclose = () => {
+    statusEl.textContent = 'Disconnected — reconnecting…';
+    statusEl.className = 'disconnected';
+    setTimeout(connect, 1000);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+resize();
+connect();
+</script>
+</body>
+</html>

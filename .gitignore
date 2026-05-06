@@ -58,6 +58,9 @@ selfdrive/ui/translations/tmp
 selfdrive/car/tests/cars_dump
 system/camerad/camerad
 system/camerad/test/ae_gray_test
+system/loggerd/loggerd
+system/loggerd/encoderd
+system/loggerd/bootlog
 
 .coverage*
 coverage.xml
@@ -93,3 +96,6 @@ docs/screenshot/
 .context/
 PLAN.md
 TASK.md
+
+# generated trajectory JSON outputs (generators in repo, outputs reproducible)
+orin/test_trajectory_*.json

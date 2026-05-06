@@ -9,6 +9,7 @@ ADCM 형식 테스트 궤적 생성기
 
 import json
 import math
+import os
 import numpy as np
 
 
@@ -222,7 +223,8 @@ if __name__ == "__main__":
     frames = simulate_ego_on_path(ref_path, SIM_HZ, SIM_DURATION)
     print(f"생성 프레임: {len(frames)}개 ({SIM_HZ}Hz, {len(frames)/SIM_HZ:.1f}초)")
 
-    output_path = "/home/a/orin/work/test_trajectory_right_turn.json"
+    output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "test_trajectory_right_turn.json")
     with open(output_path, "w") as f:
         json.dump({
             "description": "ADCM test: GPS(37.4646,127.12484), 10km/h straight 2s then right turn R=15m",
