@@ -29,15 +29,30 @@ Usage:
 """
 
 import argparse
-import json
 import math
+import os
 import socket
 import struct
+import sys
 import time
 
 import numpy as np
 
+# repo root 를 PYTHONPATH 에 추가 (orin/ 에서 한 단계 위)
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_THIS_DIR)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import cereal.messaging as messaging
+
+from orin.path_transform import (
+    apply_transform_to_path,
+    find_closest_index,
+    load_path_json,
+    make_transform_params,
+    signed_lateral_error,
+)
 
 
 # 반드시 udp_bridge.py 의 상수와 일치
@@ -64,30 +79,6 @@ def get_pose_from_messages(sm):
     # NED → ENU: 절대값 맞추기 (East 시작에서 yaw=0) + 회전 방향 맞추기
     yaw = float(lp.orientationNED.z) - math.pi / 2
     return (x, y, yaw)
-
-
-def make_transform_params(anchor_pose, json_first_pose):
-    """JSON 좌표계 점을 anchor_pose 기준 GPS 프레임으로 매핑하는 파라미터 반환.
-    매핑:
-      rx = (x - jx) * cos_d - (y - jy) * sin_d + ax
-      ry = (x - jx) * sin_d + (y - jy) * cos_d + ay
-      ryaw = yaw + delta_yaw
-    """
-    ax, ay, ayaw = anchor_pose
-    jx, jy, jyaw = json_first_pose
-    delta_yaw = ayaw - jyaw
-    return (ax, ay, jx, jy, delta_yaw, math.cos(delta_yaw), math.sin(delta_yaw))
-
-
-def apply_transform_to_path(transform, path_json):
-    """JSON path (N, 3) 을 GPS 프레임으로 일괄 변환."""
-    ax, ay, jx, jy, delta_yaw, cos_d, sin_d = transform
-    dx = path_json[:, 0] - jx
-    dy = path_json[:, 1] - jy
-    rx = dx * cos_d - dy * sin_d + ax
-    ry = dx * sin_d + dy * cos_d + ay
-    ryaw = path_json[:, 2] + delta_yaw
-    return np.stack([rx, ry, ryaw], axis=1)
 
 
 def smoothstep(t):
@@ -202,14 +193,11 @@ def main():
     args = parser.parse_args()
 
     print(f"Loading: {args.json}")
-    with open(args.json) as f:
-        data = json.load(f)
-    path_pts = data.get("path")
-    if not path_pts:
-        print("ERROR: JSON 에 'path' 가 없습니다.")
+    try:
+        path_json, json_first_pose, data = load_path_json(args.json)
+    except (ValueError, FileNotFoundError) as e:
+        print(f"ERROR: {e}")
         return
-
-    path_json = np.array([(p["x"], p["y"], p["yaw"]) for p in path_pts], dtype=np.float64)
 
     target_mps = float(args.target_speed if args.target_speed is not None
                        else data.get("speed_mps", 2.78))
@@ -232,8 +220,6 @@ def main():
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sm = messaging.SubMaster(["carState", "gpsLocationExternal", "livePose"])
-
-    json_first_pose = (float(path_json[0, 0]), float(path_json[0, 1]), float(path_json[0, 2]))
 
     path_world = None
     pose_warn_last = 0.0
@@ -277,8 +263,7 @@ def main():
                       f"path={len(path_world)} 점")
 
             # closest path index
-            d2 = (path_world[:, 0] - cur_pose[0]) ** 2 + (path_world[:, 1] - cur_pose[1]) ** 2
-            i_closest = int(np.argmin(d2))
+            i_closest = find_closest_index(path_world, cur_pose[0], cur_pose[1])
 
             # path 끝 도달 (non-loop)
             if not args.loop and i_closest >= len(path_world) - MAX_POINTS:
@@ -305,9 +290,7 @@ def main():
             sock.sendto(packet, (args.ip, args.port))
 
             if seq % max(int(args.hz), 1) == 0:
-                px, py, pyaw = path_world[i_closest]
-                perp_cx, perp_cy = -math.sin(pyaw), math.cos(pyaw)
-                lat_err = (cur_pose[0] - px) * perp_cx + (cur_pose[1] - py) * perp_cy
+                lat_err = signed_lateral_error(path_world, i_closest, cur_pose[0], cur_pose[1])
                 print(f"[seq={seq:5d}] i={i_closest:5d}/{len(path_world)} "
                       f"v_ego={v_ego * 3.6:5.1f}km/h a_tgt={target_accel:+.1f} "
                       f"lat_err={lat_err:+.2f}m "

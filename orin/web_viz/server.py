@@ -27,6 +27,7 @@ import asyncio
 import http.server
 import json
 import math
+import os
 import struct
 import sys
 import threading
@@ -34,6 +35,20 @@ import time
 from pathlib import Path
 
 import websockets
+
+# repo root 를 PYTHONPATH 에 추가 (orin/web_viz/ 에서 두 단계 위)
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from orin.path_transform import (
+    apply_transform_to_path,
+    find_closest_index,
+    load_path_json,
+    make_transform_params,
+    signed_lateral_error,
+)
 
 
 # ── Protocol constants (must match udp_bridge.py) ────────────────────────────
@@ -117,6 +132,12 @@ class State:
 
     coma_drop_warn_last: float = 0.0  # rate-limit warn
     adcm_count: int = 0
+
+    # Reference path (--ref-json opt-in). path_json/json_first_pose 는 startup 시,
+    # path_world 는 첫 ADCM 패킷의 ego 로 anchor 잡은 직후 셋팅된다.
+    path_json = None        # (N, 3) ndarray in JSON 좌표계
+    json_first_pose = None  # (jx, jy, jyaw) — JSON 첫 점
+    path_world = None       # (N, 3) ndarray, anchor 기준 GPS 프레임
 
 
 clients: set = set()
@@ -215,6 +236,24 @@ class AdcmProtocol(asyncio.DatagramProtocol):
             State.actual_initialized = True
             print(f"[ADCM] anchor set to ({ego_x:.2f}, {ego_y:.2f}) yaw={ego_yaw:+.3f} rad")
 
+            # --ref-json 지정 시 anchor 기준 path_world 만들고 1회 broadcast.
+            # sender 와 같은 transform 함수를 호출하므로 sender 의 path_world 와 동일.
+            if State.path_json is not None:
+                transform = make_transform_params(
+                    (ego_x, ego_y, ego_yaw), State.json_first_pose)
+                State.path_world = apply_transform_to_path(transform, State.path_json)
+                ref_pts = [
+                    {"x": round(float(State.path_world[i, 0] - ego_x), 4),
+                     "y": round(float(State.path_world[i, 1] - ego_y), 4)}
+                    for i in range(len(State.path_world))
+                ]
+                schedule_broadcast("reference_path", {
+                    "type": "reference_path",
+                    "num_points": len(ref_pts),
+                    "points": ref_pts,
+                })
+                print(f"[ADCM] reference_path broadcast: {len(ref_pts)} points")
+
         ax, ay = State.anchor
         n_valid = parsed["n_valid"]
         pts = [
@@ -227,7 +266,7 @@ class AdcmProtocol(asyncio.DatagramProtocol):
             "num_points": n_valid,
             "points": pts,
         })
-        schedule_broadcast("vehicle_planned", {
+        planned_payload = {
             "type": "vehicle_planned",
             "x": round(ego_x - ax, 4),
             "y": round(ego_y - ay, 4),
@@ -238,7 +277,14 @@ class AdcmProtocol(asyncio.DatagramProtocol):
             "emergency": round(parsed["emergency"], 4),
             "n_valid": n_valid,
             "frame": State.adcm_count,
-        })
+        }
+        if State.path_world is not None:
+            i_closest = find_closest_index(State.path_world, ego_x, ego_y)
+            lat_err = signed_lateral_error(
+                State.path_world, i_closest, ego_x, ego_y)
+            planned_payload["lat_err"] = round(float(lat_err), 4)
+            planned_payload["closest_idx"] = i_closest
+        schedule_broadcast("vehicle_planned", planned_payload)
 
         # ADCM ego 를 그대로 차량 위치/heading 으로 신뢰. 실차에선 Orin 의 GPS+IMU+카메라
         # 융합 결과, sim 에선 sender 가 gpsLocationExternal+livePose 로 모방한 값이라
@@ -310,7 +356,18 @@ def main():
     parser.add_argument("--ws-port", type=int, default=8765)
     parser.add_argument("--http-port", type=int, default=8080,
                         help="0 = auto-pick free port (printed on startup)")
+    parser.add_argument("--ref-json", default=None,
+                        help="reference path JSON. 지정 시 첫 ADCM ego 를 anchor 로 ref 를 1회 broadcast 하고 매 패킷 cross-track 을 계산. sender 와 동일한 JSON 을 줘야 좌표가 정렬됨.")
     args = parser.parse_args()
+
+    if args.ref_json:
+        try:
+            State.path_json, State.json_first_pose, _ = load_path_json(args.ref_json)
+            print(f"[server] ref-json: {args.ref_json} ({len(State.path_json)} 점)")
+        except (ValueError, FileNotFoundError) as e:
+            print(f"[server] ERROR loading ref-json: {e}")
+            return
+
     try:
         asyncio.run(run(args))
     except KeyboardInterrupt:

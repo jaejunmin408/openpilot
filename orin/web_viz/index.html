@@ -58,10 +58,10 @@
   </div>
 
   <div class="section">
-    <h3>Error (actual − planned)</h3>
-    <div class="info-row"><span class="info-label">dist</span><span class="info-value" id="e-d">-</span></div>
-    <div class="info-row"><span class="info-label">dx</span><span class="info-value" id="e-dx">-</span></div>
-    <div class="info-row"><span class="info-label">dy</span><span class="info-value" id="e-dy">-</span></div>
+    <h3>Error (vs reference)</h3>
+    <div class="info-row"><span class="info-label">lat_err</span><span class="info-value" id="e-lat">-</span></div>
+    <div class="info-row"><span class="info-label">|lat_err|</span><span class="info-value" id="e-abs">-</span></div>
+    <div class="info-row"><span class="info-label">closest_idx</span><span class="info-value" id="e-idx">-</span></div>
   </div>
 
   <div class="section">
@@ -70,6 +70,7 @@
     <div class="legend-entry"><span class="legend-swatch" style="background:rgba(233,69,96,0.85)"></span>경로 (ADCM 위치에서 이어짐)</div>
     <div class="legend-entry"><span class="legend-swatch" style="background:repeating-linear-gradient(to right,rgba(6,214,160,0.9) 0 5px,transparent 5px 9px)"></span>내 위치 (livePose 기반)</div>
     <div class="legend-entry"><span class="legend-swatch" style="background:rgba(6,214,160,0.85)"></span>경로 (livePose 위치에서 이어짐)</div>
+    <div class="legend-entry"><span class="legend-swatch" style="background:repeating-linear-gradient(to right,rgba(255,209,102,0.9) 0 6px,transparent 6px 10px)"></span>절대 ref path (--ref-json)</div>
   </div>
 </div>
 
@@ -81,6 +82,7 @@ const ctx = canvas.getContext('2d');
 let vehicle = null;           // actual, dead-reckoned (type: 'vehicle')
 let vehiclePlanned = null;    // ADCM planned ego (type: 'vehicle_planned')
 let worldTrajectory = null;   // 50 ADCM planned points (type: 'trajectory_world')
+let referencePath = null;     // 절대 ref path (server --ref-json 지정 시 1회 도착)
 
 let actualTrail = [];         // accumulated from 'vehicle'
 let plannedTrail = [];        // accumulated from 'vehicle_planned'
@@ -140,6 +142,23 @@ function draw() {
 
   const cam = getCamera();
   drawGrid(W, H, cam);
+
+  // 0. reference path (절대 ref, --ref-json 지정 시) — 노랑 점선, 가장 아래 layer
+  if (referencePath && referencePath.points && referencePath.points.length > 1) {
+    const pts = referencePath.points;
+    ctx.beginPath();
+    let s0 = toScreen(pts[0].x, pts[0].y, cam, W, H);
+    ctx.moveTo(s0.sx, s0.sy);
+    for (let i = 1; i < pts.length; i++) {
+      const s = toScreen(pts[i].x, pts[i].y, cam, W, H);
+      ctx.lineTo(s.sx, s.sy);
+    }
+    ctx.setLineDash([6, 4]);
+    ctx.strokeStyle = 'rgba(255,209,102,0.7)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
 
   // 1. planned-ego trail (dashed red — already travelled)
   if (plannedTrail.length > 1) {
@@ -352,14 +371,21 @@ function updateVehiclePanel(v) {
   document.getElementById('v-yr').textContent = v.yaw_rate.toFixed(3) + ' rad/s';
 }
 
-function updateErrorPanel() {
-  if (vehicle && vehiclePlanned) {
-    const dx = vehicle.x - vehiclePlanned.x;
-    const dy = vehicle.y - vehiclePlanned.y;
-    const d = Math.hypot(dx, dy);
-    document.getElementById('e-d').textContent = d.toFixed(3) + ' m';
-    document.getElementById('e-dx').textContent = (dx >= 0 ? '+' : '') + dx.toFixed(3);
-    document.getElementById('e-dy').textContent = (dy >= 0 ? '+' : '') + dy.toFixed(3);
+function updateErrorPanel(planned) {
+  // server 가 vehicle_planned payload 에 lat_err / closest_idx 를 실어 보냄
+  // (--ref-json 미지정 시 필드 없음 → '-')
+  const latEl = document.getElementById('e-lat');
+  const absEl = document.getElementById('e-abs');
+  const idxEl = document.getElementById('e-idx');
+  if (planned && planned.lat_err !== undefined) {
+    const v = planned.lat_err;
+    latEl.textContent = (v >= 0 ? '+' : '') + v.toFixed(3) + ' m';
+    absEl.textContent = Math.abs(v).toFixed(3) + ' m';
+    idxEl.textContent = String(planned.closest_idx);
+  } else {
+    latEl.textContent = '-';
+    absEl.textContent = '-';
+    idxEl.textContent = '-';
   }
 }
 
@@ -376,6 +402,14 @@ function connect() {
   ws.onmessage = (e) => {
     const data = JSON.parse(e.data);
 
+    if (data.type === 'reference_path') {
+      referencePath = data;
+      statusEl.textContent = 'Receiving';
+      statusEl.className = 'connected';
+      draw();
+      return;
+    }
+
     if (data.type === 'trajectory_world') {
       worldTrajectory = data;
       statusEl.textContent = 'Receiving';
@@ -389,7 +423,7 @@ function connect() {
       plannedTrail.push({ x: data.x, y: data.y });
       if (plannedTrail.length > MAX_TRAIL) plannedTrail.shift();
       updatePlannedPanel(data);
-      updateErrorPanel();
+      updateErrorPanel(data);
       statusEl.textContent = 'Receiving';
       statusEl.className = 'connected';
       draw();
@@ -401,7 +435,6 @@ function connect() {
       actualTrail.push({ x: data.x, y: data.y });
       if (actualTrail.length > MAX_TRAIL) actualTrail.shift();
       updateVehiclePanel(data);
-      updateErrorPanel();
       statusEl.textContent = 'Receiving';
       statusEl.className = 'connected';
       draw();
