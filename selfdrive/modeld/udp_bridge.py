@@ -4,7 +4,7 @@ Alpamayo UDP Bridge (ac_decoded_path.json 포맷) — 위치 기반 경로 추�
 
 외부에서 UDP로 1회 전송한 ac_decoded_path.json 전체(JSON bytes)를 수신하여:
   - pred_xyz / pred_yaw_rad / pred_v_mps 를 수신 시점 LocalWorld 앵커 기준 global 좌표로 변환해 저장
-  - 20Hz 루프에서 livePose를 LocalWorld에 적분 → 현재 pose에서 Pure Pursuit/종방향 추종기 실행
+  - 20Hz 루프에서 livePose를 LocalWorld에 적분 → 현재 pose에서 종방향 추종기 + 공식 openpilot yaw-기반 curvature 산출 실행
   - 결과 desiredCurvature / desiredAcceleration 을 modelV2.action 으로 발행
   - pred_xyz 는 현재 ego frame으로 재표현해 modelV2.position 에 실어 UI 표시
 
@@ -20,9 +20,12 @@ import numpy as np
 import cereal.messaging as messaging
 from cereal import log
 from cereal.messaging import PubMaster, SubMaster
+from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.controls.lib.drive_helpers import curv_from_psis, smooth_value
 from openpilot.selfdrive.controls.lib.local_world import LocalWorld
 from openpilot.selfdrive.modeld.constants import ModelConstants
+from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 
 # ── 설정 ──────────────────────────────────────────────
 UDP_PORT = 5005
@@ -36,12 +39,8 @@ X_IDXS = np.array(ModelConstants.X_IDXS, dtype=np.float64)
 IDX_N = ModelConstants.IDX_N   # 33
 
 # ── 추종기 파라미터 ──────────────────────────────────
-WHEELBASE_M = 2.8                    # Pure Pursuit에 사용 (sim 기준 근사)
-LOOKAHEAD_MIN_M = 10.0               # 최소 lookahead
-LOOKAHEAD_K = 0.6                    # L_d = max(MIN, K * v_ego)  (≈0.6s 선행)
-LOOKAHEAD_MAX_M = 20.0
+MIN_LAT_CONTROL_SPEED = 0.3          # 이 속도 이하에서는 직전 curvature 유지 (공식 modeld와 동일)
 
-CURV_CLAMP = 0.5                     # ±0.5 1/m
 ACCEL_MIN = -3.5
 ACCEL_MAX = 2.0
 
@@ -169,33 +168,26 @@ def nearest_index_ahead(x, y):
     return int(np.argmin(x * x + y * y))
 
 
-# ── lateral tracker: Pure Pursuit ────────────────────
-def pure_pursuit_curvature(x, y, v_ego):
-    """현재 ego-frame path 상에서 lookahead 점 찾아 curvature 반환.
-    x=fwd, y=right. curvature>0 이면 우회전(openpilot 규약).
+# ── lateral tracker: 공식 openpilot 수식 (yaw 궤적 → curvature) ──
+def curvature_from_path_yaws(x, y, yaw, dt_s, v_ego, action_t):
+    """현재 ego-frame path의 yaw 시계열로부터 curvature 산출.
+    공식 openpilot `get_curvature_from_plan` 과 동일한 수식 사용:
+      κ = 2·ψ_target/(v·t) - ψ̇/v
+    여기서 ψ_target은 action_t 시점의 목표 yaw, ψ̇은 현재 yaw rate.
+
+    x=fwd, y=right, yaw=CW(우회전 양수). curvature>0 이면 우회전.
+    nearest-ahead 점을 t=0으로 잡아 시간축을 'from now'로 정렬한다.
     """
-    L_d = max(LOOKAHEAD_MIN_M, min(LOOKAHEAD_MAX_M, LOOKAHEAD_K * max(v_ego, 0.0)))
-    # 원점 기준 전방 점 중 |p| >= L_d 인 첫 점
-    dist = np.hypot(x, y)
-    ahead = x > 0.0
-    cand = np.where(ahead & (dist >= L_d))[0]
-    if len(cand) > 0:
-        i = int(cand[0])
-    else:
-        # lookahead까지 못 미침 → 가장 먼 전방 점
-        ahead_idx = np.where(ahead)[0]
-        if len(ahead_idx) == 0:
-            return 0.0, L_d
-        i = int(ahead_idx[-1])
-    tx, ty = x[i], y[i]
-    Ld_actual = math.hypot(tx, ty)
-    if Ld_actual < 1e-3:
-        return 0.0, L_d
-    # Pure Pursuit: κ = 2·sin(α)/L_d, α=heading error to target
-    # body frame에서 target 각도 α = atan2(y_right, x_fwd) (오른쪽이면 α>0, 우회전)
-    alpha = math.atan2(ty, tx)
-    kappa = 2.0 * math.sin(alpha) / Ld_actual
-    return float(np.clip(kappa, -CURV_CLAMP, CURV_CLAMP)), L_d
+    i0 = nearest_index_ahead(x, y)
+    yaws = yaw[i0:].astype(np.float64)
+    if len(yaws) < 2:
+        return 0.0
+    # 첫 점이 '현재'가 되도록 yaw0 을 빼주어 ψ(0)=0 정규화
+    yaws = yaws - yaws[0]
+    t_rel = np.arange(len(yaws), dtype=np.float64) * float(dt_s)
+    psi_target = float(np.interp(action_t, t_rel, yaws))
+    psi_rate = float((yaws[1] - yaws[0]) / float(dt_s))
+    return float(curv_from_psis(psi_target, psi_rate, v_ego, action_t))
 
 
 # ── longitudinal tracker ─────────────────────────────
@@ -512,7 +504,7 @@ def main():
     cloudlog.warning("udp_bridge init (position-tracking mode)")
 
     pm = PubMaster(["modelV2", "drivingModelData", "longitudinalPlan", "driverAssistance"])
-    sm = SubMaster(["carState", "livePose"])
+    sm = SubMaster(["carState", "livePose", "liveDelay"])
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -532,6 +524,7 @@ def main():
     pending_pkt = None       # LocalWorld 초기화 대기 중인 ego-frame 패킷
     recv_count = 0
     log_counter = 0
+    prev_curvature = 0.0     # 저속 hold 및 smooth_value 용
 
     loop_period = 1.0 / ModelConstants.MODEL_RUN_FREQ  # 50ms = 20Hz
 
@@ -590,7 +583,19 @@ def main():
             cur = world.current()
             path_ego = path_world_to_current_ego(stored, cur)
 
-            kappa, L_d = pure_pursuit_curvature(path_ego['x'], path_ego['y'], v_ego)
+            # 공식 openpilot 방식: lateralDelay+DT_MDL 시점의 yaw 예측으로 κ 산출
+            lat_delay = float(sm["liveDelay"].lateralDelay) + LAT_SMOOTH_SECONDS
+            action_t = lat_delay + DT_MDL
+            kappa_raw = curvature_from_path_yaws(
+                path_ego['x'], path_ego['y'], path_ego['yaw'],
+                stored['dt_s'], v_ego, action_t,
+            )
+            if v_ego > MIN_LAT_CONTROL_SPEED:
+                kappa = smooth_value(kappa_raw, prev_curvature, LAT_SMOOTH_SECONDS)
+            else:
+                kappa = prev_curvature
+            prev_curvature = kappa
+
             a_cmd, should_stop, v_ref, remaining = longitudinal_accel(
                 path_ego, v_ego, s_ref_total=None,
             )
@@ -606,11 +611,13 @@ def main():
                 cte = float(path_ego['y'][nearest_index_ahead(path_ego['x'], path_ego['y'])])
                 cloudlog.warning(
                     f"track: v_ego={v_ego:.2f} v_ref={v_ref:.2f} cte={cte:+.2f}m "
-                    f"κ={kappa:+.4f} a={a_cmd:+.2f} Ld={L_d:.1f} rem={remaining:.1f} stop={should_stop}"
+                    f"κ={kappa:+.4f}(raw {kappa_raw:+.4f}) a={a_cmd:+.2f} "
+                    f"action_t={action_t:.3f} rem={remaining:.1f} stop={should_stop}"
                 )
         else:
             action = idle_action()
             rs = default_resampled()
+            prev_curvature = 0.0
 
         # 5. 메시지 발행
         publish_messages(pm, rs, action, frame_id, v_ego)
