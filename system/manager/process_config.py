@@ -77,6 +77,7 @@ procs = [
   PythonProcess("timed", "system.timed", always_run, enabled=not PC),
 
   PythonProcess("modeld", "selfdrive.modeld.modeld", only_onroad),
+  PythonProcess("udp_bridge", "selfdrive.modeld.udp_bridge", only_onroad),
   PythonProcess("dmonitoringmodeld", "selfdrive.modeld.dmonitoringmodeld", driverview, enabled=(WEBCAM or not PC)),
 
   PythonProcess("sensord", "system.sensord.sensord", only_onroad, enabled=not PC),
@@ -98,7 +99,7 @@ procs = [
   PythonProcess("lagd", "selfdrive.locationd.lagd", only_onroad),
   PythonProcess("ubloxd", "system.ubloxd.ubloxd", ublox, enabled=TICI),
   PythonProcess("pigeond", "system.ubloxd.pigeond", ublox, enabled=TICI),
-  PythonProcess("plannerd", "selfdrive.controls.plannerd", not_long_maneuver),
+  #PythonProcess("plannerd", "selfdrive.controls.plannerd", not_long_maneuver),  # udp_bridge가 longitudinalPlan/driverAssistance 발행
   PythonProcess("maneuversd", "tools.longitudinal_maneuvers.maneuversd", long_maneuver),
   PythonProcess("radard", "selfdrive.controls.radard", only_onroad),
   PythonProcess("hardwared", "system.hardware.hardwared", always_run),

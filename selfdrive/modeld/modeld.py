@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""
+modeld (camera-only mode)
+카메라 영상으로 모델 inference를 수행하여 cameraOdometry만 발행한다.
+modelV2 / drivingModelData / longitudinalPlan / driverAssistance는 udp_bridge가 담당.
+LAT_SMOOTH_SECONDS는 udp_bridge가 import하므로 유지.
+"""
 import os
 from openpilot.system.hardware import TICI
 os.environ['DEV'] = 'QCOM' if TICI else 'CPU'
@@ -11,7 +17,7 @@ import time
 import pickle
 import numpy as np
 import cereal.messaging as messaging
-from cereal import car, log
+from cereal import car
 from pathlib import Path
 from cereal.messaging import PubMaster, SubMaster
 from msgq.visionipc import VisionIpcClient, VisionStreamType, VisionBuf
@@ -19,20 +25,16 @@ from opendbc.car.car_helpers import get_demo_car_params
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.params import Params
 from openpilot.common.filter_simple import FirstOrderFilter
-from openpilot.common.realtime import config_realtime_process, DT_MDL
+from openpilot.common.realtime import config_realtime_process
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.common.transformations.model import get_warp_matrix
-from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
-from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value, get_curvature_from_plan
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
-from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState
+from openpilot.selfdrive.modeld.fill_model_msg import fill_pose_msg
 from openpilot.common.file_chunker import read_file_chunked
-from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
-
+from openpilot.selfdrive.modeld.constants import ModelConstants
 
 PROCESS_NAME = "selfdrive.modeld.modeld"
-SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 
 VISION_PKL_PATH = Path(__file__).parent / 'models/driving_vision_tinygrad.pkl'
 POLICY_PKL_PATH = Path(__file__).parent / 'models/driving_policy_tinygrad.pkl'
@@ -41,81 +43,10 @@ POLICY_METADATA_PATH = Path(__file__).parent / 'models/driving_policy_metadata.p
 MODELS_DIR = Path(__file__).parent / 'models'
 
 LAT_SMOOTH_SECONDS = 0.0
-LONG_SMOOTH_SECONDS = 0.3
-MIN_LAT_CONTROL_SPEED = 0.3
 
 IMG_QUEUE_SHAPE = (6*(ModelConstants.MODEL_RUN_FREQ//ModelConstants.MODEL_CONTEXT_FREQ + 1), 128, 256)
 assert IMG_QUEUE_SHAPE[0] == 30
 
-CUSTOM_PATH_MODE = os.getenv("CUSTOM_PATH_MODE", "off").strip().lower()
-CUSTOM_RIGHT_TURN_RADIUS_M = float(os.getenv("CUSTOM_RIGHT_TURN_RADIUS_M", "40.0"))
-CUSTOM_RIGHT_TURN_SIGN = float(os.getenv("CUSTOM_RIGHT_TURN_SIGN", "1.0"))
-
-POS_X_COL = Plan.POSITION.start + 0
-POS_Y_COL = Plan.POSITION.start + 1
-POS_Z_COL = Plan.POSITION.start + 2
-YAW_COL = Plan.T_FROM_CURRENT_EULER.start + 2
-YAW_RATE_COL = Plan.ORIENTATION_RATE.start + 2
-
-
-def apply_custom_lateral_plan(model_output: dict[str, np.ndarray], mode: str, v_ego: float) -> None:
-  if mode not in ("straight", "right_turn"):
-    return
-
-  plan = model_output["plan"][0]
-  t = np.asarray(ModelConstants.T_IDXS, dtype=np.float32)
-  speed = max(float(v_ego), 1.0)
-
-  if mode == "straight":
-    x = speed * t
-    y = np.zeros_like(t)
-    yaw = np.zeros_like(t)
-    yaw_rate = np.zeros_like(t)
-  else:
-    radius = max(CUSTOM_RIGHT_TURN_RADIUS_M, 1.0)
-    sign = 1.0 if CUSTOM_RIGHT_TURN_SIGN >= 0.0 else -1.0
-    kappa = np.clip(sign / radius, -0.2, 0.2)
-
-    theta = kappa * speed * t
-    if abs(kappa) < 1e-6:
-      x = speed * t
-      y = np.zeros_like(t)
-    else:
-      x = np.sin(theta) / kappa
-      y = (1.0 - np.cos(theta)) / kappa
-
-    yaw = theta
-    yaw_rate = np.full_like(t, kappa * speed)
-
-  plan[:, POS_X_COL] = x
-  plan[:, POS_Y_COL] = y
-  plan[:, POS_Z_COL] = 0.0
-  plan[:, YAW_COL] = yaw
-  plan[:, YAW_RATE_COL] = yaw_rate
-
-
-def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
-                          lat_action_t: float, long_action_t: float, v_ego: float) -> log.ModelDataV2.Action:
-    plan = model_output['plan'][0]
-    desired_accel, should_stop = get_accel_from_plan(plan[:,Plan.VELOCITY][:,0],
-                                                     plan[:,Plan.ACCELERATION][:,0],
-                                                     ModelConstants.T_IDXS,
-                                                     action_t=long_action_t)
-    desired_accel = smooth_value(desired_accel, prev_action.desiredAcceleration, LONG_SMOOTH_SECONDS)
-
-    desired_curvature = get_curvature_from_plan(plan[:,Plan.T_FROM_CURRENT_EULER][:,2],
-                                                plan[:,Plan.ORIENTATION_RATE][:,2],
-                                                ModelConstants.T_IDXS,
-                                                v_ego,
-                                                lat_action_t)
-    if v_ego > MIN_LAT_CONTROL_SPEED:
-      desired_curvature = smooth_value(desired_curvature, prev_action.desiredCurvature, LAT_SMOOTH_SECONDS)
-    else:
-      desired_curvature = prev_action.desiredCurvature
-
-    return log.ModelDataV2.Action(desiredCurvature=float(desired_curvature),
-                                  desiredAcceleration=float(desired_accel),
-                                  shouldStop=bool(should_stop))
 
 class FrameMeta:
   frame_id: int = 0
@@ -275,14 +206,12 @@ class ModelState:
     self.policy_output = self.policy_run(**self.policy_inputs).contiguous().realize().uop.base.buffer.numpy().flatten()
     policy_outputs_dict = self.parser.parse_policy_outputs(self.slice_outputs(self.policy_output, self.policy_output_slices))
     combined_outputs_dict = {**vision_outputs_dict, **policy_outputs_dict}
-    if SEND_RAW_PRED:
-      combined_outputs_dict['raw_pred'] = np.concatenate([self.vision_output.copy(), self.policy_output.copy()])
 
     return combined_outputs_dict
 
 
 def main(demo=False):
-  cloudlog.warning("modeld init")
+  cloudlog.warning("modeld init (camera-only mode: cameraOdometry only)")
 
   if not USBGPU:
     # USB GPU currently saturates a core so can't do this yet,
@@ -317,16 +246,14 @@ def main(demo=False):
   if use_extra_client:
     cloudlog.warning(f"connected extra cam with buffer size: {vipc_client_extra.buffer_len} ({vipc_client_extra.width} x {vipc_client_extra.height})")
 
-  # messaging
-  pm = PubMaster(["modelV2", "drivingModelData", "cameraOdometry"])
-  sm = SubMaster(["deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carControl", "liveDelay"])
+  # messaging — cameraOdometry only
+  pm = PubMaster(["cameraOdometry"])
+  sm = SubMaster(["deviceState", "roadCameraState", "liveCalibration", "driverMonitoringState"])
 
-  publish_state = PublishState()
   params = Params()
 
   # setup filter to track dropped frames
   frame_dropped_filter = FirstOrderFilter(0., 10., 1. / ModelConstants.MODEL_RUN_FREQ)
-  frame_id = 0
   last_vipc_frame_id = 0
   run_count = 0
 
@@ -337,21 +264,11 @@ def main(demo=False):
   meta_main = FrameMeta()
   meta_extra = FrameMeta()
 
-
   if demo:
     CP = get_demo_car_params()
   else:
     CP = messaging.log_from_bytes(params.get("CarParams", block=True), car.CarParams)
   cloudlog.info("modeld got CarParams: %s", CP.brand)
-
-  # TODO this needs more thought, use .2s extra for now to estimate other delays
-  # TODO Move smooth seconds to action function
-  long_delay = CP.longitudinalActuatorDelay + LONG_SMOOTH_SECONDS
-  prev_action = log.ModelDataV2.Action()
-  if CUSTOM_PATH_MODE in ("straight", "right_turn"):
-    cloudlog.warning(f"custom lateral path mode enabled: {CUSTOM_PATH_MODE}")
-
-  DH = DesireHelper()
 
   while True:
     # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
@@ -387,11 +304,7 @@ def main(demo=False):
       meta_extra = meta_main
 
     sm.update(0)
-    desire = DH.desire
     is_rhd = sm["driverMonitoringState"].isRHD
-    frame_id = sm["roadCameraState"].frameId
-    v_ego = max(sm["carState"].vEgo, 0.)
-    lat_delay = sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
     if sm.updated["liveCalibration"] and sm.seen['roadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["liveCalibration"].rpyCalib, dtype=np.float32)
       dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['roadCameraState'].sensor))]
@@ -403,18 +316,15 @@ def main(demo=False):
     traffic_convention[int(is_rhd)] = 1
 
     vec_desire = np.zeros(ModelConstants.DESIRE_LEN, dtype=np.float32)
-    if desire >= 0 and desire < ModelConstants.DESIRE_LEN:
-      vec_desire[desire] = 1
 
     # tracked dropped frames
     vipc_dropped_frames = max(0, meta_main.frame_id - last_vipc_frame_id - 1)
     frames_dropped = frame_dropped_filter.update(min(vipc_dropped_frames, 10))
-    if run_count < 10: # let frame drops warm up
+    if run_count < 10:
       frame_dropped_filter.x = 0.
       frames_dropped = 0.
     run_count = run_count + 1
 
-    frame_drop_ratio = frames_dropped / (1 + frames_dropped)
     prepare_only = vipc_dropped_frames > 0
     if prepare_only:
       cloudlog.error(f"skipping model eval. Dropped {vipc_dropped_frames} frames")
@@ -426,36 +336,11 @@ def main(demo=False):
       'traffic_convention': traffic_convention,
     }
 
-    mt1 = time.perf_counter()
     model_output = model.run(bufs, transforms, inputs, prepare_only)
-    mt2 = time.perf_counter()
-    model_execution_time = mt2 - mt1
 
     if model_output is not None:
-      modelv2_send = messaging.new_message('modelV2')
-      drivingdata_send = messaging.new_message('drivingModelData')
       posenet_send = messaging.new_message('cameraOdometry')
-
-      apply_custom_lateral_plan(model_output, CUSTOM_PATH_MODE, v_ego)
-      action = get_action_from_model(model_output, prev_action, lat_delay + DT_MDL, long_delay + DT_MDL, v_ego)
-      prev_action = action
-      fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
-                     publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
-                     frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen)
-
-      desire_state = modelv2_send.modelV2.meta.desireState
-      l_lane_change_prob = desire_state[log.Desire.laneChangeLeft]
-      r_lane_change_prob = desire_state[log.Desire.laneChangeRight]
-      lane_change_prob = l_lane_change_prob + r_lane_change_prob
-      DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob)
-      modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
-      modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction
-      drivingdata_send.drivingModelData.meta.laneChangeState = DH.lane_change_state
-      drivingdata_send.drivingModelData.meta.laneChangeDirection = DH.lane_change_direction
-
       fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
-      pm.send('modelV2', modelv2_send)
-      pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)
     last_vipc_frame_id = meta_main.frame_id
 
