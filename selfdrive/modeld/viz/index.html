@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>udp_bridge Viz</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; color: #eee; font-family: 'Consolas', monospace; display: flex; height: 100vh; overflow: hidden; }
+  #canvas { flex: 1 1 0; min-width: 0; display: block; }
+  #panel {
+    flex: 0 0 280px;
+    padding: 14px; background: #16213e; overflow-y: auto;
+    border-left: 1px solid #0f3460;
+  }
+  #panel h2 { color: #e94560; margin-bottom: 10px; font-size: 15px; }
+  .section { margin-bottom: 14px; }
+  .section h3 { font-size: 12px; color: #53c1de; margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .info-row { display: flex; justify-content: space-between; padding: 2px 0; border-bottom: 1px solid #0f3460; font-size: 11px; }
+  .info-label { color: #999; }
+  .info-value { color: #53c1de; font-weight: bold; }
+  #status { padding: 6px; margin-bottom: 10px; border-radius: 4px; font-size: 11px; text-align: center; }
+  .connected { background: #1b4332; color: #95d5b2; }
+  .disconnected { background: #3d0000; color: #ff6b6b; }
+  .waiting { background: #3d3100; color: #ffd166; }
+  .legend-entry { display: flex; align-items: center; gap: 6px; font-size: 10px; margin: 2px 0; color: #bbb; }
+  .legend-swatch { width: 18px; height: 3px; }
+  .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+  #help { font-size: 10px; color: #777; margin-top: 8px; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="panel">
+  <h2>udp_bridge viz</h2>
+  <div id="status" class="disconnected">Disconnected</div>
+
+  <div class="section">
+    <h3>Vehicle (livePose)</h3>
+    <div class="info-row"><span class="info-label">x</span><span class="info-value" id="v-x">-</span></div>
+    <div class="info-row"><span class="info-label">y</span><span class="info-value" id="v-y">-</span></div>
+    <div class="info-row"><span class="info-label">heading</span><span class="info-value" id="v-hdg">-</span></div>
+    <div class="info-row"><span class="info-label">speed</span><span class="info-value" id="v-speed">-</span></div>
+    <div class="info-row"><span class="info-label">accel</span><span class="info-value" id="v-accel">-</span></div>
+    <div class="info-row"><span class="info-label">frame</span><span class="info-value" id="v-frm">-</span></div>
+  </div>
+
+  <div class="section">
+    <h3>World path (anchored)</h3>
+    <div class="info-row"><span class="info-label">seq</span><span class="info-value" id="w-seq">-</span></div>
+    <div class="info-row"><span class="info-label">num_points</span><span class="info-value" id="w-np">-</span></div>
+    <div class="info-row"><span class="info-label">dt_s</span><span class="info-value" id="w-dt">-</span></div>
+    <div class="info-row"><span class="info-label">anchor x</span><span class="info-value" id="w-ax">-</span></div>
+    <div class="info-row"><span class="info-label">anchor y</span><span class="info-value" id="w-ay">-</span></div>
+  </div>
+
+  <div class="section">
+    <h3>Legend</h3>
+    <div class="legend-entry"><span class="legend-swatch" style="background:rgba(255,209,102,0.85)"></span>받은 경로 (anchor 박힘)</div>
+    <div class="legend-entry"><span class="legend-dot" style="background:#ffd166"></span>anchor (path[0])</div>
+    <div class="legend-entry"><span class="legend-swatch" style="background:repeating-linear-gradient(to right,rgba(6,214,160,0.7) 0 5px,transparent 5px 9px)"></span>차량 trail (6초)</div>
+    <div class="legend-entry"><span class="legend-dot" style="background:#06d6a0"></span>현재 차량</div>
+  </div>
+
+  <div id="help">
+    [F] camera follow on/off<br>
+    [R] reset trail<br>
+    wheel: zoom
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+// ── state ──
+let vehicle = null;
+let vehicleTrail = [];     // udp_bridge 의 6초 trail (덮어쓰기, accumulate 아님)
+let worldPath = null;       // anchor 박힌 받은 경로
+let cameraFollow = true;
+let SCALE = 40;             // px/m
+
+// 좌표 규약 (LocalWorld, udp_bridge):
+//   x = north, y = east 와 비슷한 NED 적분. yaw 는 NED.z (북에서 시계방향).
+//   화면: 북=위, 동=오른쪽. 차량 yaw 는 시계방향 회전이라 canvas rotate(+yaw) 그대로.
+
+function resize() {
+  canvas.width = canvas.clientWidth * devicePixelRatio;
+  canvas.height = canvas.clientHeight * devicePixelRatio;
+  ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  draw();
+}
+window.addEventListener('resize', resize);
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'f' || e.key === 'F') { cameraFollow = !cameraFollow; draw(); }
+  if (e.key === 'r' || e.key === 'R') { vehicleTrail = []; draw(); }
+});
+
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const factor = Math.exp(-e.deltaY * 0.001);
+  SCALE = Math.max(2, Math.min(200, SCALE * factor));
+  draw();
+}, { passive: false });
+
+function getCamera() {
+  if (cameraFollow && vehicle) return { x: vehicle.x, y: vehicle.y };
+  if (worldPath && worldPath.points.length > 0) {
+    return { x: worldPath.points[0].x, y: worldPath.points[0].y };
+  }
+  return { x: 0, y: 0 };
+}
+
+// world (x=north, y=east) → screen (north up, east right)
+function toScreen(wx, wy, cam, W, H) {
+  return {
+    sx: W / 2 + (wy - cam.y) * SCALE,
+    sy: H / 2 - (wx - cam.x) * SCALE,
+  };
+}
+
+function draw() {
+  const W = canvas.clientWidth;
+  const H = canvas.clientHeight;
+  ctx.fillStyle = '#1a1a2e';
+  ctx.fillRect(0, 0, W, H);
+
+  const cam = getCamera();
+  drawGrid(W, H, cam);
+
+  // 1. world path (anchor 박힘) — 노란 실선 + 점, 가장 아래 layer
+  if (worldPath && worldPath.points.length > 1) {
+    const pts = worldPath.points;
+    ctx.beginPath();
+    const s0 = toScreen(pts[0].x, pts[0].y, cam, W, H);
+    ctx.moveTo(s0.sx, s0.sy);
+    for (let i = 1; i < pts.length; i++) {
+      const s = toScreen(pts[i].x, pts[i].y, cam, W, H);
+      ctx.lineTo(s.sx, s.sy);
+    }
+    ctx.strokeStyle = 'rgba(255,209,102,0.85)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // path 점들
+    ctx.fillStyle = 'rgba(255,209,102,0.45)';
+    for (let i = 0; i < pts.length; i++) {
+      const s = toScreen(pts[i].x, pts[i].y, cam, W, H);
+      ctx.beginPath(); ctx.arc(s.sx, s.sy, 1.8, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // anchor marker (path[0]) — 큰 노란 dot + ring
+    const sa = toScreen(pts[0].x, pts[0].y, cam, W, H);
+    ctx.fillStyle = '#ffd166';
+    ctx.beginPath(); ctx.arc(sa.sx, sa.sy, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(sa.sx, sa.sy, 10, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = '#ffd166'; ctx.font = 'bold 11px Consolas';
+    ctx.fillText('anchor', sa.sx + 14, sa.sy - 8);
+  }
+
+  // 2. vehicle trail — 초록 점선
+  if (vehicleTrail.length > 1) {
+    ctx.beginPath();
+    const s0 = toScreen(vehicleTrail[0].x, vehicleTrail[0].y, cam, W, H);
+    ctx.moveTo(s0.sx, s0.sy);
+    for (let i = 1; i < vehicleTrail.length; i++) {
+      const s = toScreen(vehicleTrail[i].x, vehicleTrail[i].y, cam, W, H);
+      ctx.lineTo(s.sx, s.sy);
+    }
+    ctx.setLineDash([5, 4]);
+    ctx.strokeStyle = 'rgba(6,214,160,0.7)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // 3. 현재 차량 (car glyph + heading)
+  if (vehicle) {
+    const s = toScreen(vehicle.x, vehicle.y, cam, W, H);
+    drawCar(s.sx, s.sy, vehicle.heading);
+    ctx.fillStyle = '#06d6a0';
+    ctx.font = 'bold 13px Consolas';
+    ctx.fillText(`${(vehicle.speed * 3.6).toFixed(1)} km/h`, s.sx + 16, s.sy - 14);
+    ctx.fillStyle = '#888';
+    ctx.font = '10px Consolas';
+    ctx.fillText(`(${vehicle.x.toFixed(1)}, ${vehicle.y.toFixed(1)})`, s.sx + 16, s.sy - 2);
+  }
+
+  drawScaleBar(W, H);
+  drawCompass(W, H);
+  if (!cameraFollow) {
+    ctx.fillStyle = '#ffd166'; ctx.font = 'bold 11px Consolas';
+    ctx.fillText('camera: fixed at anchor (press F)', 12, 20);
+  }
+}
+
+function drawGrid(W, H, cam) {
+  let gridM = 1;
+  if (gridM * SCALE < 20) gridM = 2;
+  if (gridM * SCALE < 10) gridM = 5;
+  if (gridM * SCALE < 6)  gridM = 10;
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 1;
+
+  // 화면 가로 = world y (east), 화면 세로 = world x (north)
+  const startGY = Math.floor((cam.y - W / 2 / SCALE) / gridM) * gridM;
+  for (let gy = startGY; ; gy += gridM) {
+    const sx = W / 2 + (gy - cam.y) * SCALE;
+    if (sx > W) break;
+    if (sx >= 0) { ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, H); ctx.stroke(); }
+  }
+  const startGX = Math.floor((cam.x - H / 2 / SCALE) / gridM) * gridM;
+  for (let gx = startGX; ; gx += gridM) {
+    const sy = H / 2 - (gx - cam.x) * SCALE;
+    if (sy < 0) break;
+    if (sy <= H) { ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(W, sy); ctx.stroke(); }
+  }
+  // origin (display anchor) 강조
+  const o = toScreen(0, 0, cam, W, H);
+  ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+  if (o.sx > 0 && o.sx < W) { ctx.beginPath(); ctx.moveTo(o.sx, 0); ctx.lineTo(o.sx, H); ctx.stroke(); }
+  if (o.sy > 0 && o.sy < H) { ctx.beginPath(); ctx.moveTo(0, o.sy); ctx.lineTo(W, o.sy); ctx.stroke(); }
+}
+
+function drawCar(cx, cy, yaw) {
+  // LocalWorld yaw: NED heading (clockwise from north). canvas rotate 도 시계방향(y 아래) → 그대로.
+  const size = 10;
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(yaw);
+  ctx.beginPath();
+  ctx.moveTo(0, -size * 1.5);        // 팁 (전방)
+  ctx.lineTo(-size, size);
+  ctx.lineTo(size, size);
+  ctx.closePath();
+  ctx.fillStyle = '#06d6a0';
+  ctx.fill();
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawScaleBar(W, H) {
+  const barM = SCALE > 30 ? 2 : SCALE > 15 ? 5 : 10;
+  const barPx = barM * SCALE;
+  const x = 20, y = H - 30;
+  ctx.strokeStyle = '#999'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x, y); ctx.lineTo(x + barPx, y);
+  ctx.moveTo(x, y - 4); ctx.lineTo(x, y + 4);
+  ctx.moveTo(x + barPx, y - 4); ctx.lineTo(x + barPx, y + 4);
+  ctx.stroke();
+  ctx.fillStyle = '#999'; ctx.font = '11px Consolas';
+  ctx.fillText(`${barM}m`, x + barPx / 2 - 8, y - 8);
+}
+
+function drawCompass(W, H) {
+  const cx = W - 36, cy = 36;
+  ctx.strokeStyle = '#888'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.arc(cx, cy, 18, 0, Math.PI * 2); ctx.stroke();
+  ctx.fillStyle = '#e94560'; ctx.font = 'bold 11px Consolas';
+  ctx.fillText('N', cx - 4, cy - 8);
+  ctx.fillStyle = '#888';
+  ctx.fillText('E', cx + 10, cy + 4);
+}
+
+// ── panel updates ──
+function setText(id, v) { const el = document.getElementById(id); if (el) el.textContent = v; }
+
+function updateVehiclePanel(v) {
+  setText('v-x', v.x.toFixed(2));
+  setText('v-y', v.y.toFixed(2));
+  setText('v-hdg', (v.heading * 180 / Math.PI).toFixed(1) + '°');
+  setText('v-speed', (v.speed * 3.6).toFixed(1) + ' km/h');
+  setText('v-accel', v.accel.toFixed(2) + ' m/s²');
+  setText('v-frm', String(v.frame));
+}
+
+function updateWorldPathPanel(w) {
+  setText('w-seq', String(w.seq));
+  setText('w-np', String(w.num_points));
+  setText('w-dt', w.dt_s.toFixed(3) + ' s');
+  if (w.points && w.points.length > 0) {
+    setText('w-ax', w.points[0].x.toFixed(2));
+    setText('w-ay', w.points[0].y.toFixed(2));
+  }
+}
+
+// ── WebSocket ──
+function connect() {
+  const statusEl = document.getElementById('status');
+  const ws = new WebSocket(`ws://${location.hostname}:8765`);
+
+  ws.onopen = () => {
+    statusEl.textContent = 'Connected — waiting for data';
+    statusEl.className = 'waiting';
+  };
+
+  ws.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+
+    if (data.type === 'vehicle') {
+      vehicle = data;
+      updateVehiclePanel(data);
+      statusEl.textContent = 'Receiving';
+      statusEl.className = 'connected';
+      draw();
+      return;
+    }
+
+    if (data.type === 'vehicle_trail') {
+      vehicleTrail = data.points || [];
+      draw();
+      return;
+    }
+
+    if (data.type === 'world_path') {
+      worldPath = data;
+      updateWorldPathPanel(data);
+      draw();
+      return;
+    }
+  };
+
+  ws.onclose = () => {
+    statusEl.textContent = 'Disconnected — reconnecting…';
+    statusEl.className = 'disconnected';
+    setTimeout(connect, 1000);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+resize();
+connect();
+</script>
+</body>
+</html>
