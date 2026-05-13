@@ -186,7 +186,7 @@ def curvature_from_path_yaws(x, y, yaw, dt_s, v_ego, action_t):
     yaws = yaws - yaws[0]
     t_rel = np.arange(len(yaws), dtype=np.float64) * float(dt_s)
     psi_target = float(np.interp(action_t, t_rel, yaws))
-    psi_rate = float((yaws[1] - yaws[0]) / float(dt_s))
+    psi_rate = float((yaws[2] - yaws[1]) / float(dt_s))
     return float(curv_from_psis(psi_target, psi_rate, v_ego, action_t))
 
 
@@ -561,7 +561,7 @@ def main():
         #    (path[0] = Alpamayo가 캡처한 시점의 ego 위치·방향에 맞물림)
         if pending_pkt is not None and world.is_initialized():
             #inference_time_s = pending_pkt['inference_time_s']
-            inference_time_s = 1.0
+            inference_time_s = 0.1
             past_t_ns = pending_pkt['recv_mono_ns'] - int(inference_time_s * 1e9)
             past = world.at(past_t_ns)       # 범위 밖이면 가장 가까운 끝점으로 clamp
             anchor = (past[1], past[2], past[3])
@@ -595,6 +595,10 @@ def main():
             else:
                 kappa = prev_curvature
             prev_curvature = kappa
+            
+            #[Debug] dead zone : 명령쪽 노이즈
+            if abs(kappa) < 0.001:
+                kappa = 0.0
 
             a_cmd, should_stop, v_ref, remaining = longitudinal_accel(
                 path_ego, v_ego, s_ref_total=None,
