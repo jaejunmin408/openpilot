@@ -4,7 +4,7 @@ Alpamayo UDP Bridge (ac_decoded_path.json 포맷) — 위치 기반 경로 추�
 
 외부에서 UDP로 1회 전송한 ac_decoded_path.json 전체(JSON bytes)를 수신하여:
   - pred_xyz / pred_yaw_rad / pred_v_mps 를 수신 시점 LocalWorld 앵커 기준 global 좌표로 변환해 저장
-  - 20Hz 루프에서 livePose를 LocalWorld에 적분 → 현재 pose에서 종방향 추종기 + 공식 openpilot yaw-기반 curvature 산출 실행
+  - 20Hz 루프에서 livePose를 LocalWorld에 적분 → 현재 pose에서 종방향 추종기 + nearest-ahead 경로점의 curvature 직접 사용
   - 결과 desiredCurvature / desiredAcceleration 을 modelV2.action 으로 발행
   - pred_xyz 는 현재 ego frame으로 재표현해 modelV2.position 에 실어 UI 표시
 
@@ -20,9 +20,8 @@ import numpy as np
 import cereal.messaging as messaging
 from cereal import log
 from cereal.messaging import PubMaster, SubMaster
-from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.controls.lib.drive_helpers import curv_from_psis, smooth_value
+from openpilot.selfdrive.controls.lib.drive_helpers import smooth_value
 from openpilot.selfdrive.controls.lib.local_world import LocalWorld
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
@@ -89,10 +88,13 @@ def parse_action_packet(data: bytes):
     ego_yaw = -pred_yaw.astype(np.float64)
     path_v = pred_v.astype(np.float64)
     a_ff = a.astype(np.float64)                       # feed-forward용 종가속 (ego-frame, t기반)
+    # Alpamayo(CCW>0) → openpilot(CW>0): 부호 반전
+    path_curv = -c.astype(np.float64)
 
     return {
         'ego_x': ego_x, 'ego_y': ego_y, 'ego_z': ego_z,
         'ego_yaw': ego_yaw, 'path_v': path_v,
+        'path_curv': path_curv,
         'a_ff': a_ff, 'dt_s': dt_s, 'N': N,
         'inference_time_s': inference_time_s,
     }
@@ -118,6 +120,7 @@ def path_ego_to_world(pkt, anchor):
         'world_z': pkt['ego_z'],
         'world_yaw': wyaw,
         'path_v': pkt['path_v'],
+        'path_curv': pkt['path_curv'],  # frame-invariant (스칼라 curvature)
         'a_ff': pkt['a_ff'],
         'N': pkt['N'],
         'dt_s': pkt['dt_s'],
@@ -144,6 +147,7 @@ def path_world_to_current_ego(stored, cur):
         'yaw': pyaw.astype(np.float64),
         'v': stored['path_v'].astype(np.float64),
         'z': stored['world_z'].astype(np.float64),
+        'curv': stored['path_curv'].astype(np.float64),
     }
 
 
@@ -166,28 +170,6 @@ def nearest_index_ahead(x, y):
         d2_masked = np.where(ahead_mask, d2, np.inf)
         return int(np.argmin(d2_masked))
     return int(np.argmin(x * x + y * y))
-
-
-# ── lateral tracker: 공식 openpilot 수식 (yaw 궤적 → curvature) ──
-def curvature_from_path_yaws(x, y, yaw, dt_s, v_ego, action_t):
-    """현재 ego-frame path의 yaw 시계열로부터 curvature 산출.
-    공식 openpilot `get_curvature_from_plan` 과 동일한 수식 사용:
-      κ = 2·ψ_target/(v·t) - ψ̇/v
-    여기서 ψ_target은 action_t 시점의 목표 yaw, ψ̇은 현재 yaw rate.
-
-    x=fwd, y=right, yaw=CW(우회전 양수). curvature>0 이면 우회전.
-    nearest-ahead 점을 t=0으로 잡아 시간축을 'from now'로 정렬한다.
-    """
-    i0 = nearest_index_ahead(x, y)
-    yaws = yaw[i0:].astype(np.float64)
-    if len(yaws) < 2:
-        return 0.0
-    # 첫 점이 '현재'가 되도록 yaw0 을 빼주어 ψ(0)=0 정규화
-    yaws = yaws - yaws[0]
-    t_rel = np.arange(len(yaws), dtype=np.float64) * float(dt_s)
-    psi_target = float(np.interp(action_t, t_rel, yaws))
-    psi_rate = float((yaws[2] - yaws[1]) / float(dt_s))
-    return float(curv_from_psis(psi_target, psi_rate, v_ego, action_t))
 
 
 # ── longitudinal tracker ─────────────────────────────
@@ -583,19 +565,15 @@ def main():
             cur = world.current()
             path_ego = path_world_to_current_ego(stored, cur)
 
-            # 공식 openpilot 방식: lateralDelay+DT_MDL 시점의 yaw 예측으로 κ 산출
-            lat_delay = float(sm["liveDelay"].lateralDelay) + LAT_SMOOTH_SECONDS
-            action_t = lat_delay + DT_MDL
-            kappa_raw = curvature_from_path_yaws(
-                path_ego['x'], path_ego['y'], path_ego['yaw'],
-                stored['dt_s'], v_ego, action_t,
-            )
+            # path에 박혀있는 curvature를 직접 사용 (nearest-ahead 점)
+            i_ahead = nearest_index_ahead(path_ego['x'], path_ego['y'])
+            kappa_raw = float(path_ego['curv'][i_ahead])
             if v_ego > MIN_LAT_CONTROL_SPEED:
                 kappa = smooth_value(kappa_raw, prev_curvature, LAT_SMOOTH_SECONDS)
             else:
                 kappa = prev_curvature
             prev_curvature = kappa
-            
+
             #[Debug] dead zone : 명령쪽 노이즈
             if abs(kappa) < 0.001:
                 kappa = 0.0
@@ -612,11 +590,11 @@ def main():
 
             log_counter += 1
             if log_counter % 20 == 1:   # 1Hz 로그
-                cte = float(path_ego['y'][nearest_index_ahead(path_ego['x'], path_ego['y'])])
+                cte = float(path_ego['y'][i_ahead])
                 cloudlog.warning(
                     f"track: v_ego={v_ego:.2f} v_ref={v_ref:.2f} cte={cte:+.2f}m "
                     f"κ={kappa:+.4f}(raw {kappa_raw:+.4f}) a={a_cmd:+.2f} "
-                    f"action_t={action_t:.3f} rem={remaining:.1f} stop={should_stop}"
+                    f"i={i_ahead} rem={remaining:.1f} stop={should_stop}"
                 )
         else:
             action = idle_action()
