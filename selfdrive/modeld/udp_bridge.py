@@ -568,15 +568,19 @@ def main():
             # path에 박혀있는 curvature를 직접 사용 (nearest-ahead 점)
             i_ahead = nearest_index_ahead(path_ego['x'], path_ego['y'])
             kappa_raw = float(path_ego['curv'][i_ahead])
-            if v_ego > MIN_LAT_CONTROL_SPEED:
-                kappa = smooth_value(kappa_raw, prev_curvature, LAT_SMOOTH_SECONDS)
-            else:
-                kappa = prev_curvature
+            kappa = kappa_raw
             prev_curvature = kappa
 
-            #[Debug] dead zone : 명령쪽 노이즈
-            if abs(kappa) < 0.001:
-                kappa = 0.0
+            # ── 후처리 일단 bypass (외부 curvature 그대로 사용) ──
+            # if v_ego > MIN_LAT_CONTROL_SPEED:
+            #     kappa = smooth_value(kappa_raw, prev_curvature, LAT_SMOOTH_SECONDS)
+            # else:
+            #     kappa = prev_curvature
+            # prev_curvature = kappa
+            #
+            # #[Debug] dead zone : 명령쪽 노이즈
+            # if abs(kappa) < 0.001:
+            #     kappa = 0.0
 
             a_cmd, should_stop, v_ref, remaining = longitudinal_accel(
                 path_ego, v_ego, s_ref_total=None,
