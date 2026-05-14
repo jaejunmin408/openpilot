@@ -565,22 +565,23 @@ def main():
             cur = world.current()
             path_ego = path_world_to_current_ego(stored, cur)
 
-            # path에 박혀있는 curvature를 직접 사용 (nearest-ahead 점)
-            i_ahead = nearest_index_ahead(path_ego['x'], path_ego['y'])
-            kappa_raw = float(path_ego['curv'][i_ahead])
-            kappa = kappa_raw
-            prev_curvature = kappa
+            # path 의 현재 위치 인덱스 (차 위치 기준 nearest-ahead)
+            i_now = nearest_index_ahead(path_ego['x'], path_ego['y'])
 
-            # ── 후처리 일단 bypass (외부 curvature 그대로 사용) ──
-            # if v_ego > MIN_LAT_CONTROL_SPEED:
-            #     kappa = smooth_value(kappa_raw, prev_curvature, LAT_SMOOTH_SECONDS)
-            # else:
-            #     kappa = prev_curvature
-            # prev_curvature = kappa
-            #
-            # #[Debug] dead zone : 명령쪽 노이즈
-            # if abs(kappa) < 0.001:
-            #     kappa = 0.0
+            # lat_delay 보상: PID(latcontrol_torque) 는 desired_curvature 를
+            # "lat_delay 후 도달 목표" 로 해석한다. 따라서 모델 path 에서
+            # lat_delay 만큼 미래 시점의 곡률을 명령으로 가져와야 짝이 맞는다.
+            lat_delay = float(sm["liveDelay"].lateralDelay)
+            lookahead_steps = int(round(max(lat_delay, 0.0) / stored['dt_s']))
+            i_target = min(i_now + lookahead_steps, len(path_ego['curv']) - 1)
+            kappa_raw = float(path_ego['curv'][i_target])
+
+            # ── 후처리: smooth + 저속 hold (deadzone 은 비활성) ──
+            if v_ego > MIN_LAT_CONTROL_SPEED:
+                kappa = smooth_value(kappa_raw, prev_curvature, LAT_SMOOTH_SECONDS)
+            else:
+                kappa = prev_curvature
+            prev_curvature = kappa
 
             a_cmd, should_stop, v_ref, remaining = longitudinal_accel(
                 path_ego, v_ego, s_ref_total=None,
@@ -594,11 +595,12 @@ def main():
 
             log_counter += 1
             if log_counter % 20 == 1:   # 1Hz 로그
-                cte = float(path_ego['y'][i_ahead])
+                cte = float(path_ego['y'][i_now])
                 cloudlog.warning(
                     f"track: v_ego={v_ego:.2f} v_ref={v_ref:.2f} cte={cte:+.2f}m "
                     f"κ={kappa:+.4f}(raw {kappa_raw:+.4f}) a={a_cmd:+.2f} "
-                    f"i={i_ahead} rem={remaining:.1f} stop={should_stop}"
+                    f"i_now={i_now} i_tgt={i_target} lat_delay={lat_delay:.3f} "
+                    f"rem={remaining:.1f} stop={should_stop}"
                 )
         else:
             action = idle_action()
