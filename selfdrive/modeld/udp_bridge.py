@@ -89,7 +89,7 @@ def parse_action_packet(data: bytes):
     path_v = pred_v.astype(np.float64)
     a_ff = a.astype(np.float64)                       # feed-forward용 종가속 (ego-frame, t기반)
     # Alpamayo(CCW>0) → openpilot(CW>0): 부호 반전
-    path_curv = -c.astype(np.float64)
+    path_curv = c.astype(np.float64)
 
     return {
         'ego_x': ego_x, 'ego_y': ego_y, 'ego_z': ego_z,
@@ -542,8 +542,8 @@ def main():
         #    inference_time_s 만큼 과거의 ego pose를 LocalWorld history에서 조회해 anchor로 사용
         #    (path[0] = Alpamayo가 캡처한 시점의 ego 위치·방향에 맞물림)
         if pending_pkt is not None and world.is_initialized():
-            #inference_time_s = pending_pkt['inference_time_s']
-            inference_time_s = 0.1
+            inference_time_s = pending_pkt['inference_time_s']
+            #inference_time_s = 0.1
             past_t_ns = pending_pkt['recv_mono_ns'] - int(inference_time_s * 1e9)
             past = world.at(past_t_ns)       # 범위 밖이면 가장 가까운 끝점으로 clamp
             anchor = (past[1], past[2], past[3])
