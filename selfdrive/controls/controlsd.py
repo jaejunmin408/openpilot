@@ -118,6 +118,8 @@ class Controls:
     # Reset desired curvature to current to avoid violating the limits on engage
     new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
+    if self.sm.updated['modelV2']:
+      print(f"[controlsd] model={model_v2.action.desiredCurvature:.4f} in={new_desired_curvature:.4f} latActive={CC.latActive} cur={self.curvature:.4f} clipped={self.desired_curvature:.4f} limited={curvature_limited}", flush=True)
     lat_delay = self.sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
 
     actuators.curvature = self.desired_curvature
