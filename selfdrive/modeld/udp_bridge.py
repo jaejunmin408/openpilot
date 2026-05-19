@@ -49,9 +49,7 @@ LON_USE_FEEDFORWARD = False          # 초기엔 raw_action.accel 사용 안 함
 STOP_DIST_M = 1.0                    # path 끝까지 남은 거리가 이 값 이하면 정지
 
 # ── pure pursuit 파라미터 ────────────────────────────
-PP_PREVIEW_TIME_S = 0.8              # look-ahead = preview_time * v_ego
-PP_LOOKAHEAD_MIN_M = 4.0             # look-ahead 최소값 (저속 안정)
-PP_LOOKAHEAD_MAX_M = 30.0            # look-ahead 최대값 (고속 oscillation 방지)
+PP_LOOKAHEAD_M = 3.0                 # look-ahead 고정 (실차 튜닝용)
 PP_CURV_LIMIT = 0.2                  # |κ| clip
 
 
@@ -195,9 +193,8 @@ def pure_pursuit_curvature(path_ego, v_ego, lat_delay):
     x_ref = max(v_ego, 0.0) * max(lat_delay, 0.0)
     y_ref = 0.0
 
-    # look-ahead 거리
-    L_d = float(np.clip(PP_PREVIEW_TIME_S * max(v_ego, 0.0),
-                        PP_LOOKAHEAD_MIN_M, PP_LOOKAHEAD_MAX_M))
+    # look-ahead 거리 (고정)
+    L_d = PP_LOOKAHEAD_M
 
     # 기준점 기준 path 각 점까지의 거리
     dx = x - x_ref
