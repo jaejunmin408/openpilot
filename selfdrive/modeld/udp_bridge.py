@@ -48,6 +48,12 @@ LON_USE_FEEDFORWARD = False          # 초기엔 raw_action.accel 사용 안 함
 
 STOP_DIST_M = 1.0                    # path 끝까지 남은 거리가 이 값 이하면 정지
 
+# ── pure pursuit 파라미터 ────────────────────────────
+PP_PREVIEW_TIME_S = 0.8              # look-ahead = preview_time * v_ego
+PP_LOOKAHEAD_MIN_M = 4.0             # look-ahead 최소값 (저속 안정)
+PP_LOOKAHEAD_MAX_M = 30.0            # look-ahead 최대값 (고속 oscillation 방지)
+PP_CURV_LIMIT = 0.2                  # |κ| clip
+
 
 # ── JSON 패킷 파싱 ───────────────────────────────────
 def parse_action_packet(data: bytes):
@@ -170,6 +176,51 @@ def nearest_index_ahead(x, y):
         d2_masked = np.where(ahead_mask, d2, np.inf)
         return int(np.argmin(d2_masked))
     return int(np.argmin(x * x + y * y))
+
+
+# ── pure pursuit (lateral) ───────────────────────────
+def pure_pursuit_curvature(path_ego, v_ego, lat_delay):
+    """ego-frame path(x=fwd, y=right)에서 pure pursuit 으로 desired curvature 산출.
+
+    1) lat_delay 후 ego 가 도달할 (현재 ego frame 기준) 위치를 기준점으로 잡고
+    2) 그 기준점에서 look-ahead 거리(L_d) 떨어진 path 위 goal point 를 찾아
+    3) κ = 2*Δy / L_d² 로 계산. (y 가 right(+) 이면 κ 도 CW(+) 부호 일치)
+
+    path 가 짧아 L_d 에 도달하지 못하면 path 의 마지막 점을 goal 로 사용.
+    """
+    x = path_ego['x']
+    y = path_ego['y']
+
+    # lat_delay 보상: ego 가 lat_delay 후 도달할 위치 (current ego frame)
+    x_ref = max(v_ego, 0.0) * max(lat_delay, 0.0)
+    y_ref = 0.0
+
+    # look-ahead 거리
+    L_d = float(np.clip(PP_PREVIEW_TIME_S * max(v_ego, 0.0),
+                        PP_LOOKAHEAD_MIN_M, PP_LOOKAHEAD_MAX_M))
+
+    # 기준점 기준 path 각 점까지의 거리
+    dx = x - x_ref
+    dy = y - y_ref
+    d = np.hypot(dx, dy)
+
+    # 기준점 앞쪽(dx>0)에서 d >= L_d 인 첫 점을 goal 로 (없으면 path 마지막 점)
+    fwd_mask = dx > 0.0
+    candidates = np.where(fwd_mask & (d >= L_d))[0]
+    if candidates.size > 0:
+        goal_idx = int(candidates[0])
+    elif fwd_mask.any():
+        # L_d 까지 닿는 점이 없음 → path 끝점 사용
+        goal_idx = int(np.where(fwd_mask)[0][-1])
+    else:
+        goal_idx = int(np.argmin(d))
+
+    L_d_eff = max(float(d[goal_idx]), 1e-3)
+    y_goal = float(y[goal_idx] - y_ref)
+
+    kappa = 2.0 * y_goal / (L_d_eff * L_d_eff)
+    kappa = float(np.clip(kappa, -PP_CURV_LIMIT, PP_CURV_LIMIT))
+    return kappa, goal_idx, L_d_eff
 
 
 # ── longitudinal tracker ─────────────────────────────
@@ -565,20 +616,17 @@ def main():
             cur = world.current()
             path_ego = path_world_to_current_ego(stored, cur)
 
-            # path 의 현재 위치 인덱스 (차 위치 기준 nearest-ahead)
+            # path 의 현재 위치 인덱스 (차 위치 기준 nearest-ahead, 로그/CTE 용)
             i_now = nearest_index_ahead(path_ego['x'], path_ego['y'])
 
-            # lat_delay 보상: PID(latcontrol_torque) 는 desired_curvature 를
-            # "lat_delay 후 도달 목표" 로 해석한다. 따라서 모델 path 에서
-            # lat_delay 만큼 미래 시점의 곡률을 명령으로 가져와야 짝이 맞는다.
+            # pure pursuit: path 에서 lookahead goal 잡아 직접 κ 계산
+            # lat_delay 보상은 ref point 를 v_ego*lat_delay 앞으로 옮겨서 처리
             lat_delay = float(sm["liveDelay"].lateralDelay)
-            lookahead_steps = int(round(max(lat_delay, 0.0) / stored['dt_s']))
-            i_target = min(i_now + lookahead_steps, len(path_ego['curv']) - 1)
-            kappa_raw = float(path_ego['curv'][i_target])
+            kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path_ego, v_ego, lat_delay)
 
-            # ── 후처리: smooth + 저속 hold (deadzone 은 비활성) ──
+            # ── 후처리: smooth + 저속 hold ──
             if v_ego > MIN_LAT_CONTROL_SPEED:
-                kappa = smooth_value(kappa_raw, prev_curvature, LAT_SMOOTH_SECONDS)
+                kappa = smooth_value(kappa_pp, prev_curvature, LAT_SMOOTH_SECONDS)
             else:
                 kappa = prev_curvature
             prev_curvature = kappa
@@ -596,11 +644,13 @@ def main():
             log_counter += 1
             if log_counter % 20 == 1:   # 1Hz 로그
                 cte = float(path_ego['y'][i_now])
+                # 모델이 원래 보내준 curvature (비교용, 사용 안 함)
+                kappa_model = float(path_ego['curv'][min(i_now, len(path_ego['curv']) - 1)])
                 cloudlog.warning(
                     f"track: v_ego={v_ego:.2f} v_ref={v_ref:.2f} cte={cte:+.2f}m "
-                    f"κ={kappa:+.4f}(raw {kappa_raw:+.4f}) a={a_cmd:+.2f} "
-                    f"i_now={i_now} i_tgt={i_target} lat_delay={lat_delay:.3f} "
-                    f"rem={remaining:.1f} stop={should_stop}"
+                    f"κ_pp={kappa:+.4f}(raw {kappa_pp:+.4f}) κ_model={kappa_model:+.4f} "
+                    f"a={a_cmd:+.2f} L_d={L_d_eff:.1f} i_now={i_now} i_goal={i_goal} "
+                    f"lat_delay={lat_delay:.3f} rem={remaining:.1f} stop={should_stop}"
                 )
         else:
             action = idle_action()
