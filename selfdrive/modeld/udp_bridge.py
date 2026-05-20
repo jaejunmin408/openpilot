@@ -49,9 +49,7 @@ ACCEL_MAX = 2.0
 MIN_LAT_CONTROL_SPEED = 0.3          # 이 속도 이하에서는 직전 curvature 유지
 
 # ── pure pursuit 파라미터 ────────────────────────────
-PP_PREVIEW_TIME_S = 0.8              # look-ahead = preview_time * v_ego
-PP_LOOKAHEAD_MIN_M = 10.0
-PP_LOOKAHEAD_MAX_M = 20.0
+PP_LOOKAHEAD_M = 5.0                 # 고정 look-ahead
 PP_CURV_LIMIT = 0.2
 
 
@@ -95,8 +93,7 @@ def pure_pursuit_curvature(path_ego, v_ego):
     x = path_ego['x']
     y = path_ego['y']
 
-    L_d = float(np.clip(PP_PREVIEW_TIME_S * max(v_ego, 0.0),
-                        PP_LOOKAHEAD_MIN_M, PP_LOOKAHEAD_MAX_M))
+    L_d = PP_LOOKAHEAD_M
 
     d = np.hypot(x, y)
 
