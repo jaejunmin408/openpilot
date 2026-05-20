@@ -50,8 +50,8 @@ MIN_LAT_CONTROL_SPEED = 0.3          # 이 속도 이하에서는 직전 curvatu
 
 # ── pure pursuit 파라미터 ────────────────────────────
 PP_PREVIEW_TIME_S = 0.8              # look-ahead = preview_time * v_ego
-PP_LOOKAHEAD_MIN_M = 8.0
-PP_LOOKAHEAD_MAX_M = 30.0
+PP_LOOKAHEAD_MIN_M = 10.0
+PP_LOOKAHEAD_MAX_M = 20.0
 PP_CURV_LIMIT = 0.2
 
 
