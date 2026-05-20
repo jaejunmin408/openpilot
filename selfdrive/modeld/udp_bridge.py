@@ -14,7 +14,7 @@ ego-frame JSON으로 보내준다.
 받은 path를 그대로 ego-frame path로 사용해 20 Hz control loop에서 pure pursuit
 으로 curvature를 산출한다.
 
-종방향은 TARGET_SPEED_MPS(=10 km/h) 유지 P 제어.
+종방향은 TARGET_SPEED_MPS(=15 km/h) 유지 P 제어.
 """
 import json
 import socket
@@ -41,7 +41,7 @@ X_IDXS = np.array(ModelConstants.X_IDXS, dtype=np.float64)
 IDX_N = ModelConstants.IDX_N   # 33
 
 # ── 종방향 ────────────────────────────────────────────
-TARGET_SPEED_MPS = 10.0 / 3.6        # 10 km/h ≈ 2.78 m/s
+TARGET_SPEED_MPS = 15.0 / 3.6        # 15 km/h ≈ 4.17 m/s
 LON_KP = 0.3
 ACCEL_MIN = -3.5
 ACCEL_MAX = 2.0
@@ -362,7 +362,7 @@ def send_vehicle_viz(viz_sock, world, lp, frame_id):
 
 # ── main ──────────────────────────────────────────────
 def main():
-    cloudlog.warning("udp_bridge init (ref-path slice mode, target=10km/h)")
+    cloudlog.warning("udp_bridge init (ref-path slice mode, target=15km/h)")
 
     pm = PubMaster(["modelV2", "drivingModelData", "longitudinalPlan", "driverAssistance"])
     sm = SubMaster(["carState", "livePose"])
