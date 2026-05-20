@@ -5,7 +5,7 @@ Alpamayo UDP Bridge — reference path slice 추종 모드
 외부 publisher가 ~10 Hz로 차량 앞 ~20 m 분량의 reference path slice를
 ego-frame JSON으로 보내준다.
 
-  packet: {"x": [...], "y": [...]}
+  packet: {"pred_xyz": [[x, y, z], ...]}   # (N,3) list
   좌표계: x=forward(m), y=right(m) — openpilot body frame
   (publisher 측이 y=LEFT 규약이면 거기서 부호 반전해서 보낼 것)
 
@@ -56,7 +56,7 @@ PP_CURV_LIMIT = 0.2
 
 # ── JSON 패킷 파싱 ───────────────────────────────────
 def parse_path_packet(data: bytes):
-    """{"x": [...], "y": [...]} 형태 ego-frame slice 수신.
+    """{"pred_xyz": [[x,y,z], ...]} 형태 ego-frame slice 수신.
     실패 시 None. x=forward(m), y=right(m).
     """
     try:
@@ -66,24 +66,26 @@ def parse_path_packet(data: bytes):
         return None
 
     try:
-        x = np.asarray(d['x'], dtype=np.float64)
-        y = np.asarray(d['y'], dtype=np.float64)
+        pred_xyz = np.asarray(d['pred_xyz'], dtype=np.float64)
     except (KeyError, TypeError, ValueError) as e:
         cloudlog.warning(f"udp_bridge: malformed packet ({e})")
         return None
 
-    if x.ndim != 1 or y.ndim != 1 or x.shape != y.shape or x.size < 2:
-        cloudlog.warning(f"udp_bridge: bad shape x={x.shape} y={y.shape}")
+    if pred_xyz.ndim != 2 or pred_xyz.shape[1] < 2 or pred_xyz.shape[0] < 2:
+        cloudlog.warning(f"udp_bridge: bad pred_xyz shape {pred_xyz.shape}")
         return None
 
-    return {'x': x, 'y': y, 'N': int(x.size)}
+    x = pred_xyz[:, 0]
+    y = pred_xyz[:, 1]
+
+    return {'x': x, 'y': y, 'N': int(x.shape[0])}
 
 
 # ── pure pursuit (lateral) ───────────────────────────
-def pure_pursuit_curvature(path_ego, v_ego, lat_delay):
+def pure_pursuit_curvature(path_ego, v_ego):
     """ego-frame path(x=fwd, y=right)에서 pure pursuit 으로 desired curvature 산출.
 
-    1) lat_delay 후 ego 가 도달할 위치를 기준점으로
+    1) ego (0,0) 을 기준점으로
     2) 그 기준점에서 L_d 떨어진 path 위 goal 점을 잡아
     3) κ = 2·Δy / L_d²  (y right(+) → κ CW(+))
     L_d 까지 닿는 점이 없으면 path 끝점을 goal 로.
@@ -91,17 +93,12 @@ def pure_pursuit_curvature(path_ego, v_ego, lat_delay):
     x = path_ego['x']
     y = path_ego['y']
 
-    x_ref = max(v_ego, 0.0) * max(lat_delay, 0.0)
-    y_ref = 0.0
-
     L_d = float(np.clip(PP_PREVIEW_TIME_S * max(v_ego, 0.0),
                         PP_LOOKAHEAD_MIN_M, PP_LOOKAHEAD_MAX_M))
 
-    dx = x - x_ref
-    dy = y - y_ref
-    d = np.hypot(dx, dy)
+    d = np.hypot(x, y)
 
-    fwd_mask = dx > 0.0
+    fwd_mask = x > 0.0
     candidates = np.where(fwd_mask & (d >= L_d))[0]
     if candidates.size > 0:
         goal_idx = int(candidates[0])
@@ -111,7 +108,7 @@ def pure_pursuit_curvature(path_ego, v_ego, lat_delay):
         goal_idx = int(np.argmin(d))
 
     L_d_eff = max(float(d[goal_idx]), 1e-3)
-    y_goal = float(y[goal_idx] - y_ref)
+    y_goal = float(y[goal_idx])
 
     kappa = 2.0 * y_goal / (L_d_eff * L_d_eff)
     kappa = float(np.clip(kappa, -PP_CURV_LIMIT, PP_CURV_LIMIT))
@@ -366,7 +363,7 @@ def main():
     cloudlog.warning("udp_bridge init (ref-path slice mode, target=10km/h)")
 
     pm = PubMaster(["modelV2", "drivingModelData", "longitudinalPlan", "driverAssistance"])
-    sm = SubMaster(["carState", "livePose", "liveDelay"])
+    sm = SubMaster(["carState", "livePose"])
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -416,8 +413,7 @@ def main():
 
         # 3. tracker — 받은 ego-frame path 에 곧장 pure pursuit
         if path is not None:
-            lat_delay = float(sm["liveDelay"].lateralDelay)
-            kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path, v_ego, lat_delay)
+            kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path, v_ego)
 
             if v_ego > MIN_LAT_CONTROL_SPEED:
                 kappa = smooth_value(kappa_pp, prev_curvature, LAT_SMOOTH_SECONDS)
@@ -440,7 +436,7 @@ def main():
                     f"track: v_ego={v_ego:.2f} target={TARGET_SPEED_MPS:.2f} "
                     f"κ={kappa:+.4f}(raw {kappa_pp:+.4f}) a={a_cmd:+.2f} "
                     f"L_d={L_d_eff:.1f} i_goal={i_goal} N={path['N']} "
-                    f"lat_delay={lat_delay:.3f} cte={cte:+.2f} pkts={recv_count}"
+                    f"cte={cte:+.2f} pkts={recv_count}"
                 )
         else:
             action = idle_action()
