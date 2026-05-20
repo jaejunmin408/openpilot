@@ -6,8 +6,9 @@ Alpamayo UDP Bridge — reference path slice 추종 모드
 ego-frame JSON으로 보내준다.
 
   packet: {"pred_xyz": [[x, y, z], ...]}   # (N,3) list
-  좌표계: x=forward(m), y=right(m) — openpilot body frame
-  (publisher 측이 y=LEFT 규약이면 거기서 부호 반전해서 보낼 것)
+  수신 좌표계: x=forward(m), y=right(m)  ← publisher 측 규약
+  내부 좌표계: x=forward(m), y=left(m)   ← openpilot body frame
+  parse 시점에 y 부호를 뒤집어 내부적으로는 openpilot 규약으로 통일한다.
 
 매 패킷이 그 시점 차량 위치 기준으로 잘려 들어오므로 anchor/world 변환 없이
 받은 path를 그대로 ego-frame path로 사용해 20 Hz control loop에서 pure pursuit
@@ -57,7 +58,8 @@ PP_CURV_LIMIT = 0.2
 # ── JSON 패킷 파싱 ───────────────────────────────────
 def parse_path_packet(data: bytes):
     """{"pred_xyz": [[x,y,z], ...]} 형태 ego-frame slice 수신.
-    실패 시 None. x=forward(m), y=right(m).
+    실패 시 None. 수신은 x=forward, y=right 규약이지만 내부적으로는
+    openpilot body frame(y=left)로 통일해서 반환한다.
     """
     try:
         d = json.loads(data.decode())
@@ -76,18 +78,18 @@ def parse_path_packet(data: bytes):
         return None
 
     x = pred_xyz[:, 0]
-    y = pred_xyz[:, 1]
+    y = -pred_xyz[:, 1]   # 수신 y=right(+) → 내부 y=left(+) (openpilot 규약)
 
     return {'x': x, 'y': y, 'N': int(x.shape[0])}
 
 
 # ── pure pursuit (lateral) ───────────────────────────
 def pure_pursuit_curvature(path_ego, v_ego):
-    """ego-frame path(x=fwd, y=right)에서 pure pursuit 으로 desired curvature 산출.
+    """ego-frame path(x=fwd, y=left)에서 pure pursuit 으로 desired curvature 산출.
 
     1) ego (0,0) 을 기준점으로
     2) 그 기준점에서 L_d 떨어진 path 위 goal 점을 잡아
-    3) κ = 2·Δy / L_d²  (y right(+) → κ CW(+))
+    3) κ = 2·Δy / L_d²  (y left(+) → κ CCW(+), openpilot desiredCurvature 규약)
     L_d 까지 닿는 점이 없으면 path 끝점을 goal 로.
     """
     x = path_ego['x']
