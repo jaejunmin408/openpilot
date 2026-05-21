@@ -33,8 +33,7 @@ VEHICLE_VIZ_PORT = 5006      # LocalWorld 현재 pose + 6초 trail
 WORLD_PATH_VIZ_PORT = 5008   # 과거 anchor로 월드에 박힌 경로 (trajectory_world)
 RECV_BUF_SIZE = 65535
 
-T_IDXS = np.array(ModelConstants.T_IDXS, dtype=np.float64)
-X_IDXS = np.array(ModelConstants.X_IDXS, dtype=np.float64)
+X_IDXS = np.array(ModelConstants.X_IDXS, dtype=np.float64)   # laneLines/roadEdges 더미용
 IDX_N = ModelConstants.IDX_N   # 33
 
 # ── 추종기 파라미터 ──────────────────────────────────
@@ -49,9 +48,7 @@ LON_USE_FEEDFORWARD = False          # 초기엔 raw_action.accel 사용 안 함
 STOP_DIST_M = 1.0                    # path 끝까지 남은 거리가 이 값 이하면 정지
 
 # ── pure pursuit 파라미터 ────────────────────────────
-PP_PREVIEW_TIME_S = 0.8              # look-ahead = preview_time * v_ego
-PP_LOOKAHEAD_MIN_M = 8.0             # look-ahead 최소값 (저속 안정)
-PP_LOOKAHEAD_MAX_M = 30.0            # look-ahead 최대값 (고속 oscillation 방지)
+PP_LOOKAHEAD_M = 4.0                 # look-ahead 고정 (실차 튜닝용)
 PP_CURV_LIMIT = 0.2                  # |κ| clip
 
 
@@ -195,9 +192,8 @@ def pure_pursuit_curvature(path_ego, v_ego, lat_delay):
     x_ref = max(v_ego, 0.0) * max(lat_delay, 0.0)
     y_ref = 0.0
 
-    # look-ahead 거리 (속도 비례, min/max clip)
-    L_d = float(np.clip(PP_PREVIEW_TIME_S * max(v_ego, 0.0),
-                        PP_LOOKAHEAD_MIN_M, PP_LOOKAHEAD_MAX_M))
+    # look-ahead 거리 (고정)
+    L_d = PP_LOOKAHEAD_M
 
     # 기준점 기준 path 각 점까지의 거리
     dx = x - x_ref
@@ -248,32 +244,34 @@ def longitudinal_accel(path_ego, v_ego, s_ref_total):
     return a_cmd, should_stop, v_ref, remaining
 
 
-# ── 경로 리샘플 (현재 ego-frame path → T_IDXS 33점, 시각화용) ──
-def resample_for_viz(path_ego, N_src, dt_src):
-    """path_ego(현재 ego frame, arc-length 샘플 아님)를 T_IDXS 33점으로 리샘플.
-    path_ego의 원본은 dt_src 간격 시계열이므로 시간축 보간 유지.
+# ── 경로 패킹 (현재 ego-frame path를 원본 해상도 그대로 메시지/표시용으로) ──
+def path_for_viz(path_ego, dt_src):
+    """path_ego(현재 ego frame)를 리샘플 없이 그대로 포장.
+    제어(pure pursuit)가 추종 대상으로 읽는 경로와 동일한 N점을 화면에 그대로 표시한다.
+    t는 path 자체의 시계열(dt_src 간격)을 사용 (T_IDXS 33점 리샘플 없음).
     """
-    src_t = np.arange(N_src, dtype=np.float64) * dt_src
-    x = np.interp(T_IDXS, src_t, path_ego['x']).astype(np.float32)
-    y = np.interp(T_IDXS, src_t, path_ego['y']).astype(np.float32)
-    z = np.interp(T_IDXS, src_t, path_ego['z']).astype(np.float32)
-    yaw = np.interp(T_IDXS, src_t, path_ego['yaw']).astype(np.float32)
-    v = np.interp(T_IDXS, src_t, path_ego['v']).astype(np.float32)
+    x = np.asarray(path_ego['x'], dtype=np.float32)
+    y = np.asarray(path_ego['y'], dtype=np.float32)
+    z = np.asarray(path_ego['z'], dtype=np.float32)
+    yaw = np.asarray(path_ego['yaw'], dtype=np.float32)
+    v = np.asarray(path_ego['v'], dtype=np.float32)
+    t = np.arange(len(x), dtype=np.float64) * dt_src
     vx = (v * np.cos(yaw)).astype(np.float32)
     vy = (v * np.sin(yaw)).astype(np.float32)
     return {
-        'x': x, 'y': y, 'z': z,
+        't': t, 'x': x, 'y': y, 'z': z,
         'yaw': yaw, 'v': v,
         'vx': vx, 'vy': vy,
     }
 
 
-def default_resampled():
-    zeros = np.zeros(IDX_N, dtype=np.float32)
+def default_path_viz():
+    empty_f32 = np.zeros(0, dtype=np.float32)
     return {
-        'x': zeros.copy(), 'y': zeros.copy(), 'z': zeros.copy(),
-        'yaw': zeros.copy(), 'v': zeros.copy(),
-        'vx': zeros.copy(), 'vy': zeros.copy(),
+        't': np.zeros(0, dtype=np.float64),
+        'x': empty_f32.copy(), 'y': empty_f32.copy(), 'z': empty_f32.copy(),
+        'yaw': empty_f32.copy(), 'v': empty_f32.copy(),
+        'vx': empty_f32.copy(), 'vy': empty_f32.copy(),
     }
 
 
@@ -301,13 +299,15 @@ def fill_xyzt(builder, t, x, y, z, x_std=None, y_std=None, z_std=None):
 
 def publish_messages(pm, rs, action, frame_id, v_ego):
     """modelV2 + drivingModelData + longitudinalPlan + driverAssistance 발행.
-    rs: resample_path 결과 (또는 default_resampled)
+    rs: path_for_viz 결과 (또는 default_path_viz) — path_ego 원본 해상도(N점).
     """
     now_ns = int(time.monotonic() * 1e9)
-    t_list = ModelConstants.T_IDXS
 
-    zeros_33 = np.zeros(IDX_N, dtype=np.float32)
-    low_std = np.full(IDX_N, 0.1, dtype=np.float32)
+    n = len(rs['x'])                       # path_ego 원본 점 개수
+    t_path = rs['t'].tolist()              # path 자체 시간축 (리샘플 없음)
+    zeros_n = np.zeros(n, dtype=np.float32)
+    low_std_n = np.full(n, 0.1, dtype=np.float32)
+    zeros_33 = np.zeros(IDX_N, dtype=np.float32)  # laneLines/roadEdges 더미용
 
     # ── modelV2 ──
     modelv2_send = messaging.new_message('modelV2')
@@ -321,17 +321,17 @@ def publish_messages(pm, rs, action, frame_id, v_ego):
     mv2.timestampEof = now_ns
     mv2.modelExecutionTime = 0.0
 
-    # position — pred_xyz 기반
-    fill_xyzt(mv2.position, t_list, rs['x'], rs['y'], rs['z'],
-              x_std=low_std, y_std=low_std, z_std=low_std)
+    # position — 제어(pure pursuit)가 읽는 path_ego 원본 점을 그대로
+    fill_xyzt(mv2.position, t_path, rs['x'], rs['y'], rs['z'],
+              x_std=low_std_n, y_std=low_std_n, z_std=low_std_n)
     # velocity — pred_v_mps · cos/sin(pred_yaw)
-    fill_xyzt(mv2.velocity, t_list, rs['vx'], rs['vy'], zeros_33)
+    fill_xyzt(mv2.velocity, t_path, rs['vx'], rs['vy'], zeros_n)
     # acceleration — 0
-    fill_xyzt(mv2.acceleration, t_list, zeros_33, zeros_33, zeros_33)
+    fill_xyzt(mv2.acceleration, t_path, zeros_n, zeros_n, zeros_n)
     # orientation (x=roll, y=pitch, z=yaw)
-    fill_xyzt(mv2.orientation, t_list, zeros_33, zeros_33, rs['yaw'])
+    fill_xyzt(mv2.orientation, t_path, zeros_n, zeros_n, rs['yaw'])
     # orientationRate — 0
-    fill_xyzt(mv2.orientationRate, t_list, zeros_33, zeros_33, zeros_33)
+    fill_xyzt(mv2.orientationRate, t_path, zeros_n, zeros_n, zeros_n)
 
     # action
     mv2.action = action
@@ -408,12 +408,18 @@ def publish_messages(pm, rs, action, frame_id, v_ego):
     dmd.modelExecutionTime = 0.0
     dmd.action = action
 
-    # path polynomial (pred_xyz 기반)
-    xyz = np.stack([rs['x'], rs['y'], rs['z']], axis=1)
-    coeffs = np.polynomial.polynomial.polyfit(T_IDXS, xyz, deg=ModelConstants.POLY_PATH_DEGREE)
-    dmd.path.xCoefficients = coeffs[:, 0].tolist()
-    dmd.path.yCoefficients = coeffs[:, 1].tolist()
-    dmd.path.zCoefficients = coeffs[:, 2].tolist()
+    # path polynomial — path_ego 원본 점을 그 자체 시간축에 대해 폴리피팅
+    deg = ModelConstants.POLY_PATH_DEGREE
+    if n >= deg + 1:
+        xyz = np.stack([rs['x'], rs['y'], rs['z']], axis=1)
+        coeffs = np.polynomial.polynomial.polyfit(rs['t'], xyz, deg=deg)
+        dmd.path.xCoefficients = coeffs[:, 0].tolist()
+        dmd.path.yCoefficients = coeffs[:, 1].tolist()
+        dmd.path.zCoefficients = coeffs[:, 2].tolist()
+    else:
+        dmd.path.xCoefficients = [0.0] * (deg + 1)
+        dmd.path.yCoefficients = [0.0] * (deg + 1)
+        dmd.path.zCoefficients = [0.0] * (deg + 1)
 
     # lane line meta
     dmd.laneLineMeta.leftY = -1.8
@@ -639,7 +645,7 @@ def main():
                 desiredAcceleration=float(a_cmd),
                 shouldStop=bool(should_stop),
             )
-            rs = resample_for_viz(path_ego, stored['N'], stored['dt_s'])
+            rs = path_for_viz(path_ego, stored['dt_s'])
 
             log_counter += 1
             if log_counter % 20 == 1:   # 1Hz 로그
@@ -654,7 +660,7 @@ def main():
                 )
         else:
             action = idle_action()
-            rs = default_resampled()
+            rs = default_path_viz()
             prev_curvature = 0.0
 
         # 5. 메시지 발행
