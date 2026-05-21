@@ -45,6 +45,9 @@ ACCEL_MAX = 2.0
 LON_KP = 0.3                         # v_error → accel 게인
 LON_USE_FEEDFORWARD = False          # 초기엔 raw_action.accel 사용 안 함 (튜닝 후 on)
 
+TARGET_SPEED_KPH = 10.0              # 경로 전체 목표 속도 고정값 (pred_v 무시)
+TARGET_SPEED_MPS = TARGET_SPEED_KPH / 3.6
+
 STOP_DIST_M = 1.0                    # path 끝까지 남은 거리가 이 값 이하면 정지
 
 # ── pure pursuit 파라미터 ────────────────────────────
@@ -89,7 +92,8 @@ def parse_action_packet(data: bytes):
     ego_y = -pred_xyz[:, 1].astype(np.float64)
     ego_z =  pred_xyz[:, 2].astype(np.float64)
     ego_yaw = -pred_yaw.astype(np.float64)
-    path_v = pred_v.astype(np.float64)
+    # 경로의 모든 목표 속도를 고정값으로 덮어씀 (pred_v 무시)
+    path_v = np.full(pred_v.shape[0], TARGET_SPEED_MPS, dtype=np.float64)
     a_ff = a.astype(np.float64)                       # feed-forward용 종가속 (ego-frame, t기반)
     # Alpamayo(CCW>0) → openpilot(CW>0): 부호 반전
     path_curv = c.astype(np.float64)
@@ -221,19 +225,20 @@ def pure_pursuit_curvature(path_ego, v_ego, lat_delay):
 
 # ── longitudinal tracker ─────────────────────────────
 def longitudinal_accel(path_ego, v_ego, s_ref_total):
-    """현재 위치 기준 전방 nearest 점의 pred_v를 target 삼아 accel 산출.
-    s_ref_total: path 전체 arc-length. path 끝까지 남은 거리로 stop 판단.
+    """고정 목표 속도(TARGET_SPEED_MPS)를 따라가도록 accel 산출.
+    path 끝까지 남은 거리가 STOP_DIST_M 이하이면 정지.
+    s_ref_total: 미사용 (시그니처 호환용).
     """
     x = path_ego['x']; y = path_ego['y']; v_path = path_ego['v']
     i = nearest_index_ahead(x, y)
-    v_ref = float(v_path[i])
+    v_ref = float(v_path[i])          # path_v는 고정 10km/h로 덮인 상태
 
     # path 끝까지 남은 거리
     s = path_arclengths(x, y)
     remaining = s[-1] - s[i]
 
     should_stop = False
-    if remaining < STOP_DIST_M and v_ref < 0.5:
+    if remaining < STOP_DIST_M:       # path 끝 도달 → 정지 (안전)
         v_ref = 0.0
         should_stop = True
 
