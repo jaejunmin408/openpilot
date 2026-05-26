@@ -186,7 +186,10 @@ def pure_pursuit_curvature(path_ego, v_ego, lat_delay):
 
     1) lat_delay 후 ego 가 도달할 (현재 ego frame 기준) 위치를 기준점으로 잡고
     2) 그 기준점에서 look-ahead 거리(L_d) 떨어진 path 위 goal point 를 찾아
-    3) κ = 2*Δy / L_d² 로 계산. (y 가 right(+) 이면 κ 도 CW(+) 부호 일치)
+    3) κ = -2*Δy / L_d² 로 계산.
+       부호: openpilot desiredCurvature 는 LEFT 양수 컨벤션
+       (latcontrol_torque.py: "TODO left is positive in this convention").
+       body y 는 RIGHT 양수이므로, goal 이 우측(y>0)이면 RIGHT 회전 → κ<0.
 
     path 가 짧아 L_d 에 도달하지 못하면 path 의 마지막 점을 goal 로 사용.
     """
@@ -219,7 +222,7 @@ def pure_pursuit_curvature(path_ego, v_ego, lat_delay):
     L_d_eff = max(float(d[goal_idx]), 1e-3)
     y_goal = float(y[goal_idx] - y_ref)
 
-    kappa = 2.0 * y_goal / (L_d_eff * L_d_eff)
+    kappa = -2.0 * y_goal / (L_d_eff * L_d_eff)   # LEFT-positive 컨벤션 맞춤
     kappa = float(np.clip(kappa, -PP_CURV_LIMIT, PP_CURV_LIMIT))
     return kappa, goal_idx, L_d_eff
 
