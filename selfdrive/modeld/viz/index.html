@@ -55,12 +55,12 @@
 
   <div class="section">
     <h3>Legend</h3>
-    <div class="legend-entry"><span class="legend-swatch" style="background:rgba(255,209,102,0.85)"></span>현재 경로 (최신)</div>
-    <div class="legend-entry"><span class="legend-swatch" style="background:rgba(131,165,194,0.45)"></span>과거 경로 (누적)</div>
+    <div class="legend-entry"><span class="legend-swatch" style="background:rgba(255,209,102,0.85)"></span>받은 경로 (누적, anchor 박힘)</div>
     <div class="legend-entry"><span class="legend-dot" style="background:#ffd166"></span>anchor (path[0])</div>
-    <div class="legend-entry"><span class="legend-swatch" style="background:repeating-linear-gradient(to right,rgba(6,214,160,0.7) 0 5px,transparent 5px 9px)"></span>차량 trail (6초)</div>
+    <div class="legend-entry"><span class="legend-swatch" style="background:repeating-linear-gradient(to right,rgba(6,214,160,0.7) 0 5px,transparent 5px 9px)"></span>지나온 경로 (누적)</div>
     <div class="legend-entry"><span class="legend-dot" style="background:#06d6a0"></span>현재 차량</div>
     <div class="info-row"><span class="info-label">path history</span><span class="info-value" id="w-hist">0</span></div>
+    <div class="info-row"><span class="info-label">trail points</span><span class="info-value" id="t-np">0</span></div>
   </div>
 
   <div id="help">
@@ -77,11 +77,12 @@ const ctx = canvas.getContext('2d');
 
 // ── state ──
 let vehicle = null;
-let vehicleTrail = [];     // udp_bridge 의 6초 trail (덮어쓰기, accumulate 아님)
+let vehicleTrail = [];     // 차량이 지나온 경로 — 클라에서 vehicle 메시지마다 누적 (서버 6초 버퍼는 무시)
 let worldPath = null;       // anchor 박힌 받은 경로 (최신)
 let worldPathHistory = [];  // 과거 받은 경로들 (누적)
 let cameraFollow = true;
 let SCALE = 40;             // px/m
+const TRAIL_MIN_STEP_M = 0.1;  // 마지막 점에서 이만큼 움직였을 때만 trail 에 append
 
 // 좌표 규약 (LocalWorld, udp_bridge):
 //   x = north, y = east 와 비슷한 NED 적분. yaw 는 NED.z (북에서 시계방향).
@@ -97,7 +98,7 @@ window.addEventListener('resize', resize);
 
 window.addEventListener('keydown', (e) => {
   if (e.key === 'f' || e.key === 'F') { cameraFollow = !cameraFollow; draw(); }
-  if (e.key === 'r' || e.key === 'R') { vehicleTrail = []; draw(); }
+  if (e.key === 'r' || e.key === 'R') { vehicleTrail = []; setText('t-np', '0'); draw(); }
   if (e.key === 'c' || e.key === 'C') {
     worldPathHistory = [];
     setText('w-hist', '0');
@@ -137,10 +138,10 @@ function draw() {
   const cam = getCamera();
   drawGrid(W, H, cam);
 
-  // 0. world path history — 누적된 과거 경로들, 가장 아래 layer (옅은 청회색 선)
+  // 0. world path history — 누적된 과거 경로들, 가장 아래 layer (최신과 같은 노란색)
   if (worldPathHistory.length > 0) {
-    ctx.strokeStyle = 'rgba(131,165,194,0.45)';
-    ctx.lineWidth = 1.2;
+    ctx.strokeStyle = 'rgba(255,209,102,0.85)';
+    ctx.lineWidth = 2;
     for (const past of worldPathHistory) {
       const pts = past.points;
       if (!pts || pts.length < 2) continue;
@@ -152,10 +153,10 @@ function draw() {
         ctx.lineTo(s.sx, s.sy);
       }
       ctx.stroke();
-      // 과거 anchor 점만 작게 표시
+      // 과거 anchor 도 동일하게 표시
       const sa = toScreen(pts[0].x, pts[0].y, cam, W, H);
-      ctx.fillStyle = 'rgba(131,165,194,0.6)';
-      ctx.beginPath(); ctx.arc(sa.sx, sa.sy, 2.2, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#ffd166';
+      ctx.beginPath(); ctx.arc(sa.sx, sa.sy, 3, 0, Math.PI * 2); ctx.fill();
     }
   }
 
@@ -334,6 +335,12 @@ function connect() {
 
     if (data.type === 'vehicle') {
       vehicle = data;
+      // 차량 trail 누적 — 마지막 점에서 일정 거리 이상 움직였을 때만 추가
+      const last = vehicleTrail[vehicleTrail.length - 1];
+      if (!last || Math.hypot(data.x - last.x, data.y - last.y) >= TRAIL_MIN_STEP_M) {
+        vehicleTrail.push({ x: data.x, y: data.y });
+        setText('t-np', String(vehicleTrail.length));
+      }
       updateVehiclePanel(data);
       statusEl.textContent = 'Receiving';
       statusEl.className = 'connected';
@@ -342,8 +349,7 @@ function connect() {
     }
 
     if (data.type === 'vehicle_trail') {
-      vehicleTrail = data.points || [];
-      draw();
+      // 서버의 6초 버퍼는 무시 (클라에서 vehicle 메시지로 직접 누적)
       return;
     }
 
