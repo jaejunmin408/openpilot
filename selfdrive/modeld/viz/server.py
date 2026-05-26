@@ -119,6 +119,19 @@ class VehicleProtocol(asyncio.DatagramProtocol):
         "points": out_pts,
       })
 
+    elif t == "pp_goal":
+      if State.display_anchor is None:
+        return
+      ox, oy = offset_xy(float(msg.get("x", 0.0)), float(msg.get("y", 0.0)))
+      schedule_broadcast("pp_goal", {
+        "type": "pp_goal",
+        "x": round(ox, 4),
+        "y": round(oy, 4),
+        "idx": int(msg.get("idx", 0)),
+        "L_d": round(float(msg.get("L_d", 0.0)), 3),
+        "frame": int(msg.get("frame", 0)),
+      })
+
 
 # ── UDP 5008: trajectory_world (anchor 박힌 path) ────────────────────────────
 class WorldPathProtocol(asyncio.DatagramProtocol):

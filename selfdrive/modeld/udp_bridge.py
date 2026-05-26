@@ -528,6 +528,22 @@ def send_vehicle_viz(viz_sock, world, lp, frame_id):
             pass
 
 
+def send_pp_goal_viz(viz_sock, stored, i_goal, L_d_eff, frame_id):
+    """pure pursuit goal 점(현재 추종 대상)을 world 좌표로 viz(5006)로 송신."""
+    msg = {
+        "type": "pp_goal",
+        "x": float(stored['world_x'][i_goal]),
+        "y": float(stored['world_y'][i_goal]),
+        "idx": int(i_goal),
+        "L_d": float(L_d_eff),
+        "frame": int(frame_id),
+    }
+    try:
+        viz_sock.sendto(json.dumps(msg).encode(), ("127.0.0.1", VEHICLE_VIZ_PORT))
+    except OSError:
+        pass
+
+
 def send_world_path_viz(viz_sock, points, dt_s, seq):
     """과거 anchor로 월드에 박힌 경로를 viz(5008) 로 송신."""
     msg = {
@@ -652,6 +668,9 @@ def main():
                 shouldStop=bool(should_stop),
             )
             rs = path_for_viz(path_ego, stored['dt_s'])
+
+            # pure pursuit 추종 대상 점을 viz 로 송신 (world 좌표)
+            send_pp_goal_viz(viz_sock, stored, i_goal, L_d_eff, frame_id)
 
             log_counter += 1
             if log_counter % 20 == 1:   # 1Hz 로그
