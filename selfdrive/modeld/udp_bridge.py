@@ -110,16 +110,17 @@ def parse_action_packet(data: bytes):
 # ── 좌표 변환: 수신시점 ego frame → LocalWorld 전역 frame ──
 def path_ego_to_world(pkt, anchor):
     """pkt(수신시점 ego frame, x=fwd/y=right)를 anchor=(x0,y0,yaw0) 기준 LocalWorld 좌표로.
-    LocalWorld는 R(yaw) = [[cos,-sin],[sin,cos]] 적분 사용 → body-y는 "right" 가정과 부합하도록
-    py 부호를 반전해 world frame에 둔다.
+    LocalWorld 는 NED(yaw CW from north, vy=device.right) 와 일관되게 적분되므로
+    body(forward, right) → world(north, east) 회전은 표준 NED 식을 그대로 사용:
+        north = forward*cos(yaw) - right*sin(yaw)
+        east  = forward*sin(yaw) + right*cos(yaw)
     """
     x0, y0, yaw0 = anchor
     c0, s0 = math.cos(yaw0), math.sin(yaw0)
     px = pkt['ego_x']
     py = pkt['ego_y']      # right-positive
-    # body→world (body-y=left 규약이므로 py를 flip)
-    wx = x0 + c0 * px - s0 * (-py)
-    wy = y0 + s0 * px + c0 * (-py)
+    wx = x0 + c0 * px - s0 * py
+    wy = y0 + s0 * px + c0 * py
     wyaw = yaw0 + (-pkt['ego_yaw'])  # LocalWorld CCW 가정에 맞춰 부호 반전
     return {
         'world_x': wx,                  # (N,)
@@ -136,17 +137,17 @@ def path_ego_to_world(pkt, anchor):
 
 def path_world_to_current_ego(stored, cur):
     """저장된 world path를 현재 LocalWorld pose로 ego frame(x=fwd,y=right)에 재표현.
+    NED(yaw CW from north) → body(forward, right) 역회전:
+        forward = (north-dx)*cos(yaw) + (east-dy)*sin(yaw)
+        right   = -(north-dx)*sin(yaw) + (east-dy)*cos(yaw)
     반환: dict with 'x','y','yaw','v' (각 길이 N, np.float64).
     """
     _, xc, yc, yawc = cur
     cc, sc = math.cos(yawc), math.sin(yawc)
     dx = stored['world_x'] - xc
     dy = stored['world_y'] - yc
-    # world→body (body-y=left 규약에서 변환 후 py=right로 flip)
-    bx =  cc * dx + sc * dy
-    by_left = -sc * dx + cc * dy
-    px = bx
-    py_right = -by_left
+    px       =  cc * dx + sc * dy
+    py_right = -sc * dx + cc * dy
     pyaw = -(stored['world_yaw'] - yawc)   # world_yaw→ego yaw (부호 규약 뒤집기)
     return {
         'x': px.astype(np.float64),
