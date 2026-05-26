@@ -55,15 +55,18 @@
 
   <div class="section">
     <h3>Legend</h3>
-    <div class="legend-entry"><span class="legend-swatch" style="background:rgba(255,209,102,0.85)"></span>받은 경로 (anchor 박힘)</div>
+    <div class="legend-entry"><span class="legend-swatch" style="background:rgba(255,209,102,0.85)"></span>현재 경로 (최신)</div>
+    <div class="legend-entry"><span class="legend-swatch" style="background:rgba(131,165,194,0.45)"></span>과거 경로 (누적)</div>
     <div class="legend-entry"><span class="legend-dot" style="background:#ffd166"></span>anchor (path[0])</div>
     <div class="legend-entry"><span class="legend-swatch" style="background:repeating-linear-gradient(to right,rgba(6,214,160,0.7) 0 5px,transparent 5px 9px)"></span>차량 trail (6초)</div>
     <div class="legend-entry"><span class="legend-dot" style="background:#06d6a0"></span>현재 차량</div>
+    <div class="info-row"><span class="info-label">path history</span><span class="info-value" id="w-hist">0</span></div>
   </div>
 
   <div id="help">
     [F] camera follow on/off<br>
     [R] reset trail<br>
+    [C] clear path history<br>
     wheel: zoom
   </div>
 </div>
@@ -75,7 +78,8 @@ const ctx = canvas.getContext('2d');
 // ── state ──
 let vehicle = null;
 let vehicleTrail = [];     // udp_bridge 의 6초 trail (덮어쓰기, accumulate 아님)
-let worldPath = null;       // anchor 박힌 받은 경로
+let worldPath = null;       // anchor 박힌 받은 경로 (최신)
+let worldPathHistory = [];  // 과거 받은 경로들 (누적)
 let cameraFollow = true;
 let SCALE = 40;             // px/m
 
@@ -94,6 +98,11 @@ window.addEventListener('resize', resize);
 window.addEventListener('keydown', (e) => {
   if (e.key === 'f' || e.key === 'F') { cameraFollow = !cameraFollow; draw(); }
   if (e.key === 'r' || e.key === 'R') { vehicleTrail = []; draw(); }
+  if (e.key === 'c' || e.key === 'C') {
+    worldPathHistory = [];
+    setText('w-hist', '0');
+    draw();
+  }
 });
 
 canvas.addEventListener('wheel', (e) => {
@@ -127,6 +136,28 @@ function draw() {
 
   const cam = getCamera();
   drawGrid(W, H, cam);
+
+  // 0. world path history — 누적된 과거 경로들, 가장 아래 layer (옅은 청회색 선)
+  if (worldPathHistory.length > 0) {
+    ctx.strokeStyle = 'rgba(131,165,194,0.45)';
+    ctx.lineWidth = 1.2;
+    for (const past of worldPathHistory) {
+      const pts = past.points;
+      if (!pts || pts.length < 2) continue;
+      ctx.beginPath();
+      const s0 = toScreen(pts[0].x, pts[0].y, cam, W, H);
+      ctx.moveTo(s0.sx, s0.sy);
+      for (let i = 1; i < pts.length; i++) {
+        const s = toScreen(pts[i].x, pts[i].y, cam, W, H);
+        ctx.lineTo(s.sx, s.sy);
+      }
+      ctx.stroke();
+      // 과거 anchor 점만 작게 표시
+      const sa = toScreen(pts[0].x, pts[0].y, cam, W, H);
+      ctx.fillStyle = 'rgba(131,165,194,0.6)';
+      ctx.beginPath(); ctx.arc(sa.sx, sa.sy, 2.2, 0, Math.PI * 2); ctx.fill();
+    }
+  }
 
   // 1. world path (anchor 박힘) — 노란 실선 + 점, 가장 아래 layer
   if (worldPath && worldPath.points.length > 1) {
@@ -317,6 +348,11 @@ function connect() {
     }
 
     if (data.type === 'world_path') {
+      // 같은 seq 면 단순 갱신 (anchor 안 박힌 재전송 등), 새 seq 면 직전 경로를 history 로 밀어 누적
+      if (worldPath && data.seq !== worldPath.seq) {
+        worldPathHistory.push(worldPath);
+        setText('w-hist', String(worldPathHistory.length));
+      }
       worldPath = data;
       updateWorldPathPanel(data);
       draw();
