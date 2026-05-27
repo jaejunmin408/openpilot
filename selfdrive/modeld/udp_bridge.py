@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-Alpamayo UDP Bridge (ac_decoded_path.json 포맷) — 위치 기반 경로 추종 모드
+Alpamayo UDP Bridge — arclength-based path tracking (livePose 미사용)
 
-외부에서 UDP로 1회 전송한 ac_decoded_path.json 전체(JSON bytes)를 수신하여:
-  - pred_xyz / pred_yaw_rad / pred_v_mps 를 수신 시점 LocalWorld 앵커 기준 global 좌표로 변환해 저장
-  - 20Hz 루프에서 livePose를 LocalWorld에 적분 → 현재 pose에서 종방향 추종기 + nearest-ahead 경로점의 curvature 직접 사용
-  - 결과 desiredCurvature / desiredAcceleration 을 modelV2.action 으로 발행
-  - pred_xyz 는 현재 ego frame으로 재표현해 modelV2.position 에 실어 UI 표시
+외부에서 UDP 로 ac_decoded_path.json 을 받아 path 를 그 시점 ego frame 그대로 보관.
+매 20Hz tick 마다 v_ego(휠속) 만 적분해 path 위 누적 진행거리 s_now 를 추적.
+pure pursuit goal 은 path 위 arclength = s_now + L_d 지점.
 
-좌표 변환: Alpamayo(y=LEFT, yaw=CCW, curv=CCW) → openpilot(y=RIGHT, yaw=CW, curv=CW)
-           y, yaw, curvature 부호 반전.
+좌표·노이즈:
+  - locationd / livePose 의존 0 (yaw/translation drift 가 κ 로 침투할 통로 없음).
+  - 노이즈 침투원은 v_ego 적분 하나 (수 초 적분해도 cm 단위).
+  - 새 packet 도착 시 s_now = v_ego * inference_time_s 로 회고 보상 (이미 지나간 추론 지연).
+  - 액추에이터 지연(lateralDelay) 은 controlsd 의 latcontrol_torque buffer 가 처리하므로
+    udp_bridge 에서는 손대지 않음 (이중 보상 방지).
+
+부호 컨벤션:
+  - Alpamayo(y=LEFT) → 내부 ego(y=RIGHT). parse 시 y, yaw 부호 반전.
+  - openpilot desiredCurvature 는 LEFT 양수 → 내부 y=RIGHT 기반 κ 에 부호 반전.
 """
 import json
 import math
@@ -28,38 +34,36 @@ from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 
 # ── 설정 ──────────────────────────────────────────────
 UDP_PORT = 5005
-LOCAL_PATH_VIZ_PORT = 5007   # 수신한 Alpamayo JSON 원본을 viz에 미러 (ego-frame, trajectory_local)
-VEHICLE_VIZ_PORT = 5006      # LocalWorld 현재 pose + 6초 trail
-WORLD_PATH_VIZ_PORT = 5008   # 과거 anchor로 월드에 박힌 경로 (trajectory_world)
+LOCAL_PATH_VIZ_PORT = 5007   # 수신한 Alpamayo JSON 원본 mirror (ego-frame)
+VEHICLE_VIZ_PORT = 5006      # 차량 pose/trail + pp_goal viz
+WORLD_PATH_VIZ_PORT = 5008   # packet 받은 시점 LocalWorld anchor 로 박은 path (viz only)
 RECV_BUF_SIZE = 65535
 
-X_IDXS = np.array(ModelConstants.X_IDXS, dtype=np.float64)   # laneLines/roadEdges 더미용
-IDX_N = ModelConstants.IDX_N   # 33
+X_IDXS = np.array(ModelConstants.X_IDXS, dtype=np.float64)
+IDX_N = ModelConstants.IDX_N
 
-# ── 추종기 파라미터 ──────────────────────────────────
-MIN_LAT_CONTROL_SPEED = 0.3          # 이 속도 이하에서는 직전 curvature 유지 (공식 modeld와 동일)
+# ── 제어 파라미터 ────────────────────────────────────
+MIN_LAT_CONTROL_SPEED = 0.3
 
 ACCEL_MIN = -3.5
 ACCEL_MAX = 2.0
 
-LON_KP = 0.3                         # v_error → accel 게인
-LON_USE_FEEDFORWARD = False          # 초기엔 raw_action.accel 사용 안 함 (튜닝 후 on)
-
-TARGET_SPEED_KPH = 10.0              # 경로 전체 목표 속도 고정값 (pred_v 무시)
+LON_KP = 0.3
+TARGET_SPEED_KPH = 10.0
 TARGET_SPEED_MPS = TARGET_SPEED_KPH / 3.6
-
-STOP_DIST_M = 1.0                    # path 끝까지 남은 거리가 이 값 이하면 정지
+STOP_DIST_M = 1.0
 
 # ── pure pursuit 파라미터 ────────────────────────────
-PP_LOOKAHEAD_M = 4.0                 # look-ahead 고정 (실차 튜닝용)
-PP_CURV_LIMIT = 0.2                  # |κ| clip
+PP_LOOKAHEAD_M = 5.0          # path 위 s_now 에서 이만큼 떨어진 arclength 점이 goal
+PP_CURV_LIMIT = 0.2           # |κ| clip
+
+MAX_TICK_DT_S = 0.5           # 이상치 dt 무시용 (s_now 폭주 방지)
 
 
-# ── JSON 패킷 파싱 ───────────────────────────────────
+# ── packet 파싱 + arclength 사전 계산 ────────────────
 def parse_action_packet(data: bytes):
-    """ac_decoded_path.json 바이트를 파싱해 ego-frame(수신시점) path 반환.
-    실패 시 None. 좌표계 변환(y, yaw, curvature 부호 반전)을 여기서 수행.
-    반환 path는 x=forward, y=right (openpilot body frame).
+    """ac_decoded_path.json 바이트 → 내부 ego frame(y=RIGHT) path dict.
+    누적 arclength 's' 도 함께 계산해서 반환.
     """
     try:
         d = json.loads(data.decode())
@@ -87,189 +91,139 @@ def parse_action_packet(data: bytes):
                          f"xyz={pred_xyz.shape[0]}, yaw={pred_yaw.shape[0]}, v={pred_v.shape[0]})")
         return None
 
-    # Alpamayo(y=LEFT) → openpilot(y=RIGHT) 변환
+    # Alpamayo(y=LEFT, yaw=CCW) → 내부(y=RIGHT, yaw=CW)
     ego_x =  pred_xyz[:, 0].astype(np.float64)
     ego_y = -pred_xyz[:, 1].astype(np.float64)
     ego_z =  pred_xyz[:, 2].astype(np.float64)
     ego_yaw = -pred_yaw.astype(np.float64)
-    # 경로의 모든 목표 속도를 고정값으로 덮어씀 (pred_v 무시)
-    path_v = np.full(pred_v.shape[0], TARGET_SPEED_MPS, dtype=np.float64)
-    a_ff = a.astype(np.float64)                       # feed-forward용 종가속 (ego-frame, t기반)
-    # Alpamayo(CCW>0) → openpilot(CW>0): 부호 반전
+    path_v = np.full(N, TARGET_SPEED_MPS, dtype=np.float64)  # 고정 속도로 덮어씀
+    a_ff = a.astype(np.float64)
     path_curv = c.astype(np.float64)
+
+    # 누적 arclength (보간/추종거리 계산에 사용, 단조 증가)
+    ds = np.hypot(np.diff(ego_x), np.diff(ego_y))
+    s = np.concatenate([[0.0], np.cumsum(ds)])
 
     return {
         'ego_x': ego_x, 'ego_y': ego_y, 'ego_z': ego_z,
-        'ego_yaw': ego_yaw, 'path_v': path_v,
-        'path_curv': path_curv,
-        'a_ff': a_ff, 'dt_s': dt_s, 'N': N,
+        'ego_yaw': ego_yaw,
+        'path_v': path_v, 'path_curv': path_curv, 'a_ff': a_ff,
+        's': s, 'dt_s': dt_s, 'N': N,
         'inference_time_s': inference_time_s,
     }
 
 
-# ── 좌표 변환: 수신시점 ego frame → LocalWorld 전역 frame ──
-def path_ego_to_world(pkt, anchor):
-    """pkt(수신시점 ego frame, x=fwd/y=right)를 anchor=(x0,y0,yaw0) 기준 LocalWorld 좌표로.
-    LocalWorld 는 NED(yaw CW from north, vy=device.right) 와 일관되게 적분되므로
-    body(forward, right) → world(north, east) 회전은 표준 NED 식을 그대로 사용:
-        north = forward*cos(yaw) - right*sin(yaw)
-        east  = forward*sin(yaw) + right*cos(yaw)
+# ── 보간 helper ──────────────────────────────────────
+def interp_path_at_s(pkt, s_query):
+    """path 위 arclength s_query 지점의 (x, y, tx_hat, ty_hat) 반환.
+    tx_hat, ty_hat: 단위 접선 벡터.
+    s_query 가 [0, s_max] 범위 밖이면 가장 가까운 끝점/끝접선으로 clamp.
     """
-    x0, y0, yaw0 = anchor
-    c0, s0 = math.cos(yaw0), math.sin(yaw0)
-    px = pkt['ego_x']
-    py = pkt['ego_y']      # right-positive
-    wx = x0 + c0 * px - s0 * py
-    wy = y0 + s0 * px + c0 * py
-    wyaw = yaw0 + (-pkt['ego_yaw'])  # LocalWorld CCW 가정에 맞춰 부호 반전
-    return {
-        'world_x': wx,                  # (N,)
-        'world_y': wy,
-        'world_z': pkt['ego_z'],
-        'world_yaw': wyaw,
-        'path_v': pkt['path_v'],
-        'path_curv': pkt['path_curv'],  # frame-invariant (스칼라 curvature)
-        'a_ff': pkt['a_ff'],
-        'N': pkt['N'],
-        'dt_s': pkt['dt_s'],
-    }
+    s_arr = pkt['s']
+    x_arr = pkt['ego_x']
+    y_arr = pkt['ego_y']
+    s_c = float(np.clip(s_query, s_arr[0], s_arr[-1]))
+    x = float(np.interp(s_c, s_arr, x_arr))
+    y = float(np.interp(s_c, s_arr, y_arr))
+    # 수치 미분 (작은 ds 양쪽)
+    ds = 0.1
+    s_lo = max(s_c - ds, s_arr[0])
+    s_hi = min(s_c + ds, s_arr[-1])
+    if s_hi - s_lo < 1e-6:
+        return x, y, 1.0, 0.0
+    dx = float(np.interp(s_hi, s_arr, x_arr) - np.interp(s_lo, s_arr, x_arr))
+    dy = float(np.interp(s_hi, s_arr, y_arr) - np.interp(s_lo, s_arr, y_arr))
+    norm = math.hypot(dx, dy)
+    if norm < 1e-6:
+        return x, y, 1.0, 0.0
+    return x, y, dx / norm, dy / norm
 
 
-def path_world_to_current_ego(stored, cur):
-    """저장된 world path를 현재 LocalWorld pose로 ego frame(x=fwd,y=right)에 재표현.
-    NED(yaw CW from north) → body(forward, right) 역회전:
-        forward = (north-dx)*cos(yaw) + (east-dy)*sin(yaw)
-        right   = -(north-dx)*sin(yaw) + (east-dy)*cos(yaw)
-    반환: dict with 'x','y','yaw','v' (각 길이 N, np.float64).
+# ── pure pursuit (arclength-based, path-tangent frame at s_now) ──
+def pure_pursuit_curvature(pkt, s_now):
+    """path 위 s_now 지점을 차량 위치+heading 으로 가정 (CTE/heading 오차 무시).
+    그 점의 path-tangent frame 에서 goal(= path 위 s_now+L_d) 의 lateral 로 κ 산출.
+
+    부호: 내부 y=RIGHT. lateral_right>0 → 우회전 →
+          openpilot LEFT-positive κ 컨벤션에서 κ<0 (부호 반전).
     """
-    _, xc, yc, yawc = cur
-    cc, sc = math.cos(yawc), math.sin(yawc)
-    dx = stored['world_x'] - xc
-    dy = stored['world_y'] - yc
-    px       =  cc * dx + sc * dy
-    py_right = -sc * dx + cc * dy
-    pyaw = -(stored['world_yaw'] - yawc)   # world_yaw→ego yaw (부호 규약 뒤집기)
-    return {
-        'x': px.astype(np.float64),
-        'y': py_right.astype(np.float64),
-        'yaw': pyaw.astype(np.float64),
-        'v': stored['path_v'].astype(np.float64),
-        'z': stored['world_z'].astype(np.float64),
-        'curv': stored['path_curv'].astype(np.float64),
-    }
-
-
-# ── arc-length 및 근사 함수 ──────────────────────────
-def path_arclengths(x, y):
-    """누적 arc-length (N,) 반환. 첫 값 0."""
-    dx = np.diff(x)
-    dy = np.diff(y)
-    ds = np.hypot(dx, dy)
-    return np.concatenate([[0.0], np.cumsum(ds)])
-
-
-def nearest_index_ahead(x, y):
-    """원점(차량 현재 위치) 기준으로 전방(x>0) 중 가장 가까운 점 idx.
-    전방에 점이 없으면 전체 중 가장 가까운 idx 반환.
-    """
-    ahead_mask = x > 0.0
-    if ahead_mask.any():
-        d2 = x * x + y * y
-        d2_masked = np.where(ahead_mask, d2, np.inf)
-        return int(np.argmin(d2_masked))
-    return int(np.argmin(x * x + y * y))
-
-
-# ── pure pursuit (lateral) ───────────────────────────
-def pure_pursuit_curvature(path_ego, v_ego, lat_delay):
-    """ego-frame path(x=fwd, y=right)에서 pure pursuit 으로 desired curvature 산출.
-
-    1) lat_delay 후 ego 가 도달할 (현재 ego frame 기준) 위치를 기준점으로 잡고
-    2) 그 기준점에서 look-ahead 거리(L_d) 떨어진 path 위 goal point 를 찾아
-    3) κ = -2*Δy / L_d² 로 계산.
-       부호: openpilot desiredCurvature 는 LEFT 양수 컨벤션
-       (latcontrol_torque.py: "TODO left is positive in this convention").
-       body y 는 RIGHT 양수이므로, goal 이 우측(y>0)이면 RIGHT 회전 → κ<0.
-
-    path 가 짧아 L_d 에 도달하지 못하면 path 의 마지막 점을 goal 로 사용.
-    """
-    x = path_ego['x']
-    y = path_ego['y']
-
-    # lat_delay 보상: ego 가 lat_delay 후 도달할 위치 (current ego frame)
-    x_ref = max(v_ego, 0.0) * max(lat_delay, 0.0)
-    y_ref = 0.0
-
-    # look-ahead 거리 (고정)
+    s_max = float(pkt['s'][-1])
     L_d = PP_LOOKAHEAD_M
+    s_goal = min(s_now + L_d, s_max)
 
-    # 기준점 기준 path 각 점까지의 거리
-    dx = x - x_ref
-    dy = y - y_ref
-    d = np.hypot(dx, dy)
+    x_h, y_h, tx, ty = interp_path_at_s(pkt, s_now)
+    x_g, y_g, _, _   = interp_path_at_s(pkt, s_goal)
 
-    # 기준점 앞쪽(dx>0)에서 d >= L_d 인 첫 점을 goal 로 (없으면 path 마지막 점)
-    fwd_mask = dx > 0.0
-    candidates = np.where(fwd_mask & (d >= L_d))[0]
-    if candidates.size > 0:
-        goal_idx = int(candidates[0])
-    elif fwd_mask.any():
-        # L_d 까지 닿는 점이 없음 → path 끝점 사용
-        goal_idx = int(np.where(fwd_mask)[0][-1])
-    else:
-        goal_idx = int(np.argmin(d))
+    Gx = x_g - x_h
+    Gy = y_g - y_h
 
-    L_d_eff = max(float(d[goal_idx]), 1e-3)
-    y_goal = float(y[goal_idx] - y_ref)
+    # (x_fwd, y_right) frame 에서 perp_right = R(+90° z_down) · T = (-Ty, Tx)
+    lateral_right = -ty * Gx + tx * Gy
+    L_d_eff = max(math.hypot(Gx, Gy), 1e-3)
 
-    kappa = -2.0 * y_goal / (L_d_eff * L_d_eff)   # LEFT-positive 컨벤션 맞춤
+    kappa = -2.0 * lateral_right / (L_d_eff * L_d_eff)
     kappa = float(np.clip(kappa, -PP_CURV_LIMIT, PP_CURV_LIMIT))
-    return kappa, goal_idx, L_d_eff
+    return kappa, s_goal, L_d_eff, lateral_right
 
 
-# ── longitudinal tracker ─────────────────────────────
-def longitudinal_accel(path_ego, v_ego, s_ref_total):
-    """고정 목표 속도(TARGET_SPEED_MPS)를 따라가도록 accel 산출.
-    path 끝까지 남은 거리가 STOP_DIST_M 이하이면 정지.
-    s_ref_total: 미사용 (시그니처 호환용).
-    """
-    x = path_ego['x']; y = path_ego['y']; v_path = path_ego['v']
-    i = nearest_index_ahead(x, y)
-    v_ref = float(v_path[i])          # path_v는 고정 10km/h로 덮인 상태
-
-    # path 끝까지 남은 거리
-    s = path_arclengths(x, y)
-    remaining = s[-1] - s[i]
-
+# ── longitudinal ─────────────────────────────────────
+def longitudinal_accel(pkt, s_now, v_ego):
+    """고정 목표속도 추종 + path 끝 도달 시 정지."""
+    s_max = float(pkt['s'][-1])
+    remaining = max(s_max - s_now, 0.0)
+    v_ref = TARGET_SPEED_MPS
     should_stop = False
-    if remaining < STOP_DIST_M:       # path 끝 도달 → 정지 (안전)
+    if remaining < STOP_DIST_M:
         v_ref = 0.0
         should_stop = True
-
     a_cmd = LON_KP * (v_ref - max(v_ego, 0.0))
-    if LON_USE_FEEDFORWARD:
-        a_cmd += float(path_ego.get('a_ff_at_nearest', 0.0))
     a_cmd = float(np.clip(a_cmd, ACCEL_MIN, ACCEL_MAX))
     return a_cmd, should_stop, v_ref, remaining
 
 
-# ── 경로 패킹 (현재 ego-frame path를 원본 해상도 그대로 메시지/표시용으로) ──
-def path_for_viz(path_ego, dt_src):
-    """path_ego(현재 ego frame)를 리샘플 없이 그대로 포장.
-    제어(pure pursuit)가 추종 대상으로 읽는 경로와 동일한 N점을 화면에 그대로 표시한다.
-    t는 path 자체의 시계열(dt_src 간격)을 사용 (T_IDXS 33점 리샘플 없음).
+# ── 현재 ego-frame 근사 path (modelV2.position 용) ──
+def slice_path_current_ego(pkt, s_now):
+    """s_now 이후 path 를 s_now 지점 path-tangent frame 에 표현.
+    원점=path[s_now], +x=접선, +y=접선 RIGHT.
     """
-    x = np.asarray(path_ego['x'], dtype=np.float32)
-    y = np.asarray(path_ego['y'], dtype=np.float32)
-    z = np.asarray(path_ego['z'], dtype=np.float32)
-    yaw = np.asarray(path_ego['yaw'], dtype=np.float32)
-    v = np.asarray(path_ego['v'], dtype=np.float32)
-    t = np.arange(len(x), dtype=np.float64) * dt_src
-    vx = (v * np.cos(yaw)).astype(np.float32)
-    vy = (v * np.sin(yaw)).astype(np.float32)
+    s_arr = pkt['s']
+    if s_now >= s_arr[-1]:
+        return default_path_viz()
+
+    i_start = int(np.searchsorted(s_arr, s_now, side='right'))
+    if i_start >= len(s_arr):
+        return default_path_viz()
+
+    x_h, y_h, tx, ty = interp_path_at_s(pkt, s_now)
+    tangent_angle = math.atan2(ty, tx)
+
+    # head 점(=차량 위치 추정) + 이후 원본 path 점들
+    xs_src = np.concatenate([[x_h], pkt['ego_x'][i_start:]]).astype(np.float64)
+    ys_src = np.concatenate([[y_h], pkt['ego_y'][i_start:]]).astype(np.float64)
+    z_at_h = float(np.interp(s_now, s_arr, pkt['ego_z']))
+    zs_src = np.concatenate([[z_at_h], pkt['ego_z'][i_start:]]).astype(np.float64)
+    yaws_src = np.concatenate([[tangent_angle], pkt['ego_yaw'][i_start:]]).astype(np.float64)
+    vs_src = np.concatenate([[TARGET_SPEED_MPS], pkt['path_v'][i_start:]]).astype(np.float64)
+
+    # path-tangent frame 으로 회전
+    dx = xs_src - x_h
+    dy = ys_src - y_h
+    x_curr =  tx * dx + ty * dy
+    y_curr = -ty * dx + tx * dy
+    z_curr = zs_src - z_at_h
+    yaw_curr = yaws_src - tangent_angle
+
+    n = len(x_curr)
+    t = np.arange(n, dtype=np.float64) * pkt['dt_s']
+    vx = (vs_src * np.cos(yaw_curr)).astype(np.float32)
+    vy = (vs_src * np.sin(yaw_curr)).astype(np.float32)
     return {
-        't': t, 'x': x, 'y': y, 'z': z,
-        'yaw': yaw, 'v': v,
+        't': t,
+        'x': x_curr.astype(np.float32),
+        'y': y_curr.astype(np.float32),
+        'z': z_curr.astype(np.float32),
+        'yaw': yaw_curr.astype(np.float32),
+        'v': vs_src.astype(np.float32),
         'vx': vx, 'vy': vy,
     }
 
@@ -308,15 +262,15 @@ def fill_xyzt(builder, t, x, y, z, x_std=None, y_std=None, z_std=None):
 
 def publish_messages(pm, rs, action, frame_id, v_ego):
     """modelV2 + drivingModelData + longitudinalPlan + driverAssistance 발행.
-    rs: path_for_viz 결과 (또는 default_path_viz) — path_ego 원본 해상도(N점).
+    rs: slice_path_current_ego 결과 (또는 default_path_viz).
     """
     now_ns = int(time.monotonic() * 1e9)
 
-    n = len(rs['x'])                       # path_ego 원본 점 개수
-    t_path = rs['t'].tolist()              # path 자체 시간축 (리샘플 없음)
+    n = len(rs['x'])
+    t_path = rs['t'].tolist()
     zeros_n = np.zeros(n, dtype=np.float32)
     low_std_n = np.full(n, 0.1, dtype=np.float32)
-    zeros_33 = np.zeros(IDX_N, dtype=np.float32)  # laneLines/roadEdges 더미용
+    zeros_33 = np.zeros(IDX_N, dtype=np.float32)
 
     # ── modelV2 ──
     modelv2_send = messaging.new_message('modelV2')
@@ -330,19 +284,13 @@ def publish_messages(pm, rs, action, frame_id, v_ego):
     mv2.timestampEof = now_ns
     mv2.modelExecutionTime = 0.0
 
-    # position — 제어(pure pursuit)가 읽는 path_ego 원본 점을 그대로
     fill_xyzt(mv2.position, t_path, rs['x'], rs['y'], rs['z'],
               x_std=low_std_n, y_std=low_std_n, z_std=low_std_n)
-    # velocity — pred_v_mps · cos/sin(pred_yaw)
     fill_xyzt(mv2.velocity, t_path, rs['vx'], rs['vy'], zeros_n)
-    # acceleration — 0
     fill_xyzt(mv2.acceleration, t_path, zeros_n, zeros_n, zeros_n)
-    # orientation (x=roll, y=pitch, z=yaw)
     fill_xyzt(mv2.orientation, t_path, zeros_n, zeros_n, rs['yaw'])
-    # orientationRate — 0
     fill_xyzt(mv2.orientationRate, t_path, zeros_n, zeros_n, zeros_n)
 
-    # action
     mv2.action = action
 
     # lane lines (4, dummy)
@@ -417,7 +365,6 @@ def publish_messages(pm, rs, action, frame_id, v_ego):
     dmd.modelExecutionTime = 0.0
     dmd.action = action
 
-    # path polynomial — path_ego 원본 점을 그 자체 시간축에 대해 폴리피팅
     deg = ModelConstants.POLY_PATH_DEGREE
     if n >= deg + 1:
         xyz = np.stack([rs['x'], rs['y'], rs['z']], axis=1)
@@ -430,7 +377,6 @@ def publish_messages(pm, rs, action, frame_id, v_ego):
         dmd.path.yCoefficients = [0.0] * (deg + 1)
         dmd.path.zCoefficients = [0.0] * (deg + 1)
 
-    # lane line meta
     dmd.laneLineMeta.leftY = -1.8
     dmd.laneLineMeta.leftProb = 0.0
     dmd.laneLineMeta.rightY = 1.8
@@ -454,7 +400,6 @@ def publish_messages(pm, rs, action, frame_id, v_ego):
     assist_send = messaging.new_message('driverAssistance')
     assist_send.valid = True
 
-    # ── send ──
     pm.send('modelV2', modelv2_send)
     pm.send('drivingModelData', dmd_send)
     pm.send('longitudinalPlan', plan_send)
@@ -462,31 +407,34 @@ def publish_messages(pm, rs, action, frame_id, v_ego):
 
 
 # ── viz 송신 ─────────────────────────────────────────
-def build_world_path(stored):
-    """stored(world frame)를 viz 렌더러가 기대하는 dict 리스트로 포장.
-    stored['world_x'/'world_y'/'world_yaw']는 이미 LocalWorld(LEFT/CCW) 좌표이므로
-    추가 변환 없이 그대로 직렬화만 수행. yaw는 [-π, π]로 wrap.
+def build_world_path(pkt, viz_anchor):
+    """packet 수신 시점 LocalWorld pose(viz_anchor=x0,y0,yaw0)를 *한 번* 사용해
+    pkt 의 ego frame path 를 world 좌표 list 로 변환 (viz only, drift 누적 없음).
+    body(forward, right) → world(north, east) 표준 NED 회전.
     """
-    xs = np.asarray(stored['world_x'], dtype=np.float64)
-    ys = np.asarray(stored['world_y'], dtype=np.float64)
-    yaws = np.asarray(stored['world_yaw'], dtype=np.float64)
-    yaws_wrapped = np.arctan2(np.sin(yaws), np.cos(yaws))
-    path_v = np.asarray(stored['path_v'], dtype=np.float64)
-    N = int(stored['N'])
+    x0, y0, yaw0 = viz_anchor
+    c0, s0 = math.cos(yaw0), math.sin(yaw0)
+    px = pkt['ego_x']
+    py = pkt['ego_y']
+    wx = x0 + c0 * px - s0 * py
+    wy = y0 + s0 * px + c0 * py
+    wyaw = yaw0 + (-pkt['ego_yaw'])
+    wyaw_wrapped = np.arctan2(np.sin(wyaw), np.cos(wyaw))
+    N = int(pkt['N'])
     out = []
     for i in range(N):
         out.append({
-            "x": float(xs[i]),
-            "y": float(ys[i]),
-            "yaw": float(yaws_wrapped[i]),
-            "vel": float(path_v[i]),
+            "x": float(wx[i]),
+            "y": float(wy[i]),
+            "yaw": float(wyaw_wrapped[i]),
+            "vel": float(pkt['path_v'][i]),
             "curvature": 0.0,
         })
     return out
 
 
 def send_vehicle_viz(viz_sock, world, lp, frame_id):
-    """LocalWorld 현재 pose + 6초 history를 viz(5006) 로 송신."""
+    """LocalWorld 현재 pose + 6초 history 를 viz(5006) 로 송신 (viz only)."""
     cur = world.current()
     if cur is None:
         return
@@ -531,13 +479,19 @@ def send_vehicle_viz(viz_sock, world, lp, frame_id):
             pass
 
 
-def send_pp_goal_viz(viz_sock, stored, i_goal, L_d_eff, frame_id):
-    """pure pursuit goal 점(현재 추종 대상)을 world 좌표로 viz(5006)로 송신."""
+def send_pp_goal_viz(viz_sock, pkt, viz_anchor, s_goal, L_d_eff, frame_id):
+    """pure pursuit goal 점(arclength s_goal)을 viz_anchor 기준 world 좌표로 viz(5006) 송신."""
+    if viz_anchor is None:
+        return
+    x_eg, y_eg, _, _ = interp_path_at_s(pkt, s_goal)
+    x0, y0, yaw0 = viz_anchor
+    c0, s0 = math.cos(yaw0), math.sin(yaw0)
+    wx = x0 + c0 * x_eg - s0 * y_eg
+    wy = y0 + s0 * x_eg + c0 * y_eg
     msg = {
         "type": "pp_goal",
-        "x": float(stored['world_x'][i_goal]),
-        "y": float(stored['world_y'][i_goal]),
-        "idx": int(i_goal),
+        "x": float(wx), "y": float(wy),
+        "idx": 0,
         "L_d": float(L_d_eff),
         "frame": int(frame_id),
     }
@@ -548,7 +502,7 @@ def send_pp_goal_viz(viz_sock, stored, i_goal, L_d_eff, frame_id):
 
 
 def send_world_path_viz(viz_sock, points, dt_s, seq):
-    """과거 anchor로 월드에 박힌 경로를 viz(5008) 로 송신."""
+    """viz_anchor 로 world 변환된 path 를 viz(5008) 로 송신 (viz only)."""
     msg = {
         "type": "trajectory_world",
         "seq": int(seq),
@@ -565,10 +519,10 @@ def send_world_path_viz(viz_sock, points, dt_s, seq):
 
 # ── main ──────────────────────────────────────────────
 def main():
-    cloudlog.warning("udp_bridge init (position-tracking mode)")
+    cloudlog.warning("udp_bridge init (arclength-based tracking)")
 
     pm = PubMaster(["modelV2", "drivingModelData", "longitudinalPlan", "driverAssistance"])
-    sm = SubMaster(["carState", "livePose", "liveDelay"])
+    sm = SubMaster(["carState", "livePose"])
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -579,128 +533,116 @@ def main():
     viz_sock.setblocking(False)
 
     cloudlog.warning(f"udp_bridge listening on port {UDP_PORT} (JSON ac_decoded_path)")
-    cloudlog.warning(f"udp_bridge viz publish: vehicle/trail→{VEHICLE_VIZ_PORT}, "
+    cloudlog.warning(f"udp_bridge viz publish: vehicle/trail/pp_goal→{VEHICLE_VIZ_PORT}, "
                      f"raw mirror→{LOCAL_PATH_VIZ_PORT}, worldFrame→{WORLD_PATH_VIZ_PORT}")
 
-    world = LocalWorld()
+    world = LocalWorld()         # viz only (vehicle trail)
     frame_id = 0
-    stored = None            # world 좌표 path
-    pending_pkt = None       # LocalWorld 초기화 대기 중인 ego-frame 패킷
+    stored = None                # 받은 packet (그 시점 ego frame)
+    s_now = 0.0                  # path 위 누적 진행거리 (m)
+    t_prev_tick = None
+    viz_anchor = None            # packet 받은 시점 LocalWorld pose snapshot (viz only)
     recv_count = 0
     log_counter = 0
-    prev_curvature = 0.0     # 저속 hold 및 smooth_value 용
+    prev_curvature = 0.0
 
     loop_period = 1.0 / ModelConstants.MODEL_RUN_FREQ  # 50ms = 20Hz
 
     while True:
         loop_start = time.monotonic()
 
-        # 1. UDP 패킷 수신 (non-blocking, 최신만 사용)
+        # 1. UDP 수신 (non-blocking, 최신 packet 만 유효 처리)
         try:
             while True:
                 data, _ = sock.recvfrom(RECV_BUF_SIZE)
                 pkt = parse_action_packet(data)
-                if pkt is not None:
-                    recv_count += 1
-                    pkt['recv_mono_ns'] = time.monotonic_ns()
-                    pending_pkt = pkt       # anchor 잡기 전까지 보관
-                    cloudlog.warning(f"udp_bridge: received plan #{recv_count} "
-                                     f"(N={pkt['N']}, dt={pkt['dt_s']:.3f}s, "
-                                     f"inference={pkt['inference_time_s']:.3f}s, {len(data)}B) — awaiting anchor")
-                    # raw mirror → viz (ego-frame 원본, trajectory_local)
-                    try:
-                        viz_sock.sendto(data, ('127.0.0.1', LOCAL_PATH_VIZ_PORT))
-                    except OSError:
-                        pass
+                if pkt is None:
+                    continue
+                recv_count += 1
+                v_ego_now = max(sm["carState"].vEgo, 0.0) if sm.alive["carState"] else 0.0
+                stored = pkt
+                # inference_time_s 동안 차가 path 따라 이미 진행한 거리만큼 s_now 초기화
+                s_now = v_ego_now * pkt['inference_time_s']
+                t_prev_tick = time.monotonic()
+                # viz only: LocalWorld pose 스냅샷 (있으면). 이후 갱신 없음.
+                viz_anchor = world.current()[1:] if world.is_initialized() else None
+                if viz_anchor is not None:
+                    world_points = build_world_path(pkt, viz_anchor)
+                    send_world_path_viz(viz_sock, world_points, pkt['dt_s'], recv_count)
+                cloudlog.warning(f"udp_bridge: pkt #{recv_count} "
+                                 f"N={pkt['N']} dt={pkt['dt_s']:.3f}s "
+                                 f"inference={pkt['inference_time_s']:.3f}s "
+                                 f"s_now_init={s_now:.2f}m path_len={pkt['s'][-1]:.1f}m "
+                                 f"({len(data)}B)")
+                # raw mirror → viz
+                try:
+                    viz_sock.sendto(data, ('127.0.0.1', LOCAL_PATH_VIZ_PORT))
+                except OSError:
+                    pass
         except BlockingIOError:
             pass
 
-        # 2. SubMaster 업데이트 + LocalWorld 적분
+        # 2. SubMaster 갱신 + LocalWorld 적분 (viz only)
         sm.update(0)
         if sm.updated["livePose"]:
             world.update(sm["livePose"], sm.logMonoTime["livePose"])
 
-        # 3. pending 패킷이 있고 LocalWorld 초기화되면 anchor 잡아 world frame으로 저장
-        #    inference_time_s 만큼 과거의 ego pose를 LocalWorld history에서 조회해 anchor로 사용
-        #    (path[0] = Alpamayo가 캡처한 시점의 ego 위치·방향에 맞물림)
-        if pending_pkt is not None and world.is_initialized():
-            inference_time_s = pending_pkt['inference_time_s']
-            #inference_time_s = 0.1
-            past_t_ns = pending_pkt['recv_mono_ns'] - int(inference_time_s * 1e9)
-            past = world.at(past_t_ns)       # 범위 밖이면 가장 가까운 끝점으로 clamp
-            anchor = (past[1], past[2], past[3])
-            stored = path_ego_to_world(pending_pkt, anchor)
-            clamped = (past[0] != past_t_ns)
-            cloudlog.warning(f"udp_bridge: anchor set at "
-                             f"x={anchor[0]:.2f} y={anchor[1]:.2f} yaw={math.degrees(anchor[2]):.1f}° "
-                             f"(inference={inference_time_s:.3f}s"
-                             f"{', CLAMPED' if clamped else ''})")
-            # world path viz → 5008 (anchor에 박힌 상태 그대로 1회 송신)
-            world_points = build_world_path(stored)
-            send_world_path_viz(viz_sock, world_points, pending_pkt['dt_s'], recv_count)
-            pending_pkt = None
-
         v_ego = max(sm["carState"].vEgo, 0.0)
 
-        # 4. tracker 실행
-        if stored is not None and world.is_initialized():
-            cur = world.current()
-            path_ego = path_world_to_current_ego(stored, cur)
+        # 3. tracker — arclength 기반
+        if stored is not None:
+            # v_ego 적분으로 s_now 전진
+            now = time.monotonic()
+            if t_prev_tick is not None:
+                dt = now - t_prev_tick
+                if 0.0 < dt < MAX_TICK_DT_S:
+                    s_now += v_ego * dt
+            t_prev_tick = now
 
-            # path 의 현재 위치 인덱스 (차 위치 기준 nearest-ahead, 로그/CTE 용)
-            i_now = nearest_index_ahead(path_ego['x'], path_ego['y'])
+            kappa_pp, s_goal, L_d_eff, lateral_right = pure_pursuit_curvature(stored, s_now)
 
-            # pure pursuit: path 에서 lookahead goal 잡아 직접 κ 계산
-            # lat_delay 보상은 ref point 를 v_ego*lat_delay 앞으로 옮겨서 처리
-            lat_delay = float(sm["liveDelay"].lateralDelay)
-            kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path_ego, v_ego, lat_delay)
-
-            # ── 후처리: smooth + 저속 hold ──
+            # smooth + 저속 hold
             if v_ego > MIN_LAT_CONTROL_SPEED:
                 kappa = smooth_value(kappa_pp, prev_curvature, LAT_SMOOTH_SECONDS)
             else:
                 kappa = prev_curvature
             prev_curvature = kappa
 
-            a_cmd, should_stop, v_ref, remaining = longitudinal_accel(
-                path_ego, v_ego, s_ref_total=None,
-            )
+            a_cmd, should_stop, v_ref, remaining = longitudinal_accel(stored, s_now, v_ego)
             action = log.ModelDataV2.Action(
                 desiredCurvature=float(kappa),
                 desiredAcceleration=float(a_cmd),
                 shouldStop=bool(should_stop),
             )
-            rs = path_for_viz(path_ego, stored['dt_s'])
+            rs = slice_path_current_ego(stored, s_now)
 
-            # pure pursuit 추종 대상 점을 viz 로 송신 (world 좌표)
-            send_pp_goal_viz(viz_sock, stored, i_goal, L_d_eff, frame_id)
+            send_pp_goal_viz(viz_sock, stored, viz_anchor, s_goal, L_d_eff, frame_id)
 
             log_counter += 1
-            if log_counter % 20 == 1:   # 1Hz 로그
-                cte = float(path_ego['y'][i_now])
-                # 모델이 원래 보내준 curvature (비교용, 사용 안 함)
-                kappa_model = float(path_ego['curv'][min(i_now, len(path_ego['curv']) - 1)])
+            if log_counter % 20 == 1:   # 1Hz
                 cloudlog.warning(
-                    f"track: v_ego={v_ego:.2f} v_ref={v_ref:.2f} cte={cte:+.2f}m "
-                    f"κ_pp={kappa:+.4f}(raw {kappa_pp:+.4f}) κ_model={kappa_model:+.4f} "
-                    f"a={a_cmd:+.2f} L_d={L_d_eff:.1f} i_now={i_now} i_goal={i_goal} "
-                    f"lat_delay={lat_delay:.3f} rem={remaining:.1f} stop={should_stop}"
+                    f"track: v_ego={v_ego:.2f} v_ref={v_ref:.2f} "
+                    f"s_now={s_now:.2f} s_goal={s_goal:.2f} rem={remaining:.1f} "
+                    f"lat_r={lateral_right:+.2f} "
+                    f"κ={kappa:+.4f}(raw {kappa_pp:+.4f}) a={a_cmd:+.2f} "
+                    f"L_d_eff={L_d_eff:.1f} stop={should_stop}"
                 )
         else:
             action = idle_action()
             rs = default_path_viz()
             prev_curvature = 0.0
+            t_prev_tick = time.monotonic()
 
-        # 5. 메시지 발행
+        # 4. 메시지 발행
         publish_messages(pm, rs, action, frame_id, v_ego)
 
-        # 6. viz 송신 — LocalWorld 현재 pose + 6초 trail (5006)
+        # 5. vehicle viz (LocalWorld trail, viz only)
         if world.is_initialized():
             send_vehicle_viz(viz_sock, world, sm["livePose"], frame_id)
 
         frame_id += 1
 
-        # 7. 20Hz 타이밍 유지
+        # 6. 20Hz 타이밍 유지
         elapsed = time.monotonic() - loop_start
         sleep_time = loop_period - elapsed
         if sleep_time > 0:
