@@ -436,20 +436,29 @@ def publish_messages(pm, rs, action, frame_id, v_ego):
 
 
 # ── viz 송신 ─────────────────────────────────────────
-def build_world_path(pkt, viz_anchor):
-    """packet 수신 시점 LocalWorld pose(viz_anchor=x0,y0,yaw0)를 *한 번* 사용해
+def build_world_path(pkt, viz_anchor, s_anchor):
+    """packet 수신 시점 LocalWorld pose(viz_anchor=x0,y0,yaw0)에 *path[s_anchor]* 를 박고
     pkt 의 ego frame path 를 world 좌표 list 로 변환 (viz only, drift 누적 없음).
+    s_anchor = packet 받은 순간 s_now (= v_ego·inference_time). 이 점이 실제 차 위치이므로
+    path[0] 이 아니라 path[s_anchor] 가 viz_anchor 에 정렬되어야 컨트롤과 viz 가 일치.
     body(forward, RIGHT) → world(north, east) NED 회전:
         north = forward*cos(yaw) - right*sin(yaw)
         east  = forward*sin(yaw) + right*cos(yaw)
     """
     x0, y0, yaw0 = viz_anchor
     c0, s0 = math.cos(yaw0), math.sin(yaw0)
+    x_h, y_h, tx, ty = interp_path_at_s(pkt, s_anchor)
+    tangent_angle = math.atan2(ty, tx)
     px = pkt['ego_x']
     py = pkt['ego_y']   # RIGHT positive
-    wx = x0 + c0 * px - s0 * py
-    wy = y0 + s0 * px + c0 * py
-    wyaw = yaw0 + pkt['ego_yaw']
+    dx = px - x_h
+    dy = py - y_h
+    # path[s_anchor] tangent frame: +x=tangent forward, +y=tangent RIGHT
+    x_local = tx * dx + ty * dy
+    y_local = -ty * dx + tx * dy
+    wx = x0 + c0 * x_local - s0 * y_local
+    wy = y0 + s0 * x_local + c0 * y_local
+    wyaw = yaw0 + (pkt['ego_yaw'] - tangent_angle)
     wyaw_wrapped = np.arctan2(np.sin(wyaw), np.cos(wyaw))
     N = int(pkt['N'])
     out = []
@@ -510,15 +519,22 @@ def send_vehicle_viz(viz_sock, world, lp, frame_id):
             pass
 
 
-def send_pp_goal_viz(viz_sock, pkt, viz_anchor, s_goal, L_d_eff, frame_id):
-    """pure pursuit goal 점(arclength s_goal)을 viz_anchor 기준 world 좌표로 viz(5006) 송신."""
+def send_pp_goal_viz(viz_sock, pkt, viz_anchor, s_anchor, s_goal, L_d_eff, frame_id):
+    """pure pursuit goal 점(arclength s_goal)을 viz_anchor 기준 world 좌표로 viz(5006) 송신.
+    viz_anchor 에는 path[s_anchor] 가 정렬되어 있다고 가정 (build_world_path 와 동일 규약).
+    """
     if viz_anchor is None:
         return
+    x_h, y_h, tx, ty = interp_path_at_s(pkt, s_anchor)
     x_eg, y_eg, _, _ = interp_path_at_s(pkt, s_goal)   # y_eg: RIGHT positive
+    dx = x_eg - x_h
+    dy = y_eg - y_h
+    x_local = tx * dx + ty * dy
+    y_local = -ty * dx + tx * dy
     x0, y0, yaw0 = viz_anchor
     c0, s0 = math.cos(yaw0), math.sin(yaw0)
-    wx = x0 + c0 * x_eg - s0 * y_eg
-    wy = y0 + s0 * x_eg + c0 * y_eg
+    wx = x0 + c0 * x_local - s0 * y_local
+    wy = y0 + s0 * x_local + c0 * y_local
     msg = {
         "type": "pp_goal",
         "x": float(wx), "y": float(wy),
@@ -571,6 +587,7 @@ def main():
     frame_id = 0
     stored = None                # 받은 packet (그 시점 ego frame)
     s_now = 0.0                  # path 위 누적 진행거리 (m)
+    s_anchor = 0.0               # packet 받은 시점 s_now 스냅샷 (viz 정렬용)
     t_prev_tick = None
     viz_anchor = None            # packet 받은 시점 LocalWorld pose snapshot (viz only)
     recv_count = 0
@@ -594,11 +611,12 @@ def main():
                 stored = pkt
                 # inference_time_s 동안 차가 path 따라 이미 진행한 거리만큼 s_now 초기화
                 s_now = v_ego_now * pkt['inference_time_s']
+                s_anchor = s_now   # viz_anchor 가 박힐 path 위 점 (이후 tick 에서도 고정)
                 t_prev_tick = time.monotonic()
                 # viz only: LocalWorld pose 스냅샷 (있으면). 이후 갱신 없음.
                 viz_anchor = world.current()[1:] if world.is_initialized() else None
                 if viz_anchor is not None:
-                    world_points = build_world_path(pkt, viz_anchor)
+                    world_points = build_world_path(pkt, viz_anchor, s_anchor)
                     send_world_path_viz(viz_sock, world_points, pkt['dt_s'], recv_count)
                 cloudlog.warning(f"udp_bridge: pkt #{recv_count} "
                                  f"N={pkt['N']} dt={pkt['dt_s']:.3f}s "
@@ -647,7 +665,7 @@ def main():
             )
             rs = slice_path_current_ego(stored, s_now)
 
-            send_pp_goal_viz(viz_sock, stored, viz_anchor, s_goal, L_d_eff, frame_id)
+            send_pp_goal_viz(viz_sock, stored, viz_anchor, s_anchor, s_goal, L_d_eff, frame_id)
 
             log_counter += 1
             if log_counter % 20 == 1:   # 1Hz
