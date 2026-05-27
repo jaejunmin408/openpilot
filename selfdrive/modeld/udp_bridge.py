@@ -72,34 +72,56 @@ def parse_action_packet(data: bytes):
         return None
 
     try:
-        ra = d['raw_action']
-        a = np.asarray(ra['accel_mps2'], dtype=np.float32)
-        c = np.asarray(ra['curvature'], dtype=np.float32)
-        dt_s = float(d.get('plan_dt_s', 0.1))
-        inference_time_s = float(d.get('inference_time_s', 0.0))
-
-        pred_xyz = np.asarray(d['pred_xyz'], dtype=np.float32)       # (N,3)
-        pred_yaw = np.asarray(d['pred_yaw_rad'], dtype=np.float32)   # (N,)
-        pred_v = np.asarray(d['pred_v_mps'], dtype=np.float32)       # (N,)
+        pred_xyz = np.asarray(d['pred_xyz'], dtype=np.float32)       # (N,3) 필수
     except (KeyError, TypeError, ValueError) as e:
         cloudlog.warning(f"udp_bridge: malformed packet ({e})")
         return None
 
-    N = len(a)
-    if N < 2 or len(c) != N or pred_xyz.shape[0] != N or pred_yaw.shape[0] != N or pred_v.shape[0] != N:
-        cloudlog.warning(f"udp_bridge: length mismatch (a={N}, c={len(c)}, "
-                         f"xyz={pred_xyz.shape[0]}, yaw={pred_yaw.shape[0]}, v={pred_v.shape[0]})")
+    # reference branch 와 동일: pred_xyz shape 만 검증
+    if pred_xyz.ndim != 2 or pred_xyz.shape[1] < 2 or pred_xyz.shape[0] < 2:
+        cloudlog.warning(f"udp_bridge: bad pred_xyz shape {pred_xyz.shape}")
         return None
+
+    N = pred_xyz.shape[0]
+
+    # 옵션 필드 — 없으면 default
+    dt_s = float(d.get('plan_dt_s', 0.1))
+    inference_time_s = float(d.get('inference_time_s', 0.0))
+
+    pred_yaw_raw = d.get('pred_yaw_rad')
+    if pred_yaw_raw is not None:
+        pred_yaw = np.asarray(pred_yaw_raw, dtype=np.float32)
+        if pred_yaw.shape[0] != N:
+            pred_yaw = np.zeros(N, dtype=np.float32)
+    else:
+        pred_yaw = np.zeros(N, dtype=np.float32)
+
+    ra = d.get('raw_action') or {}
+    a_raw = ra.get('accel_mps2')
+    if a_raw is not None:
+        a_arr = np.asarray(a_raw, dtype=np.float32)
+        if a_arr.shape[0] != N:
+            a_arr = np.zeros(N, dtype=np.float32)
+    else:
+        a_arr = np.zeros(N, dtype=np.float32)
+    c_raw = ra.get('curvature')
+    if c_raw is not None:
+        c_arr = np.asarray(c_raw, dtype=np.float32)
+        if c_arr.shape[0] != N:
+            c_arr = np.zeros(N, dtype=np.float32)
+    else:
+        c_arr = np.zeros(N, dtype=np.float32)
 
     # Alpamayo(y=LEFT, yaw=CCW) 그대로 내부에서도 LEFT/CCW 사용 (flip 없음).
     # openpilot desiredCurvature 가 LEFT-positive 이므로 일치, reference branch 와 동일.
     ego_x = pred_xyz[:, 0].astype(np.float64)
     ego_y = pred_xyz[:, 1].astype(np.float64)
-    ego_z = pred_xyz[:, 2].astype(np.float64)
+    ego_z = (pred_xyz[:, 2].astype(np.float64)
+             if pred_xyz.shape[1] >= 3 else np.zeros(N, dtype=np.float64))
     ego_yaw = pred_yaw.astype(np.float64)
     path_v = np.full(N, TARGET_SPEED_MPS, dtype=np.float64)  # 고정 속도로 덮어씀
-    a_ff = a.astype(np.float64)
-    path_curv = c.astype(np.float64)
+    a_ff = a_arr.astype(np.float64)
+    path_curv = c_arr.astype(np.float64)
 
     # 누적 arclength (보간/추종거리 계산에 사용, 단조 증가)
     ds = np.hypot(np.diff(ego_x), np.diff(ego_y))
