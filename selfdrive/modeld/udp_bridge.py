@@ -13,9 +13,15 @@ pure pursuit goal 은 path 위 arclength = s_now + L_d 지점.
   - 액추에이터 지연(lateralDelay) 은 controlsd 의 latcontrol_torque buffer 가 처리하므로
     udp_bridge 에서는 손대지 않음 (이중 보상 방지).
 
-부호 컨벤션 (reference branch 와 동일):
-  - Alpamayo(y=LEFT, yaw=CCW) 그대로 내부에서도 LEFT/CCW 유지 (parse 시 flip 없음).
-  - openpilot desiredCurvature 는 LEFT 양수 → 내부 y=LEFT 와 부호 일치 → κ = +2·lateral_left/L_d².
+부호 컨벤션:
+  - Alpamayo(y=LEFT, yaw=CCW) → 내부 ego(y=RIGHT, yaw=CW). parse 시 flip.
+  - 내부 y=RIGHT 는 openpilot device frame(camera.py:155 "y -> right",
+    laneLineMeta.rightY=+1.8) 과 일치.
+  - openpilot desiredCurvature 는 RIGHT 양수 컨벤션
+    (honda/carcontroller.py:142 "positive when steering right" + apply_torque =
+     -limited_torque ⇒ actuators.torque LEFT 양수, latcontrol_torque return =
+     -output_torque ⇒ setpoint = desired_curv*v² 가 RIGHT 양수).
+  - 표준 pure pursuit κ = +2·lateral_right/L_d² (별도 반전 없음).
 """
 import json
 import math
@@ -112,13 +118,13 @@ def parse_action_packet(data: bytes):
     else:
         c_arr = np.zeros(N, dtype=np.float32)
 
-    # Alpamayo(y=LEFT, yaw=CCW) 그대로 내부에서도 LEFT/CCW 사용 (flip 없음).
-    # openpilot desiredCurvature 가 LEFT-positive 이므로 일치, reference branch 와 동일.
-    ego_x = pred_xyz[:, 0].astype(np.float64)
-    ego_y = pred_xyz[:, 1].astype(np.float64)
+    # Alpamayo(y=LEFT, yaw=CCW) → 내부(y=RIGHT, yaw=CW). openpilot device frame
+    # 및 desiredCurvature(RIGHT 양수) 와 일치시키기 위해 부호 반전.
+    ego_x =  pred_xyz[:, 0].astype(np.float64)
+    ego_y = -pred_xyz[:, 1].astype(np.float64)
     ego_z = (pred_xyz[:, 2].astype(np.float64)
              if pred_xyz.shape[1] >= 3 else np.zeros(N, dtype=np.float64))
-    ego_yaw = pred_yaw.astype(np.float64)
+    ego_yaw = -pred_yaw.astype(np.float64)
     path_v = np.full(N, TARGET_SPEED_MPS, dtype=np.float64)  # 고정 속도로 덮어씀
     a_ff = a_arr.astype(np.float64)
     path_curv = c_arr.astype(np.float64)
@@ -167,8 +173,8 @@ def pure_pursuit_curvature(pkt, s_now):
     """path 위 s_now 지점을 차량 위치+heading 으로 가정 (CTE/heading 오차 무시).
     그 점의 path-tangent frame 에서 goal(= path 위 s_now+L_d) 의 lateral 로 κ 산출.
 
-    부호: 내부 y=LEFT, z=UP, 양의 회전=CCW. lateral_left>0 → 좌회전 →
-          openpilot LEFT-positive κ 와 부호 일치 (반전 없음).
+    부호: 내부 y=RIGHT, z=DOWN, 양의 회전=CW. lateral_right>0 → 우회전 →
+          openpilot RIGHT-positive κ 와 부호 일치 (반전 없음).
     """
     s_max = float(pkt['s'][-1])
     L_d = PP_LOOKAHEAD_M
@@ -180,13 +186,13 @@ def pure_pursuit_curvature(pkt, s_now):
     Gx = x_g - x_h
     Gy = y_g - y_h
 
-    # (x_fwd, y_left, z_up) frame 에서 perp_left = R(+90° z_up) · T = (-Ty, Tx)
-    lateral_left = -ty * Gx + tx * Gy
+    # (x_fwd, y_right, z_down) frame 에서 perp_right = R(+90° z_down) · T = (-Ty, Tx)
+    lateral_right = -ty * Gx + tx * Gy
     L_d_eff = max(math.hypot(Gx, Gy), 1e-3)
 
-    kappa = 2.0 * lateral_left / (L_d_eff * L_d_eff)
+    kappa = 2.0 * lateral_right / (L_d_eff * L_d_eff)
     kappa = float(np.clip(kappa, -PP_CURV_LIMIT, PP_CURV_LIMIT))
-    return kappa, s_goal, L_d_eff, lateral_left
+    return kappa, s_goal, L_d_eff, lateral_right
 
 
 # ── longitudinal ─────────────────────────────────────
@@ -207,7 +213,7 @@ def longitudinal_accel(pkt, s_now, v_ego):
 # ── 현재 ego-frame 근사 path (modelV2.position 용) ──
 def slice_path_current_ego(pkt, s_now):
     """s_now 이후 path 를 s_now 지점 path-tangent frame 에 표현.
-    원점=path[s_now], +x=접선, +y=접선 LEFT (z=UP, CCW positive).
+    원점=path[s_now], +x=접선, +y=접선 RIGHT (z=DOWN, CW positive).
     """
     s_arr = pkt['s']
     if s_now >= s_arr[-1]:
@@ -433,18 +439,17 @@ def publish_messages(pm, rs, action, frame_id, v_ego):
 def build_world_path(pkt, viz_anchor):
     """packet 수신 시점 LocalWorld pose(viz_anchor=x0,y0,yaw0)를 *한 번* 사용해
     pkt 의 ego frame path 를 world 좌표 list 로 변환 (viz only, drift 누적 없음).
-    body(forward, LEFT) → world(north, east) NED 회전:
-        north = forward*cos(yaw) + left*sin(yaw)
-        east  = forward*sin(yaw) - left*cos(yaw)
-    yaw: 내부 CCW → NED CW 로 부호 반전.
+    body(forward, RIGHT) → world(north, east) NED 회전:
+        north = forward*cos(yaw) - right*sin(yaw)
+        east  = forward*sin(yaw) + right*cos(yaw)
     """
     x0, y0, yaw0 = viz_anchor
     c0, s0 = math.cos(yaw0), math.sin(yaw0)
     px = pkt['ego_x']
-    py = pkt['ego_y']   # LEFT positive
-    wx = x0 + c0 * px + s0 * py
-    wy = y0 + s0 * px - c0 * py
-    wyaw = yaw0 - pkt['ego_yaw']
+    py = pkt['ego_y']   # RIGHT positive
+    wx = x0 + c0 * px - s0 * py
+    wy = y0 + s0 * px + c0 * py
+    wyaw = yaw0 + pkt['ego_yaw']
     wyaw_wrapped = np.arctan2(np.sin(wyaw), np.cos(wyaw))
     N = int(pkt['N'])
     out = []
@@ -509,11 +514,11 @@ def send_pp_goal_viz(viz_sock, pkt, viz_anchor, s_goal, L_d_eff, frame_id):
     """pure pursuit goal 점(arclength s_goal)을 viz_anchor 기준 world 좌표로 viz(5006) 송신."""
     if viz_anchor is None:
         return
-    x_eg, y_eg, _, _ = interp_path_at_s(pkt, s_goal)   # y_eg: LEFT positive
+    x_eg, y_eg, _, _ = interp_path_at_s(pkt, s_goal)   # y_eg: RIGHT positive
     x0, y0, yaw0 = viz_anchor
     c0, s0 = math.cos(yaw0), math.sin(yaw0)
-    wx = x0 + c0 * x_eg + s0 * y_eg
-    wy = y0 + s0 * x_eg - c0 * y_eg
+    wx = x0 + c0 * x_eg - s0 * y_eg
+    wy = y0 + s0 * x_eg + c0 * y_eg
     msg = {
         "type": "pp_goal",
         "x": float(wx), "y": float(wy),
@@ -625,7 +630,7 @@ def main():
                     s_now += v_ego * dt
             t_prev_tick = now
 
-            kappa_pp, s_goal, L_d_eff, lateral_left = pure_pursuit_curvature(stored, s_now)
+            kappa_pp, s_goal, L_d_eff, lateral_right = pure_pursuit_curvature(stored, s_now)
 
             # smooth + 저속 hold
             if v_ego > MIN_LAT_CONTROL_SPEED:
@@ -649,7 +654,7 @@ def main():
                 cloudlog.warning(
                     f"track: v_ego={v_ego:.2f} v_ref={v_ref:.2f} "
                     f"s_now={s_now:.2f} s_goal={s_goal:.2f} rem={remaining:.1f} "
-                    f"lat_l={lateral_left:+.2f} "
+                    f"lat_r={lateral_right:+.2f} "
                     f"κ={kappa:+.4f}(raw {kappa_pp:+.4f}) a={a_cmd:+.2f} "
                     f"L_d_eff={L_d_eff:.1f} stop={should_stop}"
                 )
