@@ -372,7 +372,7 @@ def main():
     cloudlog.warning("udp_bridge init (ref-path slice mode, target=15km/h)")
 
     pm = PubMaster(["modelV2", "drivingModelData", "longitudinalPlan", "driverAssistance"])
-    sm = SubMaster(["carState", "livePose"])
+    sm = SubMaster(["carState", "livePose", "selfdriveState"])
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -384,11 +384,7 @@ def main():
 
     cloudlog.warning(f"udp_bridge listening on port {UDP_PORT} (ref path slice JSON @ ~10Hz)")
     cloudlog.warning(f"udp_bridge viz: vehicle/trail→{VEHICLE_VIZ_PORT}, raw mirror→{LOCAL_PATH_VIZ_PORT}")
-
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    debug_log_path = f"{DEBUG_LOG_DIR}/udp_bridge_debug_{ts}.log"
-    debug_log = open(debug_log_path, "w", buffering=1)   # line-buffered
-    cloudlog.warning(f"udp_bridge debug log: {debug_log_path}")
+    cloudlog.warning(f"udp_bridge debug log: engage 시 {DEBUG_LOG_DIR}/udp_bridge_debug_*.log 생성")
 
     world = LocalWorld()        # viz only (vehicle trail)
     frame_id = 0
@@ -396,6 +392,10 @@ def main():
     recv_count = 0
     log_counter = 0
     prev_curvature = 0.0
+
+    # engage rising/falling edge 마다 debug log 파일을 새로 열고 닫음
+    debug_log = None
+    prev_engaged = False
 
     loop_period = 1.0 / ModelConstants.MODEL_RUN_FREQ  # 50ms = 20Hz
 
@@ -410,11 +410,12 @@ def main():
                 if pkt is not None:
                     recv_count += 1
                     path = pkt
-                    # 디버그 로그: 수신 path (내부 좌표계, y=left). 한 줄=한 path.
-                    debug_log.write(
-                        f"[t={time.monotonic():.3f}] PATH recv #{recv_count} N={pkt['N']} "
-                        f"pts={format_xy_points(pkt['x'], pkt['y'])}\n"
-                    )
+                    # 디버그 로그: 수신 path (내부 좌표계, y=left). 한 줄=한 path. engage 중에만.
+                    if debug_log is not None:
+                        debug_log.write(
+                            f"[t={time.monotonic():.3f}] PATH recv #{recv_count} N={pkt['N']} "
+                            f"pts={format_xy_points(pkt['x'], pkt['y'])}\n"
+                        )
                     # raw mirror → viz (ego-frame 원본)
                     try:
                         viz_sock.sendto(data, ('127.0.0.1', LOCAL_PATH_VIZ_PORT))
@@ -429,6 +430,19 @@ def main():
             world.update(sm["livePose"], sm.logMonoTime["livePose"])
 
         v_ego = max(sm["carState"].vEgo, 0.0)
+
+        # 2.5. engage edge 감지 → debug log 파일 open/close
+        engaged = bool(sm["selfdriveState"].enabled) if sm.alive["selfdriveState"] else False
+        if engaged and not prev_engaged:
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            debug_log_path = f"{DEBUG_LOG_DIR}/udp_bridge_debug_{ts}.log"
+            debug_log = open(debug_log_path, "w", buffering=1)   # line-buffered
+            cloudlog.warning(f"udp_bridge debug log OPEN (engage): {debug_log_path}")
+        elif (not engaged) and prev_engaged and debug_log is not None:
+            cloudlog.warning(f"udp_bridge debug log CLOSE (disengage): {debug_log.name}")
+            debug_log.close()
+            debug_log = None
+        prev_engaged = engaged
 
         # 3. tracker — 받은 ego-frame path 에 곧장 pure pursuit
         if path is not None:
@@ -448,13 +462,14 @@ def main():
             )
             rs = resample_for_viz(path)
 
-            # 디버그 로그: 매 20Hz loop curvature
-            debug_log.write(
-                f"[t={time.monotonic():.3f}] CURV frame={frame_id} v_ego={v_ego:.2f} "
-                f"raw={kappa_pp:+.4f} sm={kappa:+.4f} "
-                f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} "
-                f"cte={float(path['y'][0]):+.2f} pkts={recv_count}\n"
-            )
+            # 디버그 로그: 매 20Hz loop curvature, engage 중에만
+            if debug_log is not None:
+                debug_log.write(
+                    f"[t={time.monotonic():.3f}] CURV frame={frame_id} v_ego={v_ego:.2f} "
+                    f"raw={kappa_pp:+.4f} sm={kappa:+.4f} "
+                    f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} "
+                    f"cte={float(path['y'][0]):+.2f} pkts={recv_count}\n"
+                )
 
             log_counter += 1
             if log_counter % 20 == 1:   # 1Hz
