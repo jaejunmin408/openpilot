@@ -16,6 +16,7 @@ ego-frame JSON으로 보내준다.
 
 종방향은 TARGET_SPEED_MPS(=15 km/h) 유지 P 제어.
 """
+import datetime
 import json
 import socket
 import time
@@ -51,6 +52,15 @@ MIN_LAT_CONTROL_SPEED = 0.3          # 이 속도 이하에서는 직전 curvatu
 # ── pure pursuit 파라미터 ────────────────────────────
 PP_LOOKAHEAD_M = 5.0                 # 고정 look-ahead
 PP_CURV_LIMIT = 0.2
+
+# ── 디버그 로그 ──────────────────────────────────────
+DEBUG_LOG_DIR = "/tmp"
+
+
+def format_xy_points(x, y, prec=2):
+    """numpy array (x, y) → '[(x0,y0), (x1,y1), ...]' 사람이 읽는 문자열."""
+    fmt = f"%.{prec}f"
+    return "[" + ", ".join(f"({fmt % xi},{fmt % yi})" for xi, yi in zip(x, y)) + "]"
 
 
 # ── JSON 패킷 파싱 ───────────────────────────────────
@@ -375,6 +385,11 @@ def main():
     cloudlog.warning(f"udp_bridge listening on port {UDP_PORT} (ref path slice JSON @ ~10Hz)")
     cloudlog.warning(f"udp_bridge viz: vehicle/trail→{VEHICLE_VIZ_PORT}, raw mirror→{LOCAL_PATH_VIZ_PORT}")
 
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    debug_log_path = f"{DEBUG_LOG_DIR}/udp_bridge_debug_{ts}.log"
+    debug_log = open(debug_log_path, "w", buffering=1)   # line-buffered
+    cloudlog.warning(f"udp_bridge debug log: {debug_log_path}")
+
     world = LocalWorld()        # viz only (vehicle trail)
     frame_id = 0
     path = None
@@ -395,6 +410,11 @@ def main():
                 if pkt is not None:
                     recv_count += 1
                     path = pkt
+                    # 디버그 로그: 수신 path (내부 좌표계, y=left). 한 줄=한 path.
+                    debug_log.write(
+                        f"[t={time.monotonic():.3f}] PATH recv #{recv_count} N={pkt['N']} "
+                        f"pts={format_xy_points(pkt['x'], pkt['y'])}\n"
+                    )
                     # raw mirror → viz (ego-frame 원본)
                     try:
                         viz_sock.sendto(data, ('127.0.0.1', LOCAL_PATH_VIZ_PORT))
@@ -427,6 +447,14 @@ def main():
                 shouldStop=False,
             )
             rs = resample_for_viz(path)
+
+            # 디버그 로그: 매 20Hz loop curvature
+            debug_log.write(
+                f"[t={time.monotonic():.3f}] CURV frame={frame_id} v_ego={v_ego:.2f} "
+                f"raw={kappa_pp:+.4f} sm={kappa:+.4f} "
+                f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} "
+                f"cte={float(path['y'][0]):+.2f} pkts={recv_count}\n"
+            )
 
             log_counter += 1
             if log_counter % 20 == 1:   # 1Hz
