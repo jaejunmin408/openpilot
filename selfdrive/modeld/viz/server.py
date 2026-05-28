@@ -39,13 +39,19 @@ class State:
 
 clients: set = set()
 latest_by_type: dict[str, str] = {}
+world_path_history: list[str] = []   # 모든 world_path 누적 (새 클라이언트에 replay)
 
 
 # ── WebSocket ────────────────────────────────────────────────────────────────
 async def ws_handler(websocket):
   clients.add(websocket)
   try:
-    for msg in latest_by_type.values():
+    # 최신 vehicle/trail 상태 (각 type 1개씩) — world_path 빼고
+    for t, msg in latest_by_type.items():
+      if t != "world_path":
+        await websocket.send(msg)
+    # world_path 는 전체 history 를 순서대로 전송 → 클라이언트가 누적
+    for msg in world_path_history:
       await websocket.send(msg)
     async for _ in websocket:
       pass
@@ -138,22 +144,43 @@ class WorldPathProtocol(asyncio.DatagramProtocol):
     out_pts = []
     for p in pts:
       ox, oy = offset_xy(float(p.get("x", 0.0)), float(p.get("y", 0.0)))
-      out_pts.append({
-        "x": round(ox, 4),
-        "y": round(oy, 4),
-        "yaw": round(float(p.get("yaw", 0.0)), 5),
-        "vel": round(float(p.get("vel", 0.0)), 4),
-      })
+      out_pts.append({"x": round(ox, 4), "y": round(oy, 4)})
+
+    # ego frame 원본 (anchor 빼지 않음)
+    ego_pts = msg.get("ego_points", [])
+    out_ego = [
+      {"x": round(float(p.get("x", 0.0)), 4), "y": round(float(p.get("y", 0.0)), 4)}
+      for p in ego_pts
+    ]
+
+    # goal world frame 도 anchor 빼기
+    g_w = msg.get("goal_world", {})
+    g_wx, g_wy = offset_xy(float(g_w.get("x", 0.0)), float(g_w.get("y", 0.0)))
+    g_e = msg.get("goal_ego", {})
+
     State.world_path_count += 1
-    schedule_broadcast("world_path", {
+    payload = {
       "type": "world_path",
       "seq": int(msg.get("seq", State.world_path_count)),
       "num_points": len(out_pts),
       "dt_s": float(msg.get("dt_s", 0.0)),
       "points": out_pts,
-    })
+      "ego_points": out_ego,
+      "goal_world": {"x": round(g_wx, 4), "y": round(g_wy, 4)},
+      "goal_ego": {
+        "x": round(float(g_e.get("x", 0.0)), 4),
+        "y": round(float(g_e.get("y", 0.0)), 4),
+        "i": int(g_e.get("i", 0)),
+        "L_d_eff": round(float(g_e.get("L_d_eff", 0.0)), 4),
+      },
+      "kappa_raw": round(float(msg.get("kappa_raw", 0.0)), 6),
+    }
+    msg_str = json.dumps(payload)
+    world_path_history.append(msg_str)
+    if clients:
+      asyncio.ensure_future(asyncio.gather(*[c.send(msg_str) for c in clients], return_exceptions=True))
     print(f"[viz] world_path #{State.world_path_count} broadcast "
-          f"({len(out_pts)} pts, anchor at ({out_pts[0]['x']:+.2f}, {out_pts[0]['y']:+.2f}) from display origin)",
+          f"({len(out_pts)} pts, seq={payload['seq']}, κ={payload['kappa_raw']:+.4f})",
           file=sys.stderr)
 
 

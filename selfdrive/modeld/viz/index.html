@@ -45,18 +45,29 @@
   </div>
 
   <div class="section">
-    <h3>World path (anchored)</h3>
-    <div class="info-row"><span class="info-label">seq</span><span class="info-value" id="w-seq">-</span></div>
-    <div class="info-row"><span class="info-label">num_points</span><span class="info-value" id="w-np">-</span></div>
-    <div class="info-row"><span class="info-label">dt_s</span><span class="info-value" id="w-dt">-</span></div>
-    <div class="info-row"><span class="info-label">anchor x</span><span class="info-value" id="w-ax">-</span></div>
-    <div class="info-row"><span class="info-label">anchor y</span><span class="info-value" id="w-ay">-</span></div>
+    <h3>Paths (총 <span id="w-count">0</span>개)</h3>
+    <div class="info-row"><span class="info-label">latest seq</span><span class="info-value" id="w-seq">-</span></div>
+    <div id="w-help" style="font-size:10px;color:#777;margin-top:4px;">화면에서 path 클릭 → 상세</div>
+  </div>
+
+  <div class="section" id="sel-section" style="display:none;">
+    <h3>선택된 path</h3>
+    <div class="info-row"><span class="info-label">seq</span><span class="info-value" id="s-seq">-</span></div>
+    <div class="info-row"><span class="info-label">N points</span><span class="info-value" id="s-np">-</span></div>
+    <div class="info-row"><span class="info-label">goal i</span><span class="info-value" id="s-gi">-</span></div>
+    <div class="info-row"><span class="info-label">L_d_eff</span><span class="info-value" id="s-ld">-</span></div>
+    <div class="info-row"><span class="info-label">goal ego</span><span class="info-value" id="s-gego">-</span></div>
+    <div class="info-row"><span class="info-label">κ raw</span><span class="info-value" id="s-k">-</span></div>
+    <div style="margin-top:6px;font-size:10px;color:#999;">ego frame 좌표 (x, y):</div>
+    <div id="s-pts" style="margin-top:4px;font-size:10px;color:#bbb;max-height:240px;overflow-y:auto;white-space:pre;line-height:1.35;"></div>
+    <button id="s-close" style="margin-top:8px;width:100%;padding:4px;background:#0f3460;color:#eee;border:none;border-radius:3px;font-family:inherit;cursor:pointer;">닫기 (Esc)</button>
   </div>
 
   <div class="section">
     <h3>Legend</h3>
-    <div class="legend-entry"><span class="legend-swatch" style="background:rgba(255,209,102,0.85)"></span>받은 경로 (anchor 박힘)</div>
-    <div class="legend-entry"><span class="legend-dot" style="background:#ffd166"></span>anchor (path[0])</div>
+    <div class="legend-entry"><span class="legend-swatch" style="background:rgba(255,209,102,0.85)"></span>받은 경로 (최신 = 진함)</div>
+    <div class="legend-entry"><span class="legend-swatch" style="background:rgba(231,76,60,1)"></span>선택된 경로</div>
+    <div class="legend-entry"><span class="legend-dot" style="background:#ff4757"></span>pure pursuit goal</div>
     <div class="legend-entry"><span class="legend-swatch" style="background:repeating-linear-gradient(to right,rgba(6,214,160,0.7) 0 5px,transparent 5px 9px)"></span>차량 trail (6초)</div>
     <div class="legend-entry"><span class="legend-dot" style="background:#06d6a0"></span>현재 차량</div>
   </div>
@@ -64,7 +75,9 @@
   <div id="help">
     [F] camera follow on/off<br>
     [R] reset trail<br>
-    wheel: zoom
+    [C] clear all paths<br>
+    [Esc] close detail<br>
+    wheel: zoom · click path: 상세
   </div>
 </div>
 
@@ -75,9 +88,11 @@ const ctx = canvas.getContext('2d');
 // ── state ──
 let vehicle = null;
 let vehicleTrail = [];     // udp_bridge 의 6초 trail (덮어쓰기, accumulate 아님)
-let worldPath = null;       // anchor 박힌 받은 경로
+let worldPaths = [];        // 모든 받은 경로 누적
+let selectedSeq = null;     // 클릭으로 선택된 path seq
 let cameraFollow = true;
 let SCALE = 40;             // px/m
+const MAX_PATHS = 200;      // 너무 많아지면 오래된 것부터 drop
 
 // 좌표 규약 (LocalWorld, udp_bridge):
 //   x = north, y = east 와 비슷한 NED 적분. yaw 는 NED.z (북에서 시계방향).
@@ -94,6 +109,12 @@ window.addEventListener('resize', resize);
 window.addEventListener('keydown', (e) => {
   if (e.key === 'f' || e.key === 'F') { cameraFollow = !cameraFollow; draw(); }
   if (e.key === 'r' || e.key === 'R') { vehicleTrail = []; draw(); }
+  if (e.key === 'c' || e.key === 'C') { worldPaths = []; selectedSeq = null; hideSelected(); draw(); }
+  if (e.key === 'Escape') { selectedSeq = null; hideSelected(); draw(); }
+});
+
+document.getElementById('s-close').addEventListener('click', () => {
+  selectedSeq = null; hideSelected(); draw();
 });
 
 canvas.addEventListener('wheel', (e) => {
@@ -103,11 +124,34 @@ canvas.addEventListener('wheel', (e) => {
   draw();
 }, { passive: false });
 
+// 클릭으로 path 선택 — 마우스 위치에서 일정 픽셀 이내의 가장 가까운 path segment 찾기
+canvas.addEventListener('click', (e) => {
+  if (worldPaths.length === 0) return;
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  const cam = getCamera();
+  const HIT_PX = 12;
+  let bestSeq = null, bestD2 = HIT_PX * HIT_PX;
+  for (const p of worldPaths) {
+    for (const pt of p.points) {
+      const s = toScreen(pt.x, pt.y, cam, W, H);
+      const d2 = (s.sx - mx) ** 2 + (s.sy - my) ** 2;
+      if (d2 < bestD2) { bestD2 = d2; bestSeq = p.seq; }
+    }
+  }
+  if (bestSeq !== null) {
+    selectedSeq = bestSeq;
+    showSelected(worldPaths.find(p => p.seq === bestSeq));
+    draw();
+  }
+});
+
 function getCamera() {
   if (cameraFollow && vehicle) return { x: vehicle.x, y: vehicle.y };
-  if (worldPath && worldPath.points.length > 0) {
-    return { x: worldPath.points[0].x, y: worldPath.points[0].y };
-  }
+  const last = worldPaths[worldPaths.length - 1];
+  if (last && last.points.length > 0) return { x: last.points[0].x, y: last.points[0].y };
   return { x: 0, y: 0 };
 }
 
@@ -128,35 +172,47 @@ function draw() {
   const cam = getCamera();
   drawGrid(W, H, cam);
 
-  // 1. world path (anchor 박힘) — 노란 실선 + 점, 가장 아래 layer
-  if (worldPath && worldPath.points.length > 1) {
-    const pts = worldPath.points;
+  // 1. world paths (모두 누적) — 오래된 것 흐리게, 최신 진하게. 선택된 건 빨강.
+  const N = worldPaths.length;
+  for (let pi = 0; pi < N; pi++) {
+    const p = worldPaths[pi];
+    if (!p.points || p.points.length < 2) continue;
+    const isSelected = (p.seq === selectedSeq);
+    // 오래된 path 일수록 alpha 낮춤 (최신 = 0.85, 옛것 = 0.15)
+    const ageRatio = N <= 1 ? 1 : pi / (N - 1);
+    const alpha = isSelected ? 1.0 : (0.15 + 0.7 * ageRatio);
+    const stroke = isSelected ? `rgba(231,76,60,${alpha})` : `rgba(255,209,102,${alpha})`;
+    const lw = isSelected ? 3 : (pi === N - 1 ? 2 : 1);
+
     ctx.beginPath();
-    const s0 = toScreen(pts[0].x, pts[0].y, cam, W, H);
+    const s0 = toScreen(p.points[0].x, p.points[0].y, cam, W, H);
     ctx.moveTo(s0.sx, s0.sy);
-    for (let i = 1; i < pts.length; i++) {
-      const s = toScreen(pts[i].x, pts[i].y, cam, W, H);
+    for (let i = 1; i < p.points.length; i++) {
+      const s = toScreen(p.points[i].x, p.points[i].y, cam, W, H);
       ctx.lineTo(s.sx, s.sy);
     }
-    ctx.strokeStyle = 'rgba(255,209,102,0.85)';
-    ctx.lineWidth = 2;
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = lw;
     ctx.stroke();
 
-    // path 점들
-    ctx.fillStyle = 'rgba(255,209,102,0.45)';
-    for (let i = 0; i < pts.length; i++) {
-      const s = toScreen(pts[i].x, pts[i].y, cam, W, H);
-      ctx.beginPath(); ctx.arc(s.sx, s.sy, 1.8, 0, Math.PI * 2); ctx.fill();
+    // 선택된 path 만 점들 + goal marker
+    if (isSelected) {
+      ctx.fillStyle = 'rgba(231,76,60,0.55)';
+      for (const pt of p.points) {
+        const s = toScreen(pt.x, pt.y, cam, W, H);
+        ctx.beginPath(); ctx.arc(s.sx, s.sy, 2.4, 0, Math.PI * 2); ctx.fill();
+      }
+      // goal marker
+      if (p.goal_world) {
+        const g = toScreen(p.goal_world.x, p.goal_world.y, cam, W, H);
+        ctx.fillStyle = '#ff4757';
+        ctx.beginPath(); ctx.arc(g.sx, g.sy, 7, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(g.sx, g.sy, 11, 0, Math.PI * 2); ctx.stroke();
+        ctx.fillStyle = '#ff4757'; ctx.font = 'bold 11px Consolas';
+        ctx.fillText(`goal κ=${p.kappa_raw.toFixed(4)}`, g.sx + 14, g.sy - 8);
+      }
     }
-
-    // anchor marker (path[0]) — 큰 노란 dot + ring
-    const sa = toScreen(pts[0].x, pts[0].y, cam, W, H);
-    ctx.fillStyle = '#ffd166';
-    ctx.beginPath(); ctx.arc(sa.sx, sa.sy, 6, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
-    ctx.beginPath(); ctx.arc(sa.sx, sa.sy, 10, 0, Math.PI * 2); ctx.stroke();
-    ctx.fillStyle = '#ffd166'; ctx.font = 'bold 11px Consolas';
-    ctx.fillText('anchor', sa.sx + 14, sa.sy - 8);
   }
 
   // 2. vehicle trail — 초록 점선
@@ -278,14 +334,34 @@ function updateVehiclePanel(v) {
   setText('v-frm', String(v.frame));
 }
 
-function updateWorldPathPanel(w) {
-  setText('w-seq', String(w.seq));
-  setText('w-np', String(w.num_points));
-  setText('w-dt', w.dt_s.toFixed(3) + ' s');
-  if (w.points && w.points.length > 0) {
-    setText('w-ax', w.points[0].x.toFixed(2));
-    setText('w-ay', w.points[0].y.toFixed(2));
+function updateWorldPathPanel() {
+  setText('w-count', String(worldPaths.length));
+  const last = worldPaths[worldPaths.length - 1];
+  setText('w-seq', last ? String(last.seq) : '-');
+}
+
+function showSelected(p) {
+  if (!p) return;
+  document.getElementById('sel-section').style.display = '';
+  setText('s-seq', String(p.seq));
+  setText('s-np', String(p.num_points));
+  setText('s-gi', p.goal_ego ? String(p.goal_ego.i) : '-');
+  setText('s-ld', p.goal_ego ? p.goal_ego.L_d_eff.toFixed(2) + ' m' : '-');
+  setText('s-gego', p.goal_ego ? `(${p.goal_ego.x.toFixed(2)}, ${p.goal_ego.y.toFixed(2)})` : '-');
+  setText('s-k', p.kappa_raw.toFixed(4));
+  // ego frame 좌표 목록
+  const ptsBox = document.getElementById('s-pts');
+  if (p.ego_points && p.ego_points.length) {
+    ptsBox.textContent = p.ego_points.map((pt, i) =>
+      `[${String(i).padStart(2,' ')}] (${pt.x.toFixed(2).padStart(7,' ')}, ${pt.y.toFixed(2).padStart(7,' ')})`
+    ).join('\n');
+  } else {
+    ptsBox.textContent = '(no ego_points)';
   }
+}
+
+function hideSelected() {
+  document.getElementById('sel-section').style.display = 'none';
 }
 
 // ── WebSocket ──
@@ -317,8 +393,11 @@ function connect() {
     }
 
     if (data.type === 'world_path') {
-      worldPath = data;
-      updateWorldPathPanel(data);
+      worldPaths.push(data);
+      if (worldPaths.length > MAX_PATHS) worldPaths.shift();
+      updateWorldPathPanel();
+      // 현재 선택된 path 가 새로 도착한 경우 패널 갱신
+      if (selectedSeq !== null && data.seq === selectedSeq) showSelected(data);
       draw();
       return;
     }

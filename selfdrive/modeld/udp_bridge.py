@@ -18,6 +18,7 @@ ego-frame JSON으로 보내준다.
 """
 import datetime
 import json
+import math
 import socket
 import time
 import numpy as np
@@ -35,6 +36,7 @@ from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 UDP_PORT = 5005
 LOCAL_PATH_VIZ_PORT = 5007   # 수신한 ref path slice를 ego-frame viz로 미러
 VEHICLE_VIZ_PORT = 5006      # LocalWorld 현재 pose + 6초 trail (viz only)
+WORLD_PATH_VIZ_PORT = 5008   # 수신 path 를 LocalWorld 기준 world frame 으로 변환해 송신 (viz only)
 RECV_BUF_SIZE = 65535
 
 T_IDXS = np.array(ModelConstants.T_IDXS, dtype=np.float64)
@@ -320,6 +322,62 @@ def publish_messages(pm, rs, action, frame_id, v_ego):
     pm.send('driverAssistance', assist_send)
 
 
+# ── viz 송신 (수신 path 를 world frame 으로 변환) ─────
+def ego_to_world(x_ego, y_ego, viz_anchor):
+    """ego-frame (x=fwd, y=LEFT) → world frame (NED). viz_anchor=(x0,y0,yaw0)."""
+    x0, y0, yaw0 = viz_anchor
+    c0, s0 = math.cos(yaw0), math.sin(yaw0)
+    wx = x0 + c0 * x_ego + s0 * y_ego
+    wy = y0 + s0 * x_ego - c0 * y_ego
+    return wx, wy
+
+
+def build_world_path(path_ego, viz_anchor):
+    """수신 ego-frame path → world frame 점 list."""
+    px = path_ego['x']
+    py = path_ego['y']
+    wx, wy = ego_to_world(px, py, viz_anchor)
+    return [{"x": float(wx[i]), "y": float(wy[i])} for i in range(len(px))]
+
+
+def send_world_path_viz(viz_sock, path_ego, viz_anchor, seq,
+                         goal_ego_xy, i_goal, L_d_eff, kappa_raw):
+    """확장된 trajectory_world 송신: world path + ego path + goal point + kappa.
+
+    points       : world frame (server 가 display_anchor 빼서 전달)
+    ego_points   : 원본 ego frame 좌표 (debug panel 용)
+    goal_world   : world frame goal (server 가 anchor 빼서 전달)
+    goal_ego     : ego frame goal + 부가 정보
+    kappa_raw    : pure pursuit raw 결과 (smooth 전)
+    """
+    world_pts = build_world_path(path_ego, viz_anchor)
+    gx, gy = ego_to_world(np.float64(goal_ego_xy[0]), np.float64(goal_ego_xy[1]), viz_anchor)
+    ego_pts = [
+        {"x": float(path_ego['x'][i]), "y": float(path_ego['y'][i])}
+        for i in range(len(path_ego['x']))
+    ]
+    msg = {
+        "type": "trajectory_world",
+        "seq": int(seq),
+        "num_points": len(world_pts),
+        "dt_s": 0.0,
+        "points": world_pts,
+        "ego_points": ego_pts,
+        "goal_world": {"x": float(gx), "y": float(gy)},
+        "goal_ego": {
+            "x": float(goal_ego_xy[0]),
+            "y": float(goal_ego_xy[1]),
+            "i": int(i_goal),
+            "L_d_eff": float(L_d_eff),
+        },
+        "kappa_raw": float(kappa_raw),
+    }
+    try:
+        viz_sock.sendto(json.dumps(msg).encode(), ("127.0.0.1", WORLD_PATH_VIZ_PORT))
+    except OSError:
+        pass
+
+
 # ── viz 송신 (vehicle trail) ─────────────────────────
 def send_vehicle_viz(viz_sock, world, lp, frame_id):
     """LocalWorld 현재 pose + 6초 history를 viz(5006) 로 송신 (viz only)."""
@@ -383,7 +441,8 @@ def main():
     viz_sock.setblocking(False)
 
     cloudlog.warning(f"udp_bridge listening on port {UDP_PORT} (ref path slice JSON @ ~10Hz)")
-    cloudlog.warning(f"udp_bridge viz: vehicle/trail→{VEHICLE_VIZ_PORT}, raw mirror→{LOCAL_PATH_VIZ_PORT}")
+    cloudlog.warning(f"udp_bridge viz: vehicle/trail→{VEHICLE_VIZ_PORT}, raw mirror→{LOCAL_PATH_VIZ_PORT}, "
+                     f"world path→{WORLD_PATH_VIZ_PORT}")
     cloudlog.warning(f"udp_bridge debug log: engage 시 {DEBUG_LOG_DIR}/udp_bridge_debug_*.log 생성")
 
     world = LocalWorld()        # viz only (vehicle trail)
@@ -421,6 +480,15 @@ def main():
                         viz_sock.sendto(data, ('127.0.0.1', LOCAL_PATH_VIZ_PORT))
                     except OSError:
                         pass
+                    # 패킷 도착 시점 pure pursuit 1회 → goal + raw kappa snapshot
+                    v_ego_now = max(sm["carState"].vEgo, 0.0) if sm.alive["carState"] else 0.0
+                    kappa_pp_pkt, i_goal_pkt, L_d_eff_pkt = pure_pursuit_curvature(pkt, v_ego_now)
+                    goal_xy = (float(pkt['x'][i_goal_pkt]), float(pkt['y'][i_goal_pkt]))
+                    # world frame 변환 → viz(5008) (LocalWorld init 되어 있을 때만)
+                    if world.is_initialized():
+                        _, x0, y0, yaw0 = world.current()
+                        send_world_path_viz(viz_sock, pkt, (x0, y0, yaw0), recv_count,
+                                            goal_xy, i_goal_pkt, L_d_eff_pkt, kappa_pp_pkt)
         except BlockingIOError:
             pass
 
