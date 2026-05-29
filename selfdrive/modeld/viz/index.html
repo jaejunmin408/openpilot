@@ -346,14 +346,14 @@ function showSelected(p) {
   setText('s-seq', String(p.seq));
   setText('s-np', String(p.num_points));
   setText('s-gi', p.goal_ego ? String(p.goal_ego.i) : '-');
-  setText('s-ld', p.goal_ego ? p.goal_ego.L_d_eff.toFixed(2) + ' m' : '-');
-  setText('s-gego', p.goal_ego ? `(${p.goal_ego.x.toFixed(2)}, ${p.goal_ego.y.toFixed(2)})` : '-');
+  setText('s-ld', p.goal_ego ? p.goal_ego.L_d_eff.toFixed(4) + ' m' : '-');
+  setText('s-gego', p.goal_ego ? `(${p.goal_ego.x.toFixed(4)}, ${p.goal_ego.y.toFixed(4)})` : '-');
   setText('s-k', p.kappa_raw.toFixed(4));
   // ego frame 좌표 목록
   const ptsBox = document.getElementById('s-pts');
   if (p.ego_points && p.ego_points.length) {
     ptsBox.textContent = p.ego_points.map((pt, i) =>
-      `[${String(i).padStart(2,' ')}] (${pt.x.toFixed(2).padStart(7,' ')}, ${pt.y.toFixed(2).padStart(7,' ')})`
+      `[${String(i).padStart(2,' ')}] (${pt.x.toFixed(4).padStart(9,' ')}, ${pt.y.toFixed(4).padStart(9,' ')})`
     ).join('\n');
   } else {
     ptsBox.textContent = '(no ego_points)';
