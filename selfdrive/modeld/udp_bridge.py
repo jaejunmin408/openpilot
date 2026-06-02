@@ -17,8 +17,10 @@ ego-frame JSON으로 보내준다.
 종방향은 TARGET_SPEED_MPS(=15 km/h) 유지 P 제어.
 """
 import datetime
+import csv
 import json
 import math
+import os
 import socket
 import time
 import numpy as np
@@ -57,12 +59,74 @@ PP_CURV_LIMIT = 0.2
 
 # ── 디버그 로그 ──────────────────────────────────────
 DEBUG_LOG_DIR = "/tmp"
+DIAG_LOG_DIR = os.environ.get("UDP_BRIDGE_DIAG_LOG_DIR", DEBUG_LOG_DIR)
+DIAG_LD_VALUES_M = tuple(
+    sorted(
+        {
+            PP_LOOKAHEAD_M,
+            10.0,
+            *(
+                float(token)
+                for token in os.environ.get("UDP_BRIDGE_DIAG_LDS_M", "").split(",")
+                if token.strip()
+            ),
+        }
+    )
+)
+DIAG_CONTROL_EVERY_N = max(1, int(os.environ.get("UDP_BRIDGE_DIAG_CONTROL_EVERY_N", "1")))
 
 
 def format_xy_points(x, y, prec=2):
     """numpy array (x, y) → '[(x0,y0), (x1,y1), ...]' 사람이 읽는 문자열."""
     fmt = f"%.{prec}f"
     return "[" + ", ".join(f"({fmt % xi},{fmt % yi})" for xi, yi in zip(x, y)) + "]"
+
+
+def _as_int_or_none(value):
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float_or_none(value):
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _packet_meta(d):
+    header = d.get("packet_header") if isinstance(d.get("packet_header"), dict) else {}
+    direct_header = d.get("header") if isinstance(d.get("header"), dict) else {}
+    if direct_header:
+        header = {**direct_header, **header}
+
+    t0_utc_ns = _as_int_or_none(d.get("t0_utc_ns"))
+    source_t0_us = _as_int_or_none(d.get("t0_us"))
+    if source_t0_us is None and t0_utc_ns is not None:
+        source_t0_us = t0_utc_ns // 1000
+    if source_t0_us is None:
+        source_t0_us = _as_int_or_none(header.get("source_t0_us"))
+
+    return {
+        "udp_mode": d.get("udp_mode"),
+        "label": d.get("label"),
+        "clip_id": d.get("clip_id"),
+        "sample_id": _as_int_or_none(d.get("sample_id", header.get("sample_id"))),
+        "plan_seq": _as_int_or_none(d.get("front_frame_id", header.get("plan_seq"))),
+        "tx_seq": _as_int_or_none(header.get("tx_seq")),
+        "source_t0_us": source_t0_us,
+        "tx_time_us": _as_int_or_none(header.get("tx_time_us")),
+        "payload_actual_offset_s": _as_float_or_none(d.get("actual_offset_s", d.get("target_offset_s"))),
+        "inference_time_s": _as_float_or_none(d.get("inference_time_s")),
+        "coord_note": d.get("coordinate_note"),
+        "packet_header": header,
+    }
 
 
 # ── JSON 패킷 파싱 ───────────────────────────────────
@@ -76,6 +140,9 @@ def parse_path_packet(data: bytes):
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
         cloudlog.warning(f"udp_bridge: invalid JSON ({e})")
         return None
+    if not isinstance(d, dict):
+        cloudlog.warning(f"udp_bridge: invalid JSON root type {type(d).__name__}")
+        return None
 
     try:
         pred_xyz = np.asarray(d['pred_xyz'], dtype=np.float64)
@@ -88,13 +155,20 @@ def parse_path_packet(data: bytes):
         return None
 
     x = pred_xyz[:, 0]
-    y = -pred_xyz[:, 1]   # 수신 y=right(+) → 내부 y=left(+) (openpilot 규약)
+    raw_y = pred_xyz[:, 1]
+    y = -raw_y   # 수신 y=right(+) → 내부 y=left(+) (openpilot 규약)
 
-    return {'x': x, 'y': y, 'N': int(x.shape[0])}
+    return {
+        'x': x,
+        'y': y,
+        'raw_y': raw_y,
+        'N': int(x.shape[0]),
+        'meta': _packet_meta(d),
+    }
 
 
 # ── pure pursuit (lateral) ───────────────────────────
-def pure_pursuit_curvature(path_ego, v_ego):
+def pure_pursuit_curvature(path_ego, v_ego, lookahead_m=None):
     """ego-frame path(x=fwd, y=left)에서 pure pursuit 으로 desired curvature 산출.
 
     1) ego (0,0) 을 기준점으로
@@ -105,7 +179,7 @@ def pure_pursuit_curvature(path_ego, v_ego):
     x = path_ego['x']
     y = path_ego['y']
 
-    L_d = PP_LOOKAHEAD_M
+    L_d = float(PP_LOOKAHEAD_M if lookahead_m is None else lookahead_m)
 
     d = np.hypot(x, y)
 
@@ -124,6 +198,150 @@ def pure_pursuit_curvature(path_ego, v_ego):
     kappa = 2.0 * y_goal / (L_d_eff * L_d_eff)
     kappa = float(np.clip(kappa, -PP_CURV_LIMIT, PP_CURV_LIMIT))
     return kappa, goal_idx, L_d_eff
+
+
+def _safe_float(value):
+    if value is None:
+        return ""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(value):
+        return ""
+    return value
+
+
+def _packet_age_s_from_us(now_wall_us, timestamp_us):
+    timestamp_us = _as_int_or_none(timestamp_us)
+    if timestamp_us is None:
+        return None
+    return (int(now_wall_us) - timestamp_us) / 1_000_000.0
+
+
+def _path_shape_metrics(path_ego):
+    y = np.asarray(path_ego["y"], dtype=np.float64)
+    raw_y = np.asarray(path_ego.get("raw_y", y), dtype=np.float64)
+    x = np.asarray(path_ego["x"], dtype=np.float64)
+    dy = np.diff(y)
+    d2y = np.diff(y, n=2)
+    return {
+        "first_x_m": float(x[0]) if x.size else None,
+        "first_y_m": float(y[0]) if y.size else None,
+        "first_raw_y_m": float(raw_y[0]) if raw_y.size else None,
+        "last_x_m": float(x[-1]) if x.size else None,
+        "last_y_m": float(y[-1]) if y.size else None,
+        "mean_y_m": float(np.mean(y)) if y.size else None,
+        "std_y_m": float(np.std(y)) if y.size else None,
+        "max_abs_y_m": float(np.max(np.abs(y))) if y.size else None,
+        "dy_step_rms_m": float(np.sqrt(np.mean(dy * dy))) if dy.size else None,
+        "d2y_step_rms_m": float(np.sqrt(np.mean(d2y * d2y))) if d2y.size else None,
+    }
+
+
+def build_path_diag_row(path_ego, *, event, recv_count, frame_id, v_ego, kappa_smoothed,
+                        prev_goal_y_by_ld, now_wall_us, now_mono_s):
+    meta = dict(path_ego.get("meta") or {})
+    row = {
+        "event": event,
+        "monotonic_s": now_mono_s,
+        "wall_unix_s": now_wall_us / 1_000_000.0,
+        "frame_id": int(frame_id),
+        "recv_count": int(recv_count),
+        "N": int(path_ego.get("N", len(path_ego.get("x", [])))),
+        "v_ego_mps": _safe_float(v_ego),
+        "kappa_smoothed": _safe_float(kappa_smoothed),
+        "udp_mode": meta.get("udp_mode") or "",
+        "label": meta.get("label") or "",
+        "clip_id": meta.get("clip_id") or "",
+        "sample_id": "" if meta.get("sample_id") is None else int(meta.get("sample_id")),
+        "plan_seq": "" if meta.get("plan_seq") is None else int(meta.get("plan_seq")),
+        "tx_seq": "" if meta.get("tx_seq") is None else int(meta.get("tx_seq")),
+        "source_t0_us": "" if meta.get("source_t0_us") is None else int(meta.get("source_t0_us")),
+        "tx_time_us": "" if meta.get("tx_time_us") is None else int(meta.get("tx_time_us")),
+        "source_age_s": _safe_float(_packet_age_s_from_us(now_wall_us, meta.get("source_t0_us"))),
+        "tx_age_s": _safe_float(_packet_age_s_from_us(now_wall_us, meta.get("tx_time_us"))),
+        "payload_actual_offset_s": _safe_float(meta.get("payload_actual_offset_s")),
+        "inference_time_s": _safe_float(meta.get("inference_time_s")),
+        "coord_note": meta.get("coord_note") or "",
+    }
+    row.update({key: _safe_float(value) for key, value in _path_shape_metrics(path_ego).items()})
+
+    for ld_m in DIAG_LD_VALUES_M:
+        kappa_pp, goal_idx, L_d_eff = pure_pursuit_curvature(path_ego, v_ego, lookahead_m=ld_m)
+        goal_x = float(path_ego["x"][goal_idx])
+        goal_y = float(path_ego["y"][goal_idx])
+        prev_goal_y = prev_goal_y_by_ld.get(float(ld_m))
+        tag = f"ld{ld_m:g}"
+        row[f"{tag}_goal_idx"] = int(goal_idx)
+        row[f"{tag}_goal_x_m"] = goal_x
+        row[f"{tag}_goal_y_m"] = goal_y
+        row[f"{tag}_raw_goal_y_m"] = float(path_ego.get("raw_y", path_ego["y"])[goal_idx])
+        row[f"{tag}_L_eff_m"] = float(L_d_eff)
+        row[f"{tag}_kappa_raw"] = float(kappa_pp)
+        row[f"{tag}_goal_y_delta_m"] = "" if prev_goal_y is None else goal_y - float(prev_goal_y)
+    return row
+
+
+def diag_fieldnames():
+    fields = [
+        "event",
+        "monotonic_s",
+        "wall_unix_s",
+        "frame_id",
+        "recv_count",
+        "N",
+        "v_ego_mps",
+        "kappa_smoothed",
+        "udp_mode",
+        "label",
+        "clip_id",
+        "sample_id",
+        "plan_seq",
+        "tx_seq",
+        "source_t0_us",
+        "tx_time_us",
+        "source_age_s",
+        "tx_age_s",
+        "payload_actual_offset_s",
+        "inference_time_s",
+        "coord_note",
+        "first_x_m",
+        "first_y_m",
+        "first_raw_y_m",
+        "last_x_m",
+        "last_y_m",
+        "mean_y_m",
+        "std_y_m",
+        "max_abs_y_m",
+        "dy_step_rms_m",
+        "d2y_step_rms_m",
+    ]
+    for ld_m in DIAG_LD_VALUES_M:
+        tag = f"ld{ld_m:g}"
+        fields.extend(
+            [
+                f"{tag}_goal_idx",
+                f"{tag}_goal_x_m",
+                f"{tag}_goal_y_m",
+                f"{tag}_raw_goal_y_m",
+                f"{tag}_L_eff_m",
+                f"{tag}_kappa_raw",
+                f"{tag}_goal_y_delta_m",
+            ]
+        )
+    return fields
+
+
+def open_diag_csv():
+    os.makedirs(DIAG_LOG_DIR, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(DIAG_LOG_DIR, f"udp_bridge_path_diag_{ts}.csv")
+    fh = open(path, "w", newline="", buffering=1)
+    writer = csv.DictWriter(fh, fieldnames=diag_fieldnames(), extrasaction="ignore")
+    writer.writeheader()
+    cloudlog.warning(f"udp_bridge path diagnostics CSV: {path}")
+    return path, fh, writer
 
 
 # ── 종방향 ───────────────────────────────────────────
@@ -451,6 +669,8 @@ def main():
     recv_count = 0
     log_counter = 0
     prev_curvature = 0.0
+    diag_path, diag_fh, diag_writer = open_diag_csv()
+    prev_goal_y_by_ld = {float(ld_m): None for ld_m in DIAG_LD_VALUES_M}
 
     # engage rising/falling edge 마다 debug log 파일을 새로 열고 닫음
     debug_log = None
@@ -483,6 +703,23 @@ def main():
                     # 패킷 도착 시점 pure pursuit 1회 → goal + raw kappa snapshot
                     v_ego_now = max(sm["carState"].vEgo, 0.0) if sm.alive["carState"] else 0.0
                     kappa_pp_pkt, i_goal_pkt, L_d_eff_pkt = pure_pursuit_curvature(pkt, v_ego_now)
+                    now_wall_us = time.time_ns() // 1000
+                    now_mono_s = time.monotonic()
+                    diag_row = build_path_diag_row(
+                        pkt,
+                        event="recv",
+                        recv_count=recv_count,
+                        frame_id=frame_id,
+                        v_ego=v_ego_now,
+                        kappa_smoothed=None,
+                        prev_goal_y_by_ld=prev_goal_y_by_ld,
+                        now_wall_us=now_wall_us,
+                        now_mono_s=now_mono_s,
+                    )
+                    diag_writer.writerow(diag_row)
+                    for ld_m in DIAG_LD_VALUES_M:
+                        tag = f"ld{ld_m:g}"
+                        prev_goal_y_by_ld[float(ld_m)] = diag_row.get(f"{tag}_goal_y_m")
                     goal_xy = (float(pkt['x'][i_goal_pkt]), float(pkt['y'][i_goal_pkt]))
                     # world frame 변환 → viz(5008) (LocalWorld init 되어 있을 때만)
                     if world.is_initialized():
@@ -537,6 +774,21 @@ def main():
                     f"raw={kappa_pp:+.4f} sm={kappa:+.4f} "
                     f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} "
                     f"cte={float(path['y'][0]):+.2f} pkts={recv_count}\n"
+                )
+
+            if frame_id % DIAG_CONTROL_EVERY_N == 0:
+                diag_writer.writerow(
+                    build_path_diag_row(
+                        path,
+                        event="control",
+                        recv_count=recv_count,
+                        frame_id=frame_id,
+                        v_ego=v_ego,
+                        kappa_smoothed=kappa,
+                        prev_goal_y_by_ld={},
+                        now_wall_us=time.time_ns() // 1000,
+                        now_mono_s=time.monotonic(),
+                    )
                 )
 
             log_counter += 1
