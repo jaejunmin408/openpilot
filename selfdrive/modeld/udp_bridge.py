@@ -669,7 +669,9 @@ def main():
     recv_count = 0
     log_counter = 0
     prev_curvature = 0.0
-    diag_path, diag_fh, diag_writer = open_diag_csv()
+    # diag CSV 도 debug log 와 동일하게 engage rising/falling edge 마다 열고 닫음
+    diag_fh = None
+    diag_writer = None
     prev_goal_y_by_ld = {float(ld_m): None for ld_m in DIAG_LD_VALUES_M}
 
     # engage rising/falling edge 마다 debug log 파일을 새로 열고 닫음
@@ -703,23 +705,24 @@ def main():
                     # 패킷 도착 시점 pure pursuit 1회 → goal + raw kappa snapshot
                     v_ego_now = max(sm["carState"].vEgo, 0.0) if sm.alive["carState"] else 0.0
                     kappa_pp_pkt, i_goal_pkt, L_d_eff_pkt = pure_pursuit_curvature(pkt, v_ego_now)
-                    now_wall_us = time.time_ns() // 1000
-                    now_mono_s = time.monotonic()
-                    diag_row = build_path_diag_row(
-                        pkt,
-                        event="recv",
-                        recv_count=recv_count,
-                        frame_id=frame_id,
-                        v_ego=v_ego_now,
-                        kappa_smoothed=None,
-                        prev_goal_y_by_ld=prev_goal_y_by_ld,
-                        now_wall_us=now_wall_us,
-                        now_mono_s=now_mono_s,
-                    )
-                    diag_writer.writerow(diag_row)
-                    for ld_m in DIAG_LD_VALUES_M:
-                        tag = f"ld{ld_m:g}"
-                        prev_goal_y_by_ld[float(ld_m)] = diag_row.get(f"{tag}_goal_y_m")
+                    if diag_writer is not None:   # engage 중에만 기록
+                        now_wall_us = time.time_ns() // 1000
+                        now_mono_s = time.monotonic()
+                        diag_row = build_path_diag_row(
+                            pkt,
+                            event="recv",
+                            recv_count=recv_count,
+                            frame_id=frame_id,
+                            v_ego=v_ego_now,
+                            kappa_smoothed=None,
+                            prev_goal_y_by_ld=prev_goal_y_by_ld,
+                            now_wall_us=now_wall_us,
+                            now_mono_s=now_mono_s,
+                        )
+                        diag_writer.writerow(diag_row)
+                        for ld_m in DIAG_LD_VALUES_M:
+                            tag = f"ld{ld_m:g}"
+                            prev_goal_y_by_ld[float(ld_m)] = diag_row.get(f"{tag}_goal_y_m")
                     goal_xy = (float(pkt['x'][i_goal_pkt]), float(pkt['y'][i_goal_pkt]))
                     # world frame 변환 → viz(5008) (LocalWorld init 되어 있을 때만)
                     if world.is_initialized():
@@ -736,17 +739,26 @@ def main():
 
         v_ego = max(sm["carState"].vEgo, 0.0)
 
-        # 2.5. engage edge 감지 → debug log 파일 open/close
+        # 2.5. engage edge 감지 → debug log + diag CSV 파일 open/close
         engaged = bool(sm["selfdriveState"].enabled) if sm.alive["selfdriveState"] else False
         if engaged and not prev_engaged:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             debug_log_path = f"{DEBUG_LOG_DIR}/udp_bridge_debug_{ts}.log"
             debug_log = open(debug_log_path, "w", buffering=1)   # line-buffered
             cloudlog.warning(f"udp_bridge debug log OPEN (engage): {debug_log_path}")
-        elif (not engaged) and prev_engaged and debug_log is not None:
-            cloudlog.warning(f"udp_bridge debug log CLOSE (disengage): {debug_log.name}")
-            debug_log.close()
-            debug_log = None
+            # diag CSV 도 새로 열고, goal_y delta 누적값 리셋
+            diag_path, diag_fh, diag_writer = open_diag_csv()
+            prev_goal_y_by_ld = {float(ld_m): None for ld_m in DIAG_LD_VALUES_M}
+        elif (not engaged) and prev_engaged:
+            if debug_log is not None:
+                cloudlog.warning(f"udp_bridge debug log CLOSE (disengage): {debug_log.name}")
+                debug_log.close()
+                debug_log = None
+            if diag_fh is not None:
+                cloudlog.warning(f"udp_bridge diag CSV CLOSE (disengage): {diag_fh.name}")
+                diag_fh.close()
+                diag_fh = None
+                diag_writer = None
         prev_engaged = engaged
 
         # 3. tracker — 받은 ego-frame path 에 곧장 pure pursuit
@@ -776,7 +788,7 @@ def main():
                     f"cte={float(path['y'][0]):+.2f} pkts={recv_count}\n"
                 )
 
-            if frame_id % DIAG_CONTROL_EVERY_N == 0:
+            if diag_writer is not None and frame_id % DIAG_CONTROL_EVERY_N == 0:
                 diag_writer.writerow(
                     build_path_diag_row(
                         path,
