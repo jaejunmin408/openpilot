@@ -81,6 +81,9 @@ build/
 !.vscode/extensions.json
 !.vscode/*.code-snippets
 
+# udp_bridge 디버그 로그
+logs/
+
 # agents
 .claude/
 .context/

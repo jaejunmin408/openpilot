@@ -28,6 +28,7 @@ import numpy as np
 import cereal.messaging as messaging
 from cereal import log
 from cereal.messaging import PubMaster, SubMaster
+from openpilot.common.basedir import BASEDIR
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.drive_helpers import smooth_value
 from openpilot.selfdrive.controls.lib.local_world import LocalWorld
@@ -58,7 +59,7 @@ PP_LOOKAHEAD_M = 5.0                 # 고정 look-ahead
 PP_CURV_LIMIT = 0.2
 
 # ── 디버그 로그 ──────────────────────────────────────
-DEBUG_LOG_DIR = "/tmp"
+DEBUG_LOG_DIR = os.path.join(BASEDIR, "logs")
 DIAG_LOG_DIR = os.environ.get("UDP_BRIDGE_DIAG_LOG_DIR", DEBUG_LOG_DIR)
 DIAG_LD_VALUES_M = tuple(
     sorted(
@@ -743,6 +744,7 @@ def main():
         engaged = bool(sm["selfdriveState"].enabled) if sm.alive["selfdriveState"] else False
         if engaged and not prev_engaged:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            os.makedirs(DEBUG_LOG_DIR, exist_ok=True)
             debug_log_path = f"{DEBUG_LOG_DIR}/udp_bridge_debug_{ts}.log"
             debug_log = open(debug_log_path, "w", buffering=1)   # line-buffered
             cloudlog.warning(f"udp_bridge debug log OPEN (engage): {debug_log_path}")
