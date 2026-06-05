@@ -70,6 +70,11 @@ MPC_LATERAL_JERK_COST = 0.04
 MPC_STEERING_RATE_COST = 700.0
 MPC_CURV_LIMIT = 0.2
 
+# ── 짧은 path tail 처리 (path < v_plan·10s 인 경우) ──
+MPC_TAIL_HEADING_LEN = 3.0     # path 끝 접선 heading 추정용 lookback [m]
+MPC_TAIL_WEIGHT_TAU = 3.0      # 유효 범위 밖 노드 weight 지수감쇠 시상수 [node]
+MPC_TAIL_WEIGHT_FLOOR = 0.05   # tail reference weight 하한
+
 # ── 디버그 로그 ──────────────────────────────────────
 DEBUG_LOG_DIR = os.path.join(BASEDIR, "logs")
 DIAG_LOG_DIR = os.environ.get("UDP_BRIDGE_DIAG_LOG_DIR", DEBUG_LOG_DIR)
@@ -220,19 +225,44 @@ def sample_path_for_mpc(path_ego, v_plan):
     MPC shooting node 는 시간축 T_IDXS(33점). node i 의 reference 는 차량이
     v_plan 으로 달릴 때 시각 T_IDXS[i] 에 도달하는 arc-length s_i=v_plan·t_i
     지점의 path 값이다. 거기서 lateral offset y, 접선 heading, yaw rate 를 뽑는다.
-    path 가 s_target 보다 짧으면 끝값을 hold(직진 연장).
+
+    수신 path 길이(~20m)가 가장 먼 노드의 목표 호길이(v_plan·10s)보다 짧으면
+    path 끝 너머 노드가 생긴다. 이 구간은 끝값 hold(y 고정=직진 명령) 대신 끝점
+    접선(heading) 방향 직선으로 외삽해 기하학적으로 일관되게 채운다. 외삽 구간은
+    실제 reference 가 아니므로 호출부에서 weight 를 감쇠시키도록 n_valid 를 함께
+    반환한다(s_target ≤ path 길이 인 노드 수).
     """
     x = np.asarray(path_ego['x'], dtype=np.float64)
     y = np.asarray(path_ego['y'], dtype=np.float64)
     ds = np.hypot(np.diff(x), np.diff(y))
     s_path = np.concatenate([[0.0], np.cumsum(ds)])
+    s_end = float(s_path[-1])
     s_target = T_IDXS * max(float(v_plan), MIN_SPEED)
 
+    # path 안에 들어오는 (= 실제 데이터로 채워지는) shooting node 수
+    n_valid = int(np.count_nonzero(s_target <= s_end + 1e-6))
+    n_valid = max(n_valid, 1)   # 최소 원점 노드는 항상 유효
+
+    # 호길이 기준 리샘플 (밖은 일단 끝점 clamp)
     x_s = np.interp(s_target, s_path, x)
     y_s = np.interp(s_target, s_path, y)
+
+    # ── path 끝 너머는 끝점 접선 방향 직선으로 외삽 ──
+    if n_valid < IDX_N:
+        # 끝점 접선 heading: resample 노이즈를 피해 끝에서 살짝 뒤 구간 방향 사용
+        s_back = max(s_end - MPC_TAIL_HEADING_LEN, 0.0)
+        x_back = float(np.interp(s_back, s_path, x))
+        y_back = float(np.interp(s_back, s_path, y))
+        x_end, y_end = float(x[-1]), float(y[-1])
+        psi_end = np.arctan2(y_end - y_back, max(x_end - x_back, 1e-3))
+        ds_ext = s_target - s_end                      # 끝 너머 노드는 양수
+        ext = s_target > s_end + 1e-6
+        x_s[ext] = x_end + ds_ext[ext] * np.cos(psi_end)
+        y_s[ext] = y_end + ds_ext[ext] * np.sin(psi_end)
+
     heading = np.arctan2(np.gradient(y_s), np.maximum(np.gradient(x_s), 1e-3))
     yaw_rate = np.gradient(heading, T_IDXS)
-    return y_s, heading, yaw_rate
+    return y_s, heading, yaw_rate, n_valid
 
 
 class LatMpcController:
@@ -255,11 +285,20 @@ class LatMpcController:
     def update(self, path_ego, v_ego):
         """return (curvature, valid, solve_time). valid=False 면 caller 가 직전 값 유지."""
         v_plan = max(float(v_ego), MIN_SPEED)
-        y_pts, heading_pts, yaw_rate_pts = sample_path_for_mpc(path_ego, v_plan)
+        y_pts, heading_pts, yaw_rate_pts, n_valid = sample_path_for_mpc(path_ego, v_plan)
+
+        # path 끝 너머(외삽) 노드는 reference-tracking weight 를 지수감쇠시켜
+        # fabricate 한 tail 을 MPC 가 추종하지 않게 한다. node n_valid 부터 감쇠.
+        if n_valid < LAT_MPC_N + 1:
+            over = np.clip(np.arange(LAT_MPC_N + 1) - (n_valid - 1), 0, None)
+            node_weights = np.maximum(MPC_TAIL_WEIGHT_FLOOR,
+                                      np.exp(-over / MPC_TAIL_WEIGHT_TAU))
+        else:
+            node_weights = None
 
         self.lat_mpc.set_weights(MPC_PATH_COST, MPC_LATERAL_MOTION_COST,
                                  MPC_LATERAL_ACCEL_COST, MPC_LATERAL_JERK_COST,
-                                 MPC_STEERING_RATE_COST)
+                                 MPC_STEERING_RATE_COST, node_weights=node_weights)
         v_arr = np.full(LAT_MPC_N + 1, v_plan)
         p = np.column_stack([v_arr, np.full(LAT_MPC_N + 1, CAR_ROTATION_RADIUS)])
         self.lat_mpc.run(self.x0, p, y_pts, heading_pts, yaw_rate_pts)
