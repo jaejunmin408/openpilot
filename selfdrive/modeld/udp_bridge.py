@@ -81,8 +81,8 @@ MPC_TAIL_WEIGHT_FLOOR = 0.05   # tail reference weight 하한
 # 외부경로 지연(300~500ms)으로 틀어진 근거리를 신선한 모델이 덮어줘 지연 영향을 완화한다.
 #   y_ref(s) = y_ext(s) + α(s)·weight·(y_model(s) − y_ext(s))
 LANE_FUSE_ENABLED = os.environ.get("UDP_BRIDGE_LANE_FUSE", "1") != "0"
-LANE_FUSE_ALPHA_NEAR = float(os.environ.get("UDP_BRIDGE_LANE_ALPHA_NEAR", "0.8"))  # s=0 모델 비중
-LANE_FUSE_ALPHA_FAR = float(os.environ.get("UDP_BRIDGE_LANE_ALPHA_FAR", "0.1"))    # 원거리 모델 비중
+LANE_FUSE_ALPHA_NEAR = float(os.environ.get("UDP_BRIDGE_LANE_ALPHA_NEAR", "1.0"))  # s=0 모델 비중 (1.0=comma경로만)
+LANE_FUSE_ALPHA_FAR = float(os.environ.get("UDP_BRIDGE_LANE_ALPHA_FAR", "1.0"))    # 원거리 모델 비중 (1.0=comma경로만)
 LANE_FUSE_FALLOFF_M = float(os.environ.get("UDP_BRIDGE_LANE_FALLOFF_M", "20.0"))   # near→far 전환거리 [m]
 MODEL_PATH_MAX_AGE_S = float(os.environ.get("UDP_BRIDGE_MODEL_MAX_AGE_S", "0.3"))  # 이보다 오래된 모델경로는 무시(α→0)
 MODEL_PATH_MIN_RANGE_M = 2.0   # 모델경로 전방커버가 이보다 짧으면 신뢰 안 함
