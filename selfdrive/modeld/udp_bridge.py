@@ -75,6 +75,21 @@ MPC_TAIL_HEADING_LEN = 3.0     # path 끝 접선 heading 추정용 lookback [m]
 MPC_TAIL_WEIGHT_TAU = 3.0      # 유효 범위 밖 노드 weight 지수감쇠 시상수 [node]
 MPC_TAIL_WEIGHT_FLOOR = 0.05   # tail reference weight 하한
 
+# ── comma 차선유지 융합 (외부경로 + comma 모델 예측경로) ────────────
+# 외부경로(route)에 comma 모델의 차선중앙 경로를 얹어 차선 안에 머물도록 보정.
+# 거리별 가중 α(=모델 비중): 근거리는 신선한 모델(차선중앙)을 크게 믿고, 원거리는 외부경로(어디로 갈지)를 믿는다.
+# 외부경로 지연(300~500ms)으로 틀어진 근거리를 신선한 모델이 덮어줘 지연 영향을 완화한다.
+#   y_ref(s) = y_ext(s) + α(s)·weight·(y_model(s) − y_ext(s))
+LANE_FUSE_ENABLED = os.environ.get("UDP_BRIDGE_LANE_FUSE", "1") != "0"
+LANE_FUSE_ALPHA_NEAR = float(os.environ.get("UDP_BRIDGE_LANE_ALPHA_NEAR", "0.8"))  # s=0 모델 비중
+LANE_FUSE_ALPHA_FAR = float(os.environ.get("UDP_BRIDGE_LANE_ALPHA_FAR", "0.1"))    # 원거리 모델 비중
+LANE_FUSE_FALLOFF_M = float(os.environ.get("UDP_BRIDGE_LANE_FALLOFF_M", "20.0"))   # near→far 전환거리 [m]
+MODEL_PATH_MAX_AGE_S = float(os.environ.get("UDP_BRIDGE_MODEL_MAX_AGE_S", "0.3"))  # 이보다 오래된 모델경로는 무시(α→0)
+MODEL_PATH_MIN_RANGE_M = 2.0   # 모델경로 전방커버가 이보다 짧으면 신뢰 안 함
+# modelV2.position(y=RIGHT+) → udp_bridge 내부규약(y=LEFT+) 변환 부호.
+# ⚠️ 온디바이스 검증 필요: 차선 중앙 직진 시 모델 y 와 외부경로 y 가 같은 부호여야 함.
+MODEL_Y_TO_INTERNAL_SIGN = -1.0
+
 # ── 디버그 로그 ──────────────────────────────────────
 DEBUG_LOG_DIR = os.path.join(BASEDIR, "logs")
 DIAG_LOG_DIR = os.environ.get("UDP_BRIDGE_DIAG_LOG_DIR", DEBUG_LOG_DIR)
@@ -219,7 +234,7 @@ def pure_pursuit_curvature(path_ego, v_ego, lookahead_m=None):
 
 
 # ── lateral MPC (legacy openpilot lat_mpc) ───────────
-def sample_path_for_mpc(path_ego, v_plan):
+def sample_path_for_mpc(path_ego, v_plan, model_path=None):
     """ego-frame path(x=fwd, y=left)를 MPC reference 33점(N+1)으로 리샘플.
 
     MPC shooting node 는 시간축 T_IDXS(33점). node i 의 reference 는 차량이
@@ -260,9 +275,26 @@ def sample_path_for_mpc(path_ego, v_plan):
         x_s[ext] = x_end + ds_ext[ext] * np.cos(psi_end)
         y_s[ext] = y_end + ds_ext[ext] * np.sin(psi_end)
 
+    # ── comma 모델 예측경로(차선중앙)로 횡위치 y 보정 ──
+    # 외부경로가 정한 전방거리 station(x_s)에 모델 y 를 정렬해 거리별 α 로 끌어당긴다.
+    # 근거리는 신선한 모델(차선중앙) 비중↑, 원거리는 외부경로(route) 비중↑.
+    alpha_eff = np.zeros(IDX_N)
+    if LANE_FUSE_ENABLED and model_path is not None and model_path.get('weight', 0.0) > 0.0:
+        mx = np.asarray(model_path['x'], dtype=np.float64)
+        my = np.asarray(model_path['y'], dtype=np.float64)
+        rng = float(mx[-1] - mx[0]) if mx.size >= 2 else 0.0
+        if rng >= MODEL_PATH_MIN_RANGE_M and bool(np.all(np.diff(mx) > 0)):
+            y_model = np.interp(x_s, mx, my)               # 같은 전방거리 station 에 모델 y 정렬
+            frac = np.clip(x_s / max(LANE_FUSE_FALLOFF_M, 1e-3), 0.0, 1.0)
+            alpha = LANE_FUSE_ALPHA_NEAR + frac * (LANE_FUSE_ALPHA_FAR - LANE_FUSE_ALPHA_NEAR)
+            alpha = np.clip(alpha * float(model_path['weight']), 0.0, 1.0)
+            alpha[x_s > mx[-1]] = 0.0                       # 모델 전방커버 밖은 외부경로만
+            y_s = y_s + alpha * (y_model - y_s)
+            alpha_eff = alpha
+
     heading = np.arctan2(np.gradient(y_s), np.maximum(np.gradient(x_s), 1e-3))
     yaw_rate = np.gradient(heading, T_IDXS)
-    return y_s, heading, yaw_rate, n_valid
+    return y_s, heading, yaw_rate, n_valid, alpha_eff
 
 
 class LatMpcController:
@@ -282,10 +314,10 @@ class LatMpcController:
         self.x0 = np.zeros(4)
         self.lat_mpc.reset(x0=self.x0)
 
-    def update(self, path_ego, v_ego):
-        """return (curvature, valid, solve_time). valid=False 면 caller 가 직전 값 유지."""
+    def update(self, path_ego, v_ego, model_path=None):
+        """return (curvature, valid, solve_time, alpha_eff). valid=False 면 caller 가 직전 값 유지."""
         v_plan = max(float(v_ego), MIN_SPEED)
-        y_pts, heading_pts, yaw_rate_pts, n_valid = sample_path_for_mpc(path_ego, v_plan)
+        y_pts, heading_pts, yaw_rate_pts, n_valid, alpha_eff = sample_path_for_mpc(path_ego, v_plan, model_path)
 
         # path 끝 너머(외삽) 노드는 reference-tracking weight 를 지수감쇠시켜
         # fabricate 한 tail 을 MPC 가 추종하지 않게 한다. node n_valid 부터 감쇠.
@@ -306,12 +338,12 @@ class LatMpcController:
         mpc_nans = bool(np.isnan(self.lat_mpc.x_sol[:, 3]).any())
         if mpc_nans or self.lat_mpc.solution_status != 0:
             self.reset()
-            return 0.0, False, self.lat_mpc.solve_time
+            return 0.0, False, self.lat_mpc.solve_time, alpha_eff
 
         # 다음 iteration init 용 + 현재 command: DT_MDL 앞 desired yaw rate
         self.x0[3] = float(np.interp(DT_MDL, T_IDXS[:LAT_MPC_N + 1], self.lat_mpc.x_sol[:, 3]))
         kappa = float(np.clip(self.x0[3] / v_plan, -MPC_CURV_LIMIT, MPC_CURV_LIMIT))
-        return kappa, True, self.lat_mpc.solve_time
+        return kappa, True, self.lat_mpc.solve_time, alpha_eff
 
 
 def _safe_float(value):
@@ -456,6 +488,27 @@ def open_diag_csv():
     writer.writeheader()
     cloudlog.warning(f"udp_bridge path diagnostics CSV: {path}")
     return path, fh, writer
+
+
+# ── comma 모델 예측경로 수신 ─────────────────────────
+def build_model_path(sm, now_mono_s):
+    """SubMaster 의 modelLanePath → 내부규약(y=LEFT+) 모델경로 dict. 없거나 stale 이면 None.
+
+    weight: age 기반 신뢰도(0~1). 0 이면 융합 안 함(= 외부경로 단독, 기존 동작과 동일).
+    모델 positionY 는 modelV2.position 규약(y=RIGHT+) 이므로 MODEL_Y_TO_INTERNAL_SIGN 로
+    udp_bridge 내부규약(y=LEFT+)에 맞춰 변환한다.
+    """
+    if not sm.alive["modelLanePath"]:
+        return None
+    mlp = sm["modelLanePath"]
+    if not mlp.valid or len(mlp.positionX) < 2:
+        return None
+    age = now_mono_s - sm.logMonoTime["modelLanePath"] / 1e9
+    weight = 1.0 if age <= MODEL_PATH_MAX_AGE_S else 0.0
+    x = np.asarray(mlp.positionX, dtype=np.float64)
+    y = MODEL_Y_TO_INTERNAL_SIGN * np.asarray(mlp.positionY, dtype=np.float64)
+    return {'x': x, 'y': y, 'weight': weight, 'age': age,
+            'model_curv': float(mlp.desiredCurvature)}
 
 
 # ── 종방향 ───────────────────────────────────────────
@@ -762,7 +815,7 @@ def main():
     cloudlog.warning("udp_bridge init (ref-path slice mode, target=15km/h)")
 
     pm = PubMaster(["modelV2", "drivingModelData", "longitudinalPlan", "driverAssistance"])
-    sm = SubMaster(["carState", "livePose", "selfdriveState"])
+    sm = SubMaster(["carState", "livePose", "selfdriveState", "modelLanePath"])
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -879,9 +932,14 @@ def main():
 
         # 3. tracker — 받은 ego-frame path 에 lateral MPC 적용
         if path is not None:
+            # comma 모델 예측경로(차선중앙)를 받아 외부경로와 융합 → MPC reference
+            model_path = build_model_path(sm, time.monotonic())
             # 실제 control 은 MPC, pure pursuit 은 viz·diag·로그 비교용
-            kappa_mpc, mpc_valid, mpc_solve_time = lat_mpc_ctl.update(path, v_ego)
+            kappa_mpc, mpc_valid, mpc_solve_time, alpha_eff = lat_mpc_ctl.update(path, v_ego, model_path)
             kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path, v_ego)
+            a_near = float(alpha_eff[0]) if len(alpha_eff) else 0.0
+            a_far = float(alpha_eff[-1]) if len(alpha_eff) else 0.0
+            model_age = model_path['age'] if model_path is not None else float('nan')
 
             if mpc_valid and v_ego > MIN_LAT_CONTROL_SPEED:
                 kappa = smooth_value(kappa_mpc, prev_curvature, LAT_SMOOTH_SECONDS)
@@ -899,10 +957,12 @@ def main():
 
             # 디버그 로그: 매 20Hz loop curvature, engage 중에만
             if debug_log is not None:
+                mc = model_path['model_curv'] if model_path is not None else float('nan')
                 debug_log.write(
                     f"[t={time.monotonic():.3f}] CURV frame={frame_id} v_ego={v_ego:.2f} "
                     f"mpc={kappa_mpc:+.4f}({'ok' if mpc_valid else 'INVALID'}) "
                     f"pp={kappa_pp:+.4f} sm={kappa:+.4f} "
+                    f"fuse[a_near={a_near:.2f} a_far={a_far:.2f} model_curv={mc:+.4f} age={model_age:.3f}] "
                     f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} solve={mpc_solve_time*1e3:.1f}ms "
                     f"cte={float(path['y'][0]):+.2f} pkts={recv_count}\n"
                 )
@@ -925,10 +985,11 @@ def main():
             log_counter += 1
             if log_counter % 20 == 1:   # 1Hz
                 cte = float(path['y'][0])
+                fuse_state = "OFF" if model_path is None or model_path['weight'] == 0.0 else f"a={a_near:.2f}→{a_far:.2f}"
                 cloudlog.warning(
                     f"track: v_ego={v_ego:.2f} target={TARGET_SPEED_MPS:.2f} "
                     f"κ={kappa:+.4f}(mpc {kappa_mpc:+.4f}{'' if mpc_valid else '!'} "
-                    f"pp {kappa_pp:+.4f}) a={a_cmd:+.2f} "
+                    f"pp {kappa_pp:+.4f}) a={a_cmd:+.2f} fuse[{fuse_state}] "
                     f"L_d={L_d_eff:.1f} i_goal={i_goal} N={path['N']} "
                     f"cte={cte:+.2f} pkts={recv_count}"
                 )

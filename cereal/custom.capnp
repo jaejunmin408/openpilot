@@ -10,7 +10,16 @@ $Cxx.namespace("cereal");
 # DO rename the structs
 # DON'T change the identifier (e.g. @0x81c2f05a394cf4af)
 
-struct CustomReserved0 @0x81c2f05a394cf4af {
+# comma 비전 모델의 차선유지용 예측 주행경로 (modeld → udp_bridge).
+# modeld가 매 프레임 계산하지만 버리던 plan/position 을 외부경로 융합에 쓰기 위해 노출.
+# 좌표계: modelV2.position 과 동일 (x=forward[m], y 는 모델 native frame). udp_bridge 에서 내부규약으로 변환.
+struct ModelLanePath @0x81c2f05a394cf4af {
+  frameId @0 :UInt32;
+  valid @1 :Bool;
+  vEgo @2 :Float32;
+  positionX @3 :List(Float32);      # T_IDXS 33pts, forward [m]
+  positionY @4 :List(Float32);      # T_IDXS 33pts, lateral [m] (modelV2.position 규약)
+  desiredCurvature @5 :Float32;     # 모델 자체 차선유지 곡률 (diag/fallback 용)
 }
 
 struct CustomReserved1 @0xaedffd8f31e7b55d {
