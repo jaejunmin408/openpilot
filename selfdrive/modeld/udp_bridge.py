@@ -653,6 +653,10 @@ def publish_messages(pm, rs, action, frame_id, v_ego):
     pm.send('longitudinalPlan', plan_send)
     pm.send('driverAssistance', assist_send)
 
+    # controlsd 가 controlsState.lateralPlanMonoTime 에 이 값을 그대로 echo 하므로
+    # "내 modelV2 가 controlsd 에 반영된 시점" 역추적에 쓴다.
+    return modelv2_send.logMonoTime
+
 
 # ── viz 송신 (수신 path 를 world frame 으로 변환) ─────
 def ego_to_world(x_ego, y_ego, viz_anchor):
@@ -763,6 +767,9 @@ def main():
 
     pm = PubMaster(["modelV2", "drivingModelData", "longitudinalPlan", "driverAssistance"])
     sm = SubMaster(["carState", "livePose", "selfdriveState"])
+    # controlsState 는 100Hz 라 conflate 없이 전부 drain 해서
+    # lateralPlanMonoTime 매칭으로 controlsd 반영 시점을 정확히 잡는다.
+    ctrl_sock = messaging.sub_sock("controlsState", conflate=False)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -784,6 +791,8 @@ def main():
     recv_count = 0
     log_counter = 0
     prev_curvature = 0.0
+    new_path = False        # 이번 loop 에 새 path 가 들어왔는지 (latency 측정 1회용)
+    pending_lat = None      # 발행한 modelV2 가 controlsd 에 반영되길 기다리는 latency 측정 항목
     # diag CSV 도 debug log 와 동일하게 engage rising/falling edge 마다 열고 닫음
     diag_fh = None
     diag_writer = None
@@ -804,8 +813,10 @@ def main():
                 data, _ = sock.recvfrom(RECV_BUF_SIZE)
                 pkt = parse_path_packet(data)
                 if pkt is not None:
+                    pkt['recv_mono_ns'] = time.monotonic_ns()   # 경로 수신 시각 (latency 기준점)
                     recv_count += 1
                     path = pkt
+                    new_path = True
                     # 디버그 로그: 수신 path (내부 좌표계, y=left). 한 줄=한 path. engage 중에만.
                     if debug_log is not None:
                         debug_log.write(
@@ -852,6 +863,19 @@ def main():
         if sm.updated["livePose"]:
             world.update(sm["livePose"], sm.logMonoTime["livePose"])
 
+        # 2.1. controlsd 반영 시점 감지: controlsState.lateralPlanMonoTime 이
+        # 우리가 발행한 modelV2.logMonoTime 이상이 되는 첫 메시지 = 그 curvature 가
+        # actuator command(carControl)로 변환된 loop. 그 메시지의 logMonoTime 이 반영 시각.
+        for ctrl_msg in messaging.drain_sock(ctrl_sock):
+            if pending_lat is not None and ctrl_msg.controlsState.lateralPlanMonoTime >= pending_lat['mv2_lmt']:
+                apply_ms = (ctrl_msg.logMonoTime - pending_lat['recv_ns']) / 1e6
+                line = (f"[LAT] {pending_lat['pid']} t_apply={apply_ms:6.1f}ms "
+                        f"κ_cmd={ctrl_msg.controlsState.desiredCurvature:+.5f}")
+                print(line, flush=True)
+                if debug_log is not None:
+                    debug_log.write(f"[t={time.monotonic():.3f}] {line}\n")
+                pending_lat = None
+
         v_ego = max(sm["carState"].vEgo, 0.0)
 
         # 2.5. engage edge 감지 → debug log + diag CSV 파일 open/close
@@ -881,6 +905,7 @@ def main():
         if path is not None:
             # 실제 control 은 MPC, pure pursuit 은 viz·diag·로그 비교용
             kappa_mpc, mpc_valid, mpc_solve_time = lat_mpc_ctl.update(path, v_ego)
+            t_curv_ns = time.monotonic_ns()   # curvature 산출 완료 시각
             kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path, v_ego)
 
             if mpc_valid and v_ego > MIN_LAT_CONTROL_SPEED:
@@ -888,6 +913,18 @@ def main():
             else:
                 kappa = prev_curvature
             prev_curvature = kappa
+
+            # 새 path 첫 처리: 수신→curvature 산출 latency 를 터미널에 출력
+            if new_path:
+                curv_ms = (t_curv_ns - path['recv_mono_ns']) / 1e6
+                seq = path['meta'].get('plan_seq')
+                pid = f"path#{recv_count}" + (f"(seq={seq})" if seq is not None else "")
+                line = (f"[LAT] {pid} t_curv={curv_ms:6.1f}ms κ={kappa:+.5f} "
+                        f"(mpc {kappa_mpc:+.5f}{'' if mpc_valid else ' INVALID'}, "
+                        f"solve {mpc_solve_time*1e3:.1f}ms)")
+                print(line, flush=True)
+                if debug_log is not None:
+                    debug_log.write(f"[t={time.monotonic():.3f}] {line}\n")
 
             a_cmd = longitudinal_accel(v_ego)
             action = log.ModelDataV2.Action(
@@ -939,7 +976,17 @@ def main():
             lat_mpc_ctl.reset()
 
         # 4. 메시지 발행
-        publish_messages(pm, rs, action, frame_id, v_ego)
+        mv2_lmt = publish_messages(pm, rs, action, frame_id, v_ego)
+
+        # 새 path 의 curvature 가 실린 modelV2 → controlsd 반영 대기 등록 (2.1 에서 매칭)
+        if new_path and path is not None:
+            seq = path['meta'].get('plan_seq')
+            pending_lat = {
+                'pid': f"path#{recv_count}" + (f"(seq={seq})" if seq is not None else ""),
+                'recv_ns': path['recv_mono_ns'],
+                'mv2_lmt': mv2_lmt,
+            }
+            new_path = False
 
         # 5. vehicle trail viz
         if world.is_initialized():
