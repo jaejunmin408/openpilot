@@ -83,7 +83,7 @@ MPC_TAIL_WEIGHT_FLOOR = 0.05   # tail reference weight 하한
 # COMMA_ONLY: 외부경로(Alpamayo) 없이 comma 모델 차선유지 경로(modelLanePath)를
 # MPC reference 로 직접 사용. 외부 UDP 경로가 안 들어와도 comma 차선유지만으로
 # 제어가 도는지 검증/비교용. 모델 stale 이면 제어 정지(fallback).
-COMMA_ONLY = os.environ.get("UDP_BRIDGE_COMMA_ONLY", "0") != "0"
+COMMA_ONLY = os.environ.get("UDP_BRIDGE_COMMA_ONLY", "1") != "0"   # 검증기간: 기본 ON (외부경로 무시)
 LANE_FUSE_ENABLED = os.environ.get("UDP_BRIDGE_LANE_FUSE", "1") != "0"
 LANE_FUSE_ALPHA_NEAR = float(os.environ.get("UDP_BRIDGE_LANE_ALPHA_NEAR", "1.0"))  # s=0 모델 비중 (1.0=comma경로만)
 LANE_FUSE_ALPHA_FAR = float(os.environ.get("UDP_BRIDGE_LANE_ALPHA_FAR", "1.0"))    # 원거리 모델 비중 (1.0=comma경로만)
