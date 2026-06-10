@@ -83,10 +83,10 @@ MPC_TAIL_WEIGHT_FLOOR = 0.05   # tail reference weight 하한
 # COMMA_ONLY: 외부경로(Alpamayo) 없이 comma 모델 차선유지 경로(modelLanePath)를
 # MPC reference 로 직접 사용. 외부 UDP 경로가 안 들어와도 comma 차선유지만으로
 # 제어가 도는지 검증/비교용. 모델 stale 이면 제어 정지(fallback).
-COMMA_ONLY = os.environ.get("UDP_BRIDGE_COMMA_ONLY", "1") != "0"   # 검증기간: 기본 ON (외부경로 무시)
+COMMA_ONLY = os.environ.get("UDP_BRIDGE_COMMA_ONLY", "0") != "0"   # 기본 OFF: 외부경로 받아 융합. 1=comma 경로만(검증용)
 LANE_FUSE_ENABLED = os.environ.get("UDP_BRIDGE_LANE_FUSE", "1") != "0"
-LANE_FUSE_ALPHA_NEAR = float(os.environ.get("UDP_BRIDGE_LANE_ALPHA_NEAR", "1.0"))  # s=0 모델 비중 (1.0=comma경로만)
-LANE_FUSE_ALPHA_FAR = float(os.environ.get("UDP_BRIDGE_LANE_ALPHA_FAR", "1.0"))    # 원거리 모델 비중 (1.0=comma경로만)
+LANE_FUSE_ALPHA_NEAR = float(os.environ.get("UDP_BRIDGE_LANE_ALPHA_NEAR", "0.8"))  # s=0 모델 비중: 근거리는 차선중앙 모델 우세
+LANE_FUSE_ALPHA_FAR = float(os.environ.get("UDP_BRIDGE_LANE_ALPHA_FAR", "0.2"))    # 원거리 모델 비중: 멀리는 외부경로(route) 우세
 LANE_FUSE_FALLOFF_M = float(os.environ.get("UDP_BRIDGE_LANE_FALLOFF_M", "20.0"))   # near→far 전환거리 [m]
 MODEL_PATH_MAX_AGE_S = float(os.environ.get("UDP_BRIDGE_MODEL_MAX_AGE_S", "0.3"))  # 이보다 오래된 모델경로는 무시(α→0)
 MODEL_PATH_MIN_RANGE_M = 2.0   # 모델경로 전방커버가 이보다 짧으면 신뢰 안 함
