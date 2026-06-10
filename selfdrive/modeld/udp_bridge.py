@@ -90,9 +90,12 @@ LANE_FUSE_ALPHA_FAR = float(os.environ.get("UDP_BRIDGE_LANE_ALPHA_FAR", "1.0")) 
 LANE_FUSE_FALLOFF_M = float(os.environ.get("UDP_BRIDGE_LANE_FALLOFF_M", "20.0"))   # near→far 전환거리 [m]
 MODEL_PATH_MAX_AGE_S = float(os.environ.get("UDP_BRIDGE_MODEL_MAX_AGE_S", "0.3"))  # 이보다 오래된 모델경로는 무시(α→0)
 MODEL_PATH_MIN_RANGE_M = 2.0   # 모델경로 전방커버가 이보다 짧으면 신뢰 안 함
-# modelV2.position(y=RIGHT+) → udp_bridge 내부규약(y=LEFT+) 변환 부호.
-# ⚠️ 온디바이스 검증 필요: 차선 중앙 직진 시 모델 y 와 외부경로 y 가 같은 부호여야 함.
-MODEL_Y_TO_INTERNAL_SIGN = -1.0
+# modelV2.position.y → MPC reference 변환 부호.
+# upstream openpilot lateral_planner 는 md.position.y 를 "부호변환 없이" 그대로 동일 MPC 에
+# 넣고 그 출력 curvature(x_sol[3]/v)를 조향 명령으로 썼다(수년 검증). MPC dynamics 가
+# 넣어준 y 프레임 그대로 curvature 를 내므로, 모델 y 는 변환 없이 그대로 넣어야 desiredCurvature
+# 부호가 맞다. (이전 -1.0 은 경로를 좌우 반전시켜 온디바이스 테스트에서 반대로 조향 → +1.0 으로 수정)
+MODEL_Y_TO_INTERNAL_SIGN = 1.0
 
 # ── 디버그 로그 ──────────────────────────────────────
 DEBUG_LOG_DIR = os.path.join(BASEDIR, "logs")
