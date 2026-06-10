@@ -80,6 +80,10 @@ MPC_TAIL_WEIGHT_FLOOR = 0.05   # tail reference weight 하한
 # 거리별 가중 α(=모델 비중): 근거리는 신선한 모델(차선중앙)을 크게 믿고, 원거리는 외부경로(어디로 갈지)를 믿는다.
 # 외부경로 지연(300~500ms)으로 틀어진 근거리를 신선한 모델이 덮어줘 지연 영향을 완화한다.
 #   y_ref(s) = y_ext(s) + α(s)·weight·(y_model(s) − y_ext(s))
+# COMMA_ONLY: 외부경로(Alpamayo) 없이 comma 모델 차선유지 경로(modelLanePath)를
+# MPC reference 로 직접 사용. 외부 UDP 경로가 안 들어와도 comma 차선유지만으로
+# 제어가 도는지 검증/비교용. 모델 stale 이면 제어 정지(fallback).
+COMMA_ONLY = os.environ.get("UDP_BRIDGE_COMMA_ONLY", "0") != "0"
 LANE_FUSE_ENABLED = os.environ.get("UDP_BRIDGE_LANE_FUSE", "1") != "0"
 LANE_FUSE_ALPHA_NEAR = float(os.environ.get("UDP_BRIDGE_LANE_ALPHA_NEAR", "1.0"))  # s=0 모델 비중 (1.0=comma경로만)
 LANE_FUSE_ALPHA_FAR = float(os.environ.get("UDP_BRIDGE_LANE_ALPHA_FAR", "1.0"))    # 원거리 모델 비중 (1.0=comma경로만)
@@ -511,6 +515,24 @@ def build_model_path(sm, now_mono_s):
             'model_curv': float(mlp.desiredCurvature)}
 
 
+def model_path_to_packet(model_path):
+    """comma 모델 예측경로(modelLanePath) → 외부 UDP 패킷과 동일 포맷의 path dict.
+
+    COMMA_ONLY 모드에서 외부경로 없이 comma 차선유지 경로를 MPC reference 로 직접 쓴다.
+    x,y 는 build_model_path 에서 이미 내부규약(y=LEFT+)으로 변환됨. raw_y 는 진단표시용
+    우향(+) 복원. 이 packet 을 path 로 쓰면 lat_mpc_ctl.update 의 융합은 생략(model_path=None).
+    """
+    x = np.asarray(model_path['x'], dtype=np.float64)
+    y = np.asarray(model_path['y'], dtype=np.float64)
+    return {
+        'x': x,
+        'y': y,
+        'raw_y': -y,
+        'N': int(x.shape[0]),
+        'meta': {'udp_mode': 'comma_only', 'label': 'modelLanePath'},
+    }
+
+
 # ── 종방향 ───────────────────────────────────────────
 def longitudinal_accel(v_ego):
     """TARGET_SPEED 유지 P 제어."""
@@ -931,11 +953,19 @@ def main():
         prev_engaged = engaged
 
         # 3. tracker — 받은 ego-frame path 에 lateral MPC 적용
+        # comma 모델 예측경로(차선중앙) 수신
+        model_path = build_model_path(sm, time.monotonic())
+        # COMMA_ONLY: 외부경로 무시, comma 차선유지 경로를 MPC reference 로 직접 사용.
+        # 모델 stale/없음 → path=None → 제어 정지(fallback).
+        if COMMA_ONLY:
+            path = (model_path_to_packet(model_path)
+                    if (model_path is not None and model_path['weight'] > 0.0) else None)
+
         if path is not None:
-            # comma 모델 예측경로(차선중앙)를 받아 외부경로와 융합 → MPC reference
-            model_path = build_model_path(sm, time.monotonic())
+            # COMMA_ONLY 면 path 가 이미 모델이므로 융합 생략, 아니면 외부경로에 모델 융합.
+            fuse_model = None if COMMA_ONLY else model_path
             # 실제 control 은 MPC, pure pursuit 은 viz·diag·로그 비교용
-            kappa_mpc, mpc_valid, mpc_solve_time, alpha_eff = lat_mpc_ctl.update(path, v_ego, model_path)
+            kappa_mpc, mpc_valid, mpc_solve_time, alpha_eff = lat_mpc_ctl.update(path, v_ego, fuse_model)
             kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path, v_ego)
             a_near = float(alpha_eff[0]) if len(alpha_eff) else 0.0
             a_far = float(alpha_eff[-1]) if len(alpha_eff) else 0.0
@@ -985,7 +1015,12 @@ def main():
             log_counter += 1
             if log_counter % 20 == 1:   # 1Hz
                 cte = float(path['y'][0])
-                fuse_state = "OFF" if model_path is None or model_path['weight'] == 0.0 else f"a={a_near:.2f}→{a_far:.2f}"
+                if COMMA_ONLY:
+                    fuse_state = "COMMA_ONLY"
+                elif model_path is None or model_path['weight'] == 0.0:
+                    fuse_state = "OFF"
+                else:
+                    fuse_state = f"a={a_near:.2f}→{a_far:.2f}"
                 cloudlog.warning(
                     f"track: v_ego={v_ego:.2f} target={TARGET_SPEED_MPS:.2f} "
                     f"κ={kappa:+.4f}(mpc {kappa_mpc:+.4f}{'' if mpc_valid else '!'} "
