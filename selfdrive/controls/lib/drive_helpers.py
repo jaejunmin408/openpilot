@@ -23,20 +23,25 @@ def smooth_value(val, prev_val, tau, dt=DT_MDL):
   return alpha * val + (1 - alpha) * prev_val
 
 def clip_curvature(v_ego, prev_curvature, new_curvature, roll) -> tuple[float, bool]:
-  # This function respects ISO lateral jerk and acceleration limits + a max curvature
-  v_ego = max(v_ego, MIN_SPEED)
-  max_curvature_rate = MAX_LATERAL_JERK / (v_ego ** 2)  # inexact calculation, check https://github.com/commaai/openpilot/pull/24755
-  new_curvature = np.clip(new_curvature,
-                          prev_curvature - max_curvature_rate * DT_CTRL,
-                          prev_curvature + max_curvature_rate * DT_CTRL)
+  # NOTE: [alpa_realcar 실험] ISO lateral jerk / lateral accel / max curvature 제한 전부 해제(bypass).
+  #       원본 제한 로직은 아래 주석으로 보존 — 되돌리려면 주석을 풀고 이 bypass return 을 지울 것.
+  return float(new_curvature), False
 
-  roll_compensation = roll * ACCELERATION_DUE_TO_GRAVITY
-  max_lat_accel = MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation
-  min_lat_accel = -MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation
-  new_curvature, limited_accel = clamp(new_curvature, min_lat_accel / v_ego ** 2, max_lat_accel / v_ego ** 2)
-
-  new_curvature, limited_max_curv = clamp(new_curvature, -MAX_CURVATURE, MAX_CURVATURE)
-  return float(new_curvature), limited_accel or limited_max_curv
+  # ── 원본(제한 적용) ──────────────────────────────────────────────
+  # # This function respects ISO lateral jerk and acceleration limits + a max curvature
+  # v_ego = max(v_ego, MIN_SPEED)
+  # max_curvature_rate = MAX_LATERAL_JERK / (v_ego ** 2)  # inexact calculation, check https://github.com/commaai/openpilot/pull/24755
+  # new_curvature = np.clip(new_curvature,
+  #                         prev_curvature - max_curvature_rate * DT_CTRL,
+  #                         prev_curvature + max_curvature_rate * DT_CTRL)
+  #
+  # roll_compensation = roll * ACCELERATION_DUE_TO_GRAVITY
+  # max_lat_accel = MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation
+  # min_lat_accel = -MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation
+  # new_curvature, limited_accel = clamp(new_curvature, min_lat_accel / v_ego ** 2, max_lat_accel / v_ego ** 2)
+  #
+  # new_curvature, limited_max_curv = clamp(new_curvature, -MAX_CURVATURE, MAX_CURVATURE)
+  # return float(new_curvature), limited_accel or limited_max_curv
 
 
 def get_accel_from_plan(speeds, accels, t_idxs, action_t=DT_MDL, vEgoStopping=0.05):
