@@ -676,6 +676,64 @@ def build_world_path(path_ego, viz_anchor):
     return [{"x": float(wx[i]), "y": float(wy[i])} for i in range(len(px))]
 
 
+def world_to_ego(wx, wy, pose):
+    """world frame (NED) → ego-frame (x=fwd, y=LEFT). pose=(x0,y0,yaw0).
+    ego_to_world 의 역변환. 변환행렬 M=[[c,s],[s,-c]] 은 M²=I (reflection 포함)이라
+    역변환도 동일 형태로 쓴다."""
+    x0, y0, yaw0 = pose
+    c0, s0 = math.cos(yaw0), math.sin(yaw0)
+    dx = wx - x0
+    dy = wy - y0
+    xe = c0 * dx + s0 * dy
+    ye = s0 * dx - c0 * dy
+    return xe, ye
+
+
+def shift_path_to_current_ego(path_ego, anchor_pose, cur_pose):
+    """anchor_pose(수신 시점) ego frame 에서 받은 path 를 cur_pose(현재) ego frame 으로
+    변환한다. 그동안의 차량 이동(전진·횡변위·회전)을 reference 에 반영하는 것이 목적.
+
+    경로는 anchor ego → world → current ego 로 강체변환된다. 차가 지나쳐 뒤로 간
+    점(x<0)은 잘라내고, x=0 경계점을 보간해 path 가 현재 차 위치에서 시작하도록 한다
+    (MPC sampler 는 path 첫 점을 node 0 = 차량 현재 위치로 가정하므로 trim 이 필수).
+
+    반환: 새 path dict (x,y,raw_y,N 갱신, meta·recv_mono_ns 등 보존).
+          전방 유효 점이 2개 미만이면 None (caller 가 직전 curvature 유지)."""
+    x_ego = np.asarray(path_ego['x'], dtype=np.float64)
+    y_ego = np.asarray(path_ego['y'], dtype=np.float64)
+
+    # anchor ego frame → world → current ego frame
+    wx, wy = ego_to_world(x_ego, y_ego, anchor_pose)
+    xs, ys = world_to_ego(wx, wy, cur_pose)
+
+    fwd = np.where(xs >= 0.0)[0]
+    if fwd.size == 0:
+        return None
+    i0 = int(fwd[0])
+    if i0 > 0:
+        # 뒤쪽 점(i0-1, x<0) 과 첫 전방 점(i0, x>=0) 사이 x=0 교점을 보간해 선두점으로
+        xa, ya = xs[i0 - 1], ys[i0 - 1]
+        xb, yb = xs[i0], ys[i0]
+        denom = xb - xa
+        t = (0.0 - xa) / denom if abs(denom) > 1e-6 else 0.0
+        y_cross = ya + t * (yb - ya)
+        new_x = np.concatenate([[0.0], xs[i0:]])
+        new_y = np.concatenate([[y_cross], ys[i0:]])
+    else:
+        new_x = xs
+        new_y = ys
+
+    if new_x.size < 2:
+        return None
+
+    out = dict(path_ego)           # meta, recv_mono_ns 등 부가 키 보존
+    out['x'] = new_x
+    out['y'] = new_y
+    out['raw_y'] = -new_y          # parse 규약(y = -raw_y) 와 일관 유지 (diag 용)
+    out['N'] = int(new_x.size)
+    return out
+
+
 def send_world_path_viz(viz_sock, path_ego, viz_anchor, seq,
                          goal_ego_xy, i_goal, L_d_eff, kappa_raw):
     """확장된 trajectory_world 송신: world path + ego path + goal point + kappa.
@@ -788,6 +846,7 @@ def main():
     lat_mpc_ctl = LatMpcController()   # 받은 path → lateral MPC → desired curvature
     frame_id = 0
     path = None
+    path_anchor = None      # path 수신 시점의 world pose (x,y,yaw). ego-motion 보정 기준
     recv_count = 0
     log_counter = 0
     prev_curvature = 0.0
@@ -816,6 +875,10 @@ def main():
                     pkt['recv_mono_ns'] = time.monotonic_ns()   # 경로 수신 시각 (latency 기준점)
                     recv_count += 1
                     path = pkt
+                    # ego-motion 보정 기준: 수신 시점 world pose 스냅샷 (직전 livePose 기준,
+                    # 최대 ~50ms 지연 → 이후 control loop 와의 delta 만 사용하므로 영향 미미)
+                    cur_w = world.current() if world.is_initialized() else None
+                    path_anchor = (cur_w[1], cur_w[2], cur_w[3]) if cur_w is not None else None
                     new_path = True
                     # 디버그 로그: 수신 path (내부 좌표계, y=left). 한 줄=한 path. engage 중에만.
                     if debug_log is not None:
@@ -902,11 +965,34 @@ def main():
         prev_engaged = engaged
 
         # 3. tracker — 받은 ego-frame path 에 lateral MPC 적용
-        if path is not None:
+        #    수신 후 차가 움직인 만큼 path 를 현재 ego frame 으로 보정(shift+trim)해 stale 방지
+        if path is not None and path_anchor is not None and world.is_initialized():
+            cur_w = world.current()
+            path_eff = shift_path_to_current_ego(path, path_anchor,
+                                                 (cur_w[1], cur_w[2], cur_w[3]))
+        else:
+            path_eff = path   # world 미초기화 등: 보정 없이 원본 (기존 동작 fallback)
+
+        if path is not None and path_eff is None:
+            # ego 가 저장된 path 를 모두 지나침(전방 점 없음) → 직전 curvature 유지
+            kappa = prev_curvature
+            a_cmd = longitudinal_accel(v_ego)
+            action = log.ModelDataV2.Action(
+                desiredCurvature=float(kappa),
+                desiredAcceleration=float(a_cmd),
+                shouldStop=False,
+            )
+            rs = default_resampled()
+            if debug_log is not None:
+                debug_log.write(
+                    f"[t={time.monotonic():.3f}] CURV frame={frame_id} PATH_CONSUMED "
+                    f"hold κ={kappa:+.4f} pkts={recv_count}\n"
+                )
+        elif path_eff is not None:
             # 실제 control 은 MPC, pure pursuit 은 viz·diag·로그 비교용
-            kappa_mpc, mpc_valid, mpc_solve_time = lat_mpc_ctl.update(path, v_ego)
+            kappa_mpc, mpc_valid, mpc_solve_time = lat_mpc_ctl.update(path_eff, v_ego)
             t_curv_ns = time.monotonic_ns()   # curvature 산출 완료 시각
-            kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path, v_ego)
+            kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path_eff, v_ego)
 
             if mpc_valid and v_ego > MIN_LAT_CONTROL_SPEED:
                 kappa = smooth_value(kappa_mpc, prev_curvature, LAT_SMOOTH_SECONDS)
@@ -932,7 +1018,7 @@ def main():
                 desiredAcceleration=float(a_cmd),
                 shouldStop=False,
             )
-            rs = resample_for_viz(path)
+            rs = resample_for_viz(path_eff)
 
             # 디버그 로그: 매 20Hz loop curvature, engage 중에만
             if debug_log is not None:
@@ -941,13 +1027,13 @@ def main():
                     f"mpc={kappa_mpc:+.4f}({'ok' if mpc_valid else 'INVALID'}) "
                     f"pp={kappa_pp:+.4f} sm={kappa:+.4f} "
                     f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} solve={mpc_solve_time*1e3:.1f}ms "
-                    f"cte={float(path['y'][0]):+.2f} pkts={recv_count}\n"
+                    f"cte={float(path_eff['y'][0]):+.2f} pkts={recv_count}\n"
                 )
 
             if diag_writer is not None and frame_id % DIAG_CONTROL_EVERY_N == 0:
                 diag_writer.writerow(
                     build_path_diag_row(
-                        path,
+                        path_eff,
                         event="control",
                         recv_count=recv_count,
                         frame_id=frame_id,
@@ -961,12 +1047,12 @@ def main():
 
             log_counter += 1
             if log_counter % 20 == 1:   # 1Hz
-                cte = float(path['y'][0])
+                cte = float(path_eff['y'][0])
                 cloudlog.warning(
                     f"track: v_ego={v_ego:.2f} target={TARGET_SPEED_MPS:.2f} "
                     f"κ={kappa:+.4f}(mpc {kappa_mpc:+.4f}{'' if mpc_valid else '!'} "
                     f"pp {kappa_pp:+.4f}) a={a_cmd:+.2f} "
-                    f"L_d={L_d_eff:.1f} i_goal={i_goal} N={path['N']} "
+                    f"L_d={L_d_eff:.1f} i_goal={i_goal} N={path_eff['N']} "
                     f"cte={cte:+.2f} pkts={recv_count}"
                 )
         else:
