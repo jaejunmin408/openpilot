@@ -55,8 +55,17 @@ ACCEL_MAX = 2.0
 MIN_LAT_CONTROL_SPEED = 0.3          # 이 속도 이하에서는 직전 curvature 유지
 
 # ── pure pursuit 파라미터 ────────────────────────────
-PP_LOOKAHEAD_M = 5.0                 # 고정 look-ahead
+PP_LOOKAHEAD_M = 5.0                 # (diag/기본값) 고정 look-ahead
 PP_CURV_LIMIT = 0.2
+
+# ── adaptive look-ahead 파라미터 ─────────────────────
+# path 곡률에 따라 look-ahead 거리를 MIN~MAX 사이로 가변.
+# 직선 구간은 짧게(MIN), 곡률이 있으면 길게(MAX) 보고 pure pursuit 한다.
+PP_LOOKAHEAD_MIN_M = 4.0             # 직선 구간 기본 look-ahead
+PP_LOOKAHEAD_MAX_M = 8.0             # 곡률 큰 구간 최대 look-ahead
+PP_CURV_LOW = 0.02                   # 이 이하 곡률(1/m, R≈50m) → MIN 유지
+PP_CURV_HIGH = 0.08                  # 이 이상 곡률(1/m, R≈12.5m) → MAX 까지
+PP_CURV_FIT_WINDOW_M = 12.0          # 곡률 추정에 쓰는 전방 구간 길이(m)
 
 # ── 디버그 로그 ──────────────────────────────────────
 DEBUG_LOG_DIR = os.path.join(BASEDIR, "logs")
@@ -166,6 +175,50 @@ def parse_path_packet(data: bytes):
         'N': int(x.shape[0]),
         'meta': _packet_meta(d),
     }
+
+
+# ── adaptive look-ahead (곡률 기반) ──────────────────
+def path_curvature_estimate(path_ego, window_m=PP_CURV_FIT_WINDOW_M):
+    """전방 window_m 구간 path 점을 2차 다항식으로 fit 해 대표 곡률(|1/m|) 추정.
+
+    y ≈ a·x² + b·x + c  로 근사하면 원점 부근 곡률은
+        κ ≈ |2a| / (1 + b²)^1.5
+    최소제곱 fit 이라 점 노이즈에 비교적 강건하다.
+    """
+    x = np.asarray(path_ego['x'], dtype=np.float64)
+    y = np.asarray(path_ego['y'], dtype=np.float64)
+
+    mask = (x > 0.0) & (x <= window_m)
+    if mask.sum() < 3:
+        mask = x > 0.0                      # window 안에 점이 부족하면 전방 전체 사용
+    xs = x[mask]
+    ys = y[mask]
+    if xs.size < 3:
+        return 0.0
+
+    try:
+        a, b, _ = np.polyfit(xs, ys, 2)
+    except (np.linalg.LinAlgError, ValueError):
+        return 0.0
+
+    kappa = abs(2.0 * a) / (1.0 + b * b) ** 1.5
+    return float(kappa) if math.isfinite(kappa) else 0.0
+
+
+def adaptive_lookahead(path_ego):
+    """path 곡률에 따라 look-ahead 거리를 MIN~MAX 사이로 가변해서 반환.
+
+    곡률이 PP_CURV_LOW 이하면 MIN, PP_CURV_HIGH 이상이면 MAX,
+    그 사이는 선형 보간. (ld_m, kappa_path) 반환.
+    """
+    kappa = path_curvature_estimate(path_ego)
+    if PP_CURV_HIGH <= PP_CURV_LOW:
+        frac = 1.0 if kappa >= PP_CURV_HIGH else 0.0
+    else:
+        frac = (kappa - PP_CURV_LOW) / (PP_CURV_HIGH - PP_CURV_LOW)
+        frac = float(np.clip(frac, 0.0, 1.0))
+    ld = PP_LOOKAHEAD_MIN_M + frac * (PP_LOOKAHEAD_MAX_M - PP_LOOKAHEAD_MIN_M)
+    return float(ld), kappa
 
 
 # ── pure pursuit (lateral) ───────────────────────────
@@ -705,7 +758,8 @@ def main():
                         pass
                     # 패킷 도착 시점 pure pursuit 1회 → goal + raw kappa snapshot
                     v_ego_now = max(sm["carState"].vEgo, 0.0) if sm.alive["carState"] else 0.0
-                    kappa_pp_pkt, i_goal_pkt, L_d_eff_pkt = pure_pursuit_curvature(pkt, v_ego_now)
+                    ld_cmd_pkt, _ = adaptive_lookahead(pkt)
+                    kappa_pp_pkt, i_goal_pkt, L_d_eff_pkt = pure_pursuit_curvature(pkt, v_ego_now, lookahead_m=ld_cmd_pkt)
                     if diag_writer is not None:   # engage 중에만 기록
                         now_wall_us = time.time_ns() // 1000
                         now_mono_s = time.monotonic()
@@ -765,7 +819,8 @@ def main():
 
         # 3. tracker — 받은 ego-frame path 에 곧장 pure pursuit
         if path is not None:
-            kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path, v_ego)
+            ld_cmd, kappa_path = adaptive_lookahead(path)
+            kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path, v_ego, lookahead_m=ld_cmd)
 
             if v_ego > MIN_LAT_CONTROL_SPEED:
                 kappa = smooth_value(kappa_pp, prev_curvature, LAT_SMOOTH_SECONDS)
@@ -786,6 +841,7 @@ def main():
                 debug_log.write(
                     f"[t={time.monotonic():.3f}] CURV frame={frame_id} v_ego={v_ego:.2f} "
                     f"raw={kappa_pp:+.4f} sm={kappa:+.4f} "
+                    f"ld_cmd={ld_cmd:.2f} kappa_path={kappa_path:.4f} "
                     f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} "
                     f"cte={float(path['y'][0]):+.2f} pkts={recv_count}\n"
                 )
@@ -811,6 +867,7 @@ def main():
                 cloudlog.warning(
                     f"track: v_ego={v_ego:.2f} target={TARGET_SPEED_MPS:.2f} "
                     f"κ={kappa:+.4f}(raw {kappa_pp:+.4f}) a={a_cmd:+.2f} "
+                    f"ld_cmd={ld_cmd:.1f}(κ_path={kappa_path:.4f}) "
                     f"L_d={L_d_eff:.1f} i_goal={i_goal} N={path['N']} "
                     f"cte={cte:+.2f} pkts={recv_count}"
                 )
