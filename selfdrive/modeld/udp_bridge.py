@@ -75,6 +75,16 @@ MPC_TAIL_HEADING_LEN = 3.0     # path 끝 접선 heading 추정용 lookback [m]
 MPC_TAIL_WEIGHT_TAU = 3.0      # 유효 범위 밖 노드 weight 지수감쇠 시상수 [node]
 MPC_TAIL_WEIGHT_FLOOR = 0.05   # tail reference weight 하한
 
+# ── 시간축 경로 재원점화 (time-axis path re-origin) ──
+# 위치(ego-motion)는 무시하고, "속도×시간" 만큼 경로를 따라 진행했다고 가정해
+# 그 지점을 새 (0,0) 으로 잡는다. 두 가지 advance:
+#  1) 패킷 수신 시 inference_time 만큼(v·inference_time) 건너뛰고 시작 (latency 선보상)
+#  2) 같은 path 사용 중 path 송신 주기(기본 10Hz)마다 v·Δt 만큼 추가 진행
+TIME_AXIS_REORIGIN = True          # False 면 기존(원본 path 그대로) 동작
+TIME_AXIS_REORIGIN_PERIOD_S = 0.1  # 재원점화 주기 [s] (10Hz). 0 이면 매 control 루프(20Hz)
+DEFAULT_INFERENCE_TIME_S = 1.0     # 패킷 meta 에 inference_time_s 없을 때 fallback
+REORIGIN_TANGENT_LEN_M = 1.0       # 새 원점 접선(heading) 추정용 전방 lookahead [m]
+
 # ── 디버그 로그 ──────────────────────────────────────
 DEBUG_LOG_DIR = os.path.join(BASEDIR, "logs")
 DIAG_LOG_DIR = os.environ.get("UDP_BRIDGE_DIAG_LOG_DIR", DEBUG_LOG_DIR)
@@ -263,6 +273,112 @@ def sample_path_for_mpc(path_ego, v_plan):
     heading = np.arctan2(np.gradient(y_s), np.maximum(np.gradient(x_s), 1e-3))
     yaw_rate = np.gradient(heading, T_IDXS)
     return y_s, heading, yaw_rate, n_valid
+
+
+def reorigin_path_by_arclength(x, y, s_off, tangent_len=REORIGIN_TANGENT_LEN_M):
+    """ego-frame path(x=fwd, y=left)를 호길이 s_off 지점이 새 (0,0) 이 되도록 재원점화.
+
+    "차가 path 를 따라 s_off 만큼 진행했다" 고 가정(위치 측정 무시)하고, 그 지점의
+    pose(위치=P(s_off), heading=그 지점 접선) 기준 frame 으로 남은 path 를 옮긴다.
+      1) P(s_off) 를 원점으로 평행이동
+      2) P(s_off) 의 접선각 psi 만큼 역회전 → 새 원점에서 진행방향이 +x
+    s_off >= 전체 길이면 끝점으로 clamp(=남은 path 없음, 끝점만).
+    반환: (nx, ny, s_off_clamped, s_end)
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    ds = np.hypot(np.diff(x), np.diff(y))
+    s = np.concatenate([[0.0], np.cumsum(ds)])
+    s_end = float(s[-1])
+    s_off = float(np.clip(s_off, 0.0, s_end))
+
+    # 새 원점 P(s_off) 와 접선 heading
+    x0 = float(np.interp(s_off, s, x))
+    y0 = float(np.interp(s_off, s, y))
+    s_ahead = min(s_off + tangent_len, s_end)
+    xa = float(np.interp(s_ahead, s, x))
+    ya = float(np.interp(s_ahead, s, y))
+    psi = math.atan2(ya - y0, max(xa - x0, 1e-3))
+
+    # s_off 이후의 원본 점들 + 정확한 원점 점을 합쳐서 변환
+    mask = s >= s_off
+    xs = np.concatenate([[x0], x[mask]])
+    ys = np.concatenate([[y0], y[mask]])
+    dx = xs - x0
+    dy = ys - y0
+    c, sn = math.cos(psi), math.sin(psi)
+    # R(-psi): 새 frame(진행방향=+x) 좌표
+    nx = c * dx + sn * dy
+    ny = -sn * dx + c * dy
+    return nx, ny, s_off, s_end
+
+
+class TimeAxisPathManager:
+    """들어온 path 를 위치가 아닌 "속도×시간" 으로만 진행시키는 시간축 관리자.
+
+    - on_new_packet: 새 path 저장 + inference_time 만큼(v·inf_t) 건너뛴 지점을 시작 원점으로.
+    - current: 마지막 재원점화 후 PERIOD 경과 시, 그 사이 진행거리(v·Δt)만큼 s_off 를
+      더 전진시켜 다시 재원점화한다. 경과 전이면 직전 결과를 그대로 반환.
+    위치(ego-motion/livePose)는 일절 쓰지 않는다 — path 를 정확히 따라간다고 가정.
+    """
+
+    def __init__(self, period_s=TIME_AXIS_REORIGIN_PERIOD_S):
+        self.period_s = float(period_s)
+        self._reset_state()
+
+    def _reset_state(self):
+        self._raw = None          # 원본 path dict (수신 frame)
+        self._s_off = 0.0         # 원본 path 위 누적 진행 호길이
+        self._s_end = 0.0
+        self._last_mono = None    # 마지막 current() 시각
+        self._accum_t = 0.0       # 마지막 재원점화 이후 누적 경과시간
+        self._cached = None       # 마지막 재원점화 결과 path dict
+
+    def on_new_packet(self, pkt, v_ego, now_mono):
+        """새 패킷 수신: inference_time 만큼 건너뛴 지점을 시작 원점으로 설정."""
+        if not pkt.get('has_path') or pkt.get('x') is None:
+            return
+        inf_t = pkt['meta'].get('inference_time_s')
+        if inf_t is None or not math.isfinite(inf_t) or inf_t < 0:
+            inf_t = DEFAULT_INFERENCE_TIME_S
+        self._raw = pkt
+        self._s_off = max(float(v_ego), 0.0) * float(inf_t)   # latency 선보상
+        self._last_mono = now_mono
+        self._accum_t = 0.0
+        self._cached = self._build(v_ego)
+
+    def _build(self, v_ego):
+        nx, ny, s_off, s_end = reorigin_path_by_arclength(
+            self._raw['x'], self._raw['y'], self._s_off)
+        self._s_off = s_off
+        self._s_end = s_end
+        return {
+            **self._raw,
+            'x': nx,
+            'y': ny,
+            'raw_y': ny,            # diag 안전용 (재원점화 후 좌우 부호는 y 와 동일 처리)
+            'N': int(len(nx)),
+            's_off': s_off,         # 디버그용: 현재 진행 호길이
+            's_end': s_end,
+        }
+
+    def current(self, v_ego, now_mono):
+        """현재 시각 기준 재원점화된 path 반환 (없으면 None)."""
+        if self._raw is None or self._cached is None:
+            return None
+        if self._last_mono is not None:
+            dt = max(now_mono - self._last_mono, 0.0)
+            self._accum_t += dt
+        self._last_mono = now_mono
+        # 주기 경과 시 그 사이 진행거리(v·Δt)만큼 전진 후 재원점화
+        if self._accum_t >= self.period_s:
+            self._s_off += max(float(v_ego), 0.0) * self._accum_t
+            self._accum_t = 0.0
+            self._cached = self._build(v_ego)
+        return self._cached
+
+    def reset(self):
+        self._reset_state()
 
 
 class LatMpcController:
@@ -786,6 +902,7 @@ def main():
 
     world = LocalWorld()        # viz only (vehicle trail)
     lat_mpc_ctl = LatMpcController()   # 받은 path → lateral MPC → desired curvature
+    time_path_mgr = TimeAxisPathManager()   # 시간축 재원점화 (위치 무시, 속도×시간)
     frame_id = 0
     path = None
     recv_count = 0
@@ -830,6 +947,9 @@ def main():
                         pass
                     # 패킷 도착 시점 pure pursuit 1회 → goal + raw kappa snapshot
                     v_ego_now = max(sm["carState"].vEgo, 0.0) if sm.alive["carState"] else 0.0
+                    # 시간축 재원점화: 새 패킷을 inference_time 만큼 건너뛴 지점부터 시작
+                    if TIME_AXIS_REORIGIN:
+                        time_path_mgr.on_new_packet(pkt, v_ego_now, time.monotonic())
                     kappa_pp_pkt, i_goal_pkt, L_d_eff_pkt = pure_pursuit_curvature(pkt, v_ego_now)
                     if diag_writer is not None:   # engage 중에만 기록
                         now_wall_us = time.time_ns() // 1000
@@ -903,10 +1023,17 @@ def main():
 
         # 3. tracker — 받은 ego-frame path 에 lateral MPC 적용
         if path is not None:
+            # 시간축 재원점화: 위치 무시, 속도×시간으로 진행한 지점을 (0,0) 으로 한 path.
+            # 비활성(TIME_AXIS_REORIGIN=False)이거나 아직 준비 안됐으면 원본 path 사용.
+            path_eff = time_path_mgr.current(v_ego, time.monotonic()) if TIME_AXIS_REORIGIN else None
+            if path_eff is None:
+                path_eff = path
+            s_off_dbg = float(path_eff.get('s_off', 0.0))
+
             # 실제 control 은 MPC, pure pursuit 은 viz·diag·로그 비교용
-            kappa_mpc, mpc_valid, mpc_solve_time = lat_mpc_ctl.update(path, v_ego)
+            kappa_mpc, mpc_valid, mpc_solve_time = lat_mpc_ctl.update(path_eff, v_ego)
             t_curv_ns = time.monotonic_ns()   # curvature 산출 완료 시각
-            kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path, v_ego)
+            kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path_eff, v_ego)
 
             if mpc_valid and v_ego > MIN_LAT_CONTROL_SPEED:
                 kappa = smooth_value(kappa_mpc, prev_curvature, LAT_SMOOTH_SECONDS)
@@ -932,7 +1059,7 @@ def main():
                 desiredAcceleration=float(a_cmd),
                 shouldStop=False,
             )
-            rs = resample_for_viz(path)
+            rs = resample_for_viz(path_eff)
 
             # 디버그 로그: 매 20Hz loop curvature, engage 중에만
             if debug_log is not None:
@@ -941,7 +1068,7 @@ def main():
                     f"mpc={kappa_mpc:+.4f}({'ok' if mpc_valid else 'INVALID'}) "
                     f"pp={kappa_pp:+.4f} sm={kappa:+.4f} "
                     f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} solve={mpc_solve_time*1e3:.1f}ms "
-                    f"cte={float(path['y'][0]):+.2f} pkts={recv_count}\n"
+                    f"s_off={s_off_dbg:.2f} cte={float(path_eff['y'][0]):+.2f} pkts={recv_count}\n"
                 )
 
             if diag_writer is not None and frame_id % DIAG_CONTROL_EVERY_N == 0:
@@ -974,6 +1101,7 @@ def main():
             rs = default_resampled()
             prev_curvature = 0.0
             lat_mpc_ctl.reset()
+            time_path_mgr.reset()
 
         # 4. 메시지 발행
         mv2_lmt = publish_messages(pm, rs, action, frame_id, v_ego)
