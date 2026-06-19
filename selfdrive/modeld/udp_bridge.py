@@ -58,6 +58,8 @@ ACCEL_MAX = 2.0
 
 MIN_LAT_CONTROL_SPEED = 0.3          # 이 속도 이하에서는 직전 curvature 유지
 
+CURV_DEADZONE = 0.01                  # |curvature| 이 이하면 0 으로 (직진 데드존)
+
 # ── pure pursuit 파라미터 (viz·diag 비교용) ──────────
 PP_LOOKAHEAD_M = 5.0                 # 고정 look-ahead
 PP_CURV_LIMIT = 0.2
@@ -913,6 +915,10 @@ def main():
             else:
                 kappa = prev_curvature
             prev_curvature = kappa
+
+            # 직진 데드존: |curvature| 이 임계 이하면 제어 입력을 0 으로
+            if abs(kappa) <= CURV_DEADZONE:
+                kappa = 0.0
 
             # 새 path 첫 처리: 수신→curvature 산출 latency 를 터미널에 출력
             if new_path:
