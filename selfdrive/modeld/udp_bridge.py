@@ -74,6 +74,13 @@ PP_CURV_LIMIT = 0.2
 #   예) 0.5 → path 중간 인덱스, 1.0 → path 끝점, 0.0 → 첫 점
 PP_INDEX_FRAC = 0.5
 
+# ── 곡률 적응형 goal 선택 (2단계, 좌우 대칭) ─────────
+# 원점(0,0)→경로 끝점 방위각 θ=atan2(y_end, x_end) 로 회전 severity 판단.
+# |θ| 가 TURN_ANGLE_THRESH_DEG 이상이면 심한 회전 구간 → PP_INDEX_FRAC_TURN 사용.
+# (좌회전 θ>0, 우회전 θ<0 이지만 크기만 보므로 좌우 대칭)
+TURN_ANGLE_THRESH_DEG = 15.0         # 끝점 방위각 |θ| 이 이상이면 회전으로 간주
+PP_INDEX_FRAC_TURN = 0.7             # 회전 구간에서 쓰는 (더 먼) goal 인덱스 비율
+
 # ── path slicing 파라미터 ────────────────────────────
 SLICE_DT_S = 0.1                     # 10Hz: 이 주기마다 그동안 이동한 만큼 slice 전진
 
@@ -230,6 +237,26 @@ def pure_pursuit_curvature(path_ego, v_ego, lookahead_m=None, index_frac=None):
     kappa = 2.0 * y_goal / (L_d_eff * L_d_eff)
     kappa = float(np.clip(kappa, -PP_CURV_LIMIT, PP_CURV_LIMIT))
     return kappa, goal_idx, L_d_eff
+
+
+# ── 곡률 적응형 goal 인덱스 비율 선택 ────────────────
+def endpoint_bearing_deg(path_ego):
+    """원점(0,0)→경로 끝점 방위각 θ=atan2(y_end, x_end) [deg]. 좌회전 +, 우회전 −."""
+    x = np.asarray(path_ego['x'], dtype=np.float64)
+    y = np.asarray(path_ego['y'], dtype=np.float64)
+    if x.size == 0:
+        return 0.0
+    return math.degrees(math.atan2(float(y[-1]), float(x[-1])))
+
+
+def select_index_frac(path_ego):
+    """끝점 방위각 크기로 goal 인덱스 비율을 2단계로 선택 (좌우 대칭).
+    |θ| >= TURN_ANGLE_THRESH_DEG → PP_INDEX_FRAC_TURN, 아니면 PP_INDEX_FRAC.
+    반환: (index_frac, theta_deg)
+    """
+    theta_deg = endpoint_bearing_deg(path_ego)
+    frac = PP_INDEX_FRAC_TURN if abs(theta_deg) >= TURN_ANGLE_THRESH_DEG else PP_INDEX_FRAC
+    return frac, theta_deg
 
 
 # ── path slicing (10Hz re-zero) ──────────────────────
@@ -798,7 +825,8 @@ def main():
                         pass
                     # 패킷 도착 시점 pure pursuit 1회 → goal + raw kappa snapshot
                     v_ego_now = max(sm["carState"].vEgo, 0.0) if sm.alive["carState"] else 0.0
-                    kappa_pp_pkt, i_goal_pkt, L_d_eff_pkt = pure_pursuit_curvature(pkt, v_ego_now, index_frac=PP_INDEX_FRAC)
+                    index_frac_pkt, _ = select_index_frac(pkt)
+                    kappa_pp_pkt, i_goal_pkt, L_d_eff_pkt = pure_pursuit_curvature(pkt, v_ego_now, index_frac=index_frac_pkt)
                     if diag_writer is not None:   # engage 중에만 기록
                         now_wall_us = time.time_ns() // 1000
                         now_mono_s = time.monotonic()
@@ -870,7 +898,8 @@ def main():
         # 3. tracker — path 를 slice_s 만큼 잘라 re-zero 한 뒤 pure pursuit
         if path is not None:
             sliced = slice_and_rezero(path, slice_s)
-            kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(sliced, v_ego, index_frac=PP_INDEX_FRAC)
+            index_frac, theta_deg = select_index_frac(sliced)
+            kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(sliced, v_ego, index_frac=index_frac)
 
             if v_ego > MIN_LAT_CONTROL_SPEED:
                 kappa = smooth_value(kappa_pp, prev_curvature, LAT_SMOOTH_SECONDS)
@@ -895,8 +924,8 @@ def main():
                 debug_log.write(
                     f"[t={time.monotonic():.3f}] CURV frame={frame_id} v_ego={v_ego:.2f} "
                     f"raw={kappa_pp:+.4f} sm={kappa:+.4f} "
-                    f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} slice_s={slice_s:.2f} "
-                    f"cte={float(path['y'][0]):+.2f} pkts={recv_count}\n"
+                    f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} frac={index_frac:.2f} theta={theta_deg:+.1f} "
+                    f"slice_s={slice_s:.2f} cte={float(path['y'][0]):+.2f} pkts={recv_count}\n"
                 )
 
             if diag_writer is not None and frame_id % DIAG_CONTROL_EVERY_N == 0:
@@ -921,7 +950,7 @@ def main():
                 cloudlog.warning(
                     f"track: v_ego={v_ego:.2f} target={TARGET_SPEED_MPS:.2f} "
                     f"κ={kappa:+.4f}(raw {kappa_pp:+.4f}) a={a_cmd:+.2f} "
-                    f"L_d={L_d_eff:.1f} i_goal={i_goal} N={path['N']} "
+                    f"L_d={L_d_eff:.1f} i_goal={i_goal} frac={index_frac:.2f} theta={theta_deg:+.1f} N={path['N']} "
                     f"slice_s={slice_s:.2f} cte={cte:+.2f} pkts={recv_count}"
                 )
         else:
