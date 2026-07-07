@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>실제 주행 경로 (live)</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0d1117; color: #e6edf3;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; overflow: hidden; }
+  #wrap { position: fixed; inset: 0; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #hud { position: fixed; top: 12px; left: 12px; background: rgba(22,27,34,.82);
+    border: 1px solid #30363d; border-radius: 8px; padding: 10px 12px; font-size: 12px;
+    line-height: 1.7; min-width: 190px; backdrop-filter: blur(4px); }
+  #hud .row { display: flex; justify-content: space-between; gap: 16px; }
+  #hud .k { color: #8b949e; }
+  #hud .v { color: #e6edf3; font-variant-numeric: tabular-nums; }
+  #dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: #f85149; margin-right: 6px; vertical-align: middle; }
+  #dot.on { background: #3fb950; }
+  #ctrl { position: fixed; top: 12px; right: 12px; display: flex; flex-direction: column; gap: 6px; }
+  #ctrl button { background: rgba(22,27,34,.82); color: #e6edf3; border: 1px solid #30363d;
+    border-radius: 6px; padding: 7px 12px; font: inherit; font-size: 12px; cursor: pointer; }
+  #ctrl button:hover { border-color: #58a6ff; }
+  #ctrl button.active { border-color: #58a6ff; color: #58a6ff; }
+  #hint { position: fixed; bottom: 10px; left: 12px; font-size: 11px; color: #6e7681; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cv"></canvas></div>
+
+<div id="hud">
+  <div class="row"><span class="k"><span id="dot"></span>연결</span><span class="v" id="conn">…</span></div>
+  <div class="row"><span class="k">속도</span><span class="v" id="spd">–</span></div>
+  <div class="row"><span class="k">이동거리</span><span class="v" id="dist">–</span></div>
+  <div class="row"><span class="k">경로 점</span><span class="v" id="npts">0</span></div>
+  <div class="row"><span class="k">현재 x, y</span><span class="v" id="xy">–</span></div>
+  <div class="row"><span class="k">배율</span><span class="v" id="scale">–</span></div>
+</div>
+
+<div id="ctrl">
+  <button id="btnFit" class="active">자동 맞춤</button>
+  <button id="btnFollow">차량 추적</button>
+  <button id="btnClear">화면 초기화</button>
+</div>
+
+<div id="hint">드래그: 이동 · 휠: 확대/축소 · (자동 맞춤/추적 켜면 수동 조작 시 자동 해제)</div>
+
+<script>
+// ── 좌표 규약 ─────────────────────────────────────────────
+// world: x=North, y=East (m). 화면: 오른쪽=East(y), 위=North(x).
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+let DPR = window.devicePixelRatio || 1;
+
+let pts = [];           // [{x, y, yaw}]  누적 경로 (world)
+let vehicle = null;     // {x, y, yaw, speed}
+let distTotal = 0;      // 누적 이동거리 (m)
+let prevPt = null;
+
+// view: 화면 중심에 오는 world 좌표(cx,cy) + 배율(scale, px/m)
+let view = { cx: 0, cy: 0, scale: 8 };
+let autoFit = true, follow = false;
+let dragging = false, lastMouse = null, userMoved = false;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  cv.width = Math.floor(cv.clientWidth * DPR);
+  cv.height = Math.floor(cv.clientHeight * DPR);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// world → screen (px)
+function toScreen(wx, wy) {
+  // 화면 오른쪽 = East(wy), 화면 위 = North(wx)
+  const sx = (wy - view.cy) * view.scale + cv.width / 2;
+  const sy = cv.height / 2 - (wx - view.cx) * view.scale;
+  return [sx, sy];
+}
+function screenToWorld(sx, sy) {
+  const wy = (sx - cv.width / 2) / view.scale + view.cy;
+  const wx = (cv.height / 2 - sy) / view.scale + view.cx;
+  return [wx, wy];
+}
+
+function fitToPath() {
+  if (pts.length === 0) return;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const p of pts) {
+    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+  }
+  if (vehicle) {
+    minX = Math.min(minX, vehicle.x); maxX = Math.max(maxX, vehicle.x);
+    minY = Math.min(minY, vehicle.y); maxY = Math.max(maxY, vehicle.y);
+  }
+  const spanX = Math.max(maxX - minX, 2);
+  const spanY = Math.max(maxY - minY, 2);
+  view.cx = (minX + maxX) / 2;
+  view.cy = (minY + maxY) / 2;
+  const pad = 0.85;
+  const sX = (cv.height * pad) / spanX;
+  const sY = (cv.width * pad) / spanY;
+  view.scale = Math.max(0.5, Math.min(sX, sY));
+}
+
+function draw() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, cv.width, cv.height);
+
+  if (autoFit) fitToPath();
+  else if (follow && vehicle) { view.cx = vehicle.x; view.cy = vehicle.y; }
+
+  drawGrid();
+
+  // 경로 폴리라인
+  if (pts.length > 1) {
+    ctx.beginPath();
+    for (let i = 0; i < pts.length; i++) {
+      const [sx, sy] = toScreen(pts[i].x, pts[i].y);
+      i === 0 ? ctx.moveTo(sx, sy) : ctx.lineTo(sx, sy);
+    }
+    ctx.strokeStyle = '#58a6ff';
+    ctx.lineWidth = 2 * DPR;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+  }
+
+  // 시작점
+  if (pts.length > 0) {
+    const [sx, sy] = toScreen(pts[0].x, pts[0].y);
+    ctx.fillStyle = '#3fb950';
+    ctx.beginPath(); ctx.arc(sx, sy, 5 * DPR, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = '#8b949e'; ctx.font = `${11 * DPR}px monospace`;
+    ctx.fillText('start', sx + 8 * DPR, sy - 6 * DPR);
+  }
+
+  // 현재 차량 (진행방향 삼각형)
+  if (vehicle && vehicle.have) {
+    const [sx, sy] = toScreen(vehicle.x, vehicle.y);
+    // yaw = orientationNED.z (North 기준, East 방향으로 +). 화면상 진행벡터:
+    const hx = Math.cos(vehicle.yaw), hy = Math.sin(vehicle.yaw); // world (North, East)
+    // 화면 벡터: 오른쪽=East(hy), 위=North(hx)
+    const ang = Math.atan2(hy, hx);   // screen: dx=East, dy=-North
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(-ang + Math.PI / 2);   // 삼각형 위쪽을 진행방향에 맞춤
+    ctx.beginPath();
+    const s = 9 * DPR;
+    ctx.moveTo(0, -s); ctx.lineTo(s * 0.7, s * 0.8); ctx.lineTo(-s * 0.7, s * 0.8);
+    ctx.closePath();
+    ctx.fillStyle = '#f0883e';
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawGrid() {
+  // world 격자 (배율에 맞춰 10/20/50/100 m 단위 선택)
+  const targetPx = 80 * DPR;
+  let step = 1;
+  const raw = targetPx / view.scale;
+  const nice = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
+  for (const n of nice) { if (n >= raw) { step = n; break; } step = n; }
+  const [w0x, w0y] = screenToWorld(0, cv.height);
+  const [w1x, w1y] = screenToWorld(cv.width, 0);
+  ctx.strokeStyle = '#21262d';
+  ctx.lineWidth = 1;
+  ctx.fillStyle = '#484f58';
+  ctx.font = `${10 * DPR}px monospace`;
+  // East(y) 방향 세로선
+  for (let y = Math.floor(w0y / step) * step; y <= w1y; y += step) {
+    const [sx] = toScreen(w0x, y);
+    ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, cv.height); ctx.stroke();
+    ctx.fillText(y.toFixed(0), sx + 3, cv.height - 4);
+  }
+  // North(x) 방향 가로선
+  for (let x = Math.floor(w0x / step) * step; x <= w1x; x += step) {
+    const [, sy] = toScreen(x, w0y);
+    ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(cv.width, sy); ctx.stroke();
+    ctx.fillText(x.toFixed(0), 3, sy - 3);
+  }
+}
+
+// ── HUD ────────────────────────────────────────────────
+function updateHud() {
+  document.getElementById('npts').textContent = pts.length;
+  document.getElementById('dist').textContent = distTotal >= 1000
+    ? (distTotal / 1000).toFixed(2) + ' km' : distTotal.toFixed(1) + ' m';
+  document.getElementById('scale').textContent = view.scale.toFixed(1) + ' px/m';
+  if (vehicle && vehicle.have) {
+    document.getElementById('spd').textContent =
+      vehicle.speed.toFixed(2) + ' m/s (' + (vehicle.speed * 3.6).toFixed(1) + ' km/h)';
+    document.getElementById('xy').textContent =
+      vehicle.x.toFixed(1) + ', ' + vehicle.y.toFixed(1);
+  }
+}
+
+// ── SSE (Server-Sent Events) ───────────────────────────
+const dot = document.getElementById('dot');
+const conn = document.getElementById('conn');
+function connect() {
+  const es = new EventSource('/stream');
+  es.onopen = () => { dot.classList.add('on'); conn.textContent = '연결됨'; };
+  es.onerror = () => { dot.classList.remove('on'); conn.textContent = '끊김 · 재접속…'; };
+  es.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.reset) { pts = []; distTotal = 0; prevPt = null; }
+    for (const p of m.points) {
+      if (prevPt) distTotal += Math.hypot(p.x - prevPt.x, p.y - prevPt.y);
+      pts.push(p); prevPt = p;
+    }
+    vehicle = m.vehicle;
+    updateHud();
+  };
+}
+connect();
+
+// ── 애니메이션 루프 ─────────────────────────────────────
+function loop() { draw(); requestAnimationFrame(loop); }
+loop();
+
+// ── 컨트롤 ──────────────────────────────────────────────
+const btnFit = document.getElementById('btnFit');
+const btnFollow = document.getElementById('btnFollow');
+function setMode(fit, fol) {
+  autoFit = fit; follow = fol;
+  btnFit.classList.toggle('active', fit);
+  btnFollow.classList.toggle('active', fol);
+}
+btnFit.onclick = () => setMode(!autoFit, false);
+btnFollow.onclick = () => setMode(false, !follow);
+document.getElementById('btnClear').onclick = () => { pts = []; distTotal = 0; prevPt = null; };
+
+cv.addEventListener('mousedown', (e) => { dragging = true; lastMouse = [e.clientX, e.clientY]; });
+window.addEventListener('mouseup', () => { dragging = false; });
+window.addEventListener('mousemove', (e) => {
+  if (!dragging) return;
+  setMode(false, false);
+  const dx = (e.clientX - lastMouse[0]) * DPR, dy = (e.clientY - lastMouse[1]) * DPR;
+  view.cy -= dx / view.scale;   // 화면 오른쪽 이동 = East 증가
+  view.cx += dy / view.scale;   // 화면 아래 이동 = North 감소
+  lastMouse = [e.clientX, e.clientY];
+});
+cv.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  setMode(false, follow);
+  const f = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+  view.scale = Math.max(0.2, Math.min(200, view.scale * f));
+}, { passive: false });
+</script>
+</body>
+</html>
