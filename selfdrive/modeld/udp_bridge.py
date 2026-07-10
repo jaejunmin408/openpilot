@@ -13,14 +13,8 @@ ego-frame JSON으로 보내준다.
 매 패킷이 그 시점 차량 위치 기준으로 잘려 들어오므로 anchor/world 변환 없이
 받은 path를 그대로 ego-frame path로 사용한다.
 
-[10Hz path slicing]
-패킷은 실차에서 ~1s 간격으로만 갱신되므로, 받은 path 하나로 ego 원점(0,0)에서
-pure pursuit 을 돌리면 그 1s 동안 curvature 가 고정된다. 대신 path 를 잡고 있는
-동안 SLICE_DT_S(=0.1s, 10Hz)마다 그동안 이동한 arc-length 만큼 path 위를 전진해
-그 지점을 새 원점(0,0)·전방축으로 re-zero 한 "잘린 경로"를 만들고, 거기서 pure
-pursuit 으로 curvature 를 다시 산출한다. 즉 10Hz 마다 새 path 를 만들어 가며
-curvature 가 path 의 곡률 프로파일을 따라 변한다. 새 패킷이 오면 slice offset 을
-0 으로 리셋한다.
+받은 path 를 매 루프 ego 원점(0,0)에서 그대로 pure pursuit 으로 따라간다.
+slice/re-zero 없이 최신 패킷 path 를 그대로 쓰며, 새 패킷이 오면 교체된다.
 
 종방향은 TARGET_SPEED_MPS(=15 km/h) 유지 P 제어.
 """
@@ -73,9 +67,6 @@ PP_CURV_LIMIT = 0.2
 #   PP_INDEX_FRAC 이 [0.0, 1.0] 값이면 → 들어온 path 인덱스의 그 비율 지점을 goal 로
 #   예) 0.5 → path 중간 인덱스, 1.0 → path 끝점, 0.0 → 첫 점
 PP_INDEX_FRAC = 0.5
-
-# ── path slicing 파라미터 ────────────────────────────
-SLICE_DT_S = 0.1                     # 10Hz: 이 주기마다 그동안 이동한 만큼 slice 전진
 
 # ── 디버그 로그 ──────────────────────────────────────
 DEBUG_LOG_DIR = os.path.join(BASEDIR, "logs")
@@ -230,56 +221,6 @@ def pure_pursuit_curvature(path_ego, v_ego, lookahead_m=None, index_frac=None):
     kappa = 2.0 * y_goal / (L_d_eff * L_d_eff)
     kappa = float(np.clip(kappa, -PP_CURV_LIMIT, PP_CURV_LIMIT))
     return kappa, goal_idx, L_d_eff
-
-
-# ── path slicing (10Hz re-zero) ──────────────────────
-def slice_and_rezero(path_ego, s_offset):
-    """ego-frame path(x=fwd, y=left)를 arc-length s_offset 지점에서 잘라
-    그 지점을 새 원점(0,0)·전방축(+x)으로 re-zero 한 path 를 반환한다.
-
-    - s_offset 만큼 path 를 따라 전진한 점을 보간으로 구해 새 원점으로
-    - 그 점에서의 path 진행방향(yaw0)을 +x 축에 맞추도록 전체를 -yaw0 회전
-    - s_offset 이후 점들만 유지 (원점 점을 맨 앞에 prepend)
-    s_offset 이 path 길이를 넘으면 마지막 점으로 clamp 된다(→ 사실상 직진).
-    """
-    x = np.asarray(path_ego['x'], dtype=np.float64)
-    y = np.asarray(path_ego['y'], dtype=np.float64)
-
-    ds = np.hypot(np.diff(x), np.diff(y))
-    s = np.concatenate([[0.0], np.cumsum(ds)])
-    s_total = float(s[-1])
-    s_off = float(np.clip(s_offset, 0.0, s_total))
-
-    # 새 원점 (s_off 지점 보간)
-    x0 = float(np.interp(s_off, s, x))
-    y0 = float(np.interp(s_off, s, y))
-
-    # 원점에서의 진행 방향: s_off 직후 미소구간의 tangent
-    s_ahead = min(s_off + 1e-3, s_total)
-    x1 = float(np.interp(s_ahead, s, x))
-    y1 = float(np.interp(s_ahead, s, y))
-    yaw0 = math.atan2(y1 - y0, x1 - x0)
-
-    # s_off 이후 점만 유지하고 원점 점을 맨 앞에 붙임
-    keep = s > s_off
-    xs = np.concatenate([[x0], x[keep]])
-    ys = np.concatenate([[y0], y[keep]])
-
-    # translate(원점) + rotate(-yaw0) → 전방축 정렬
-    dx = xs - x0
-    dy = ys - y0
-    c = math.cos(-yaw0)
-    sn = math.sin(-yaw0)
-    x_new = c * dx - sn * dy
-    y_new = sn * dx + c * dy
-
-    return {
-        'x': x_new,
-        'y': y_new,
-        'raw_y': -y_new,
-        'N': int(x_new.shape[0]),
-        'meta': path_ego.get('meta'),
-    }
 
 
 def _safe_float(value):
@@ -754,11 +695,6 @@ def main():
     log_counter = 0
     prev_curvature = 0.0
 
-    # ── 10Hz path slicing 상태 ──
-    slice_s = 0.0               # 현재 path 상에서 전진한 누적 arc-length offset (m)
-    seg_dist = 0.0              # 마지막 slice advance 이후 이동거리 (m)
-    seg_dt = 0.0                # 마지막 slice advance 이후 경과시간 (s)
-    prev_loop_mono = None       # 직전 루프 monotonic 시각 (dt 측정용)
     # diag CSV 도 debug log 와 동일하게 engage rising/falling edge 마다 열고 닫음
     diag_fh = None
     diag_writer = None
@@ -780,11 +716,7 @@ def main():
                 pkt = parse_path_packet(data)
                 if pkt is not None:
                     recv_count += 1
-                    path = pkt
-                    # 새 path → slice offset 0 으로 리셋 (이 시점 차량 위치가 새 원점)
-                    slice_s = 0.0
-                    seg_dist = 0.0
-                    seg_dt = 0.0
+                    path = pkt      # 최신 패킷 path 로 교체 (이 시점 차량 위치가 원점)
                     # 디버그 로그: 수신 path (내부 좌표계, y=left). 한 줄=한 path. engage 중에만.
                     if debug_log is not None:
                         debug_log.write(
@@ -812,7 +744,7 @@ def main():
                             prev_goal_y_by_ld=prev_goal_y_by_ld,
                             now_wall_us=now_wall_us,
                             now_mono_s=now_mono_s,
-                            slice_s=0.0,
+                            slice_s=None,
                         )
                         diag_writer.writerow(diag_row)
                         for ld_m in DIAG_LD_VALUES_M:
@@ -857,20 +789,9 @@ def main():
                 diag_writer = None
         prev_engaged = engaged
 
-        # 2.7. 10Hz slice 전진 — 그동안 이동한 arc-length 만큼 path 위를 전진
-        dt = (loop_start - prev_loop_mono) if prev_loop_mono is not None else loop_period
-        prev_loop_mono = loop_start
-        seg_dist += v_ego * dt
-        seg_dt += dt
-        if seg_dt >= SLICE_DT_S:
-            slice_s += seg_dist     # 10Hz 마다 누적 이동거리만큼 slice 전진
-            seg_dist = 0.0
-            seg_dt = 0.0
-
-        # 3. tracker — path 를 slice_s 만큼 잘라 re-zero 한 뒤 pure pursuit
+        # 3. tracker — 받은 path 를 그대로 ego 원점(0,0)에서 pure pursuit 으로 추종
         if path is not None:
-            sliced = slice_and_rezero(path, slice_s)
-            kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(sliced, v_ego, index_frac=PP_INDEX_FRAC)
+            kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path, v_ego, index_frac=PP_INDEX_FRAC)
 
             if v_ego > MIN_LAT_CONTROL_SPEED:
                 kappa = smooth_value(kappa_pp, prev_curvature, LAT_SMOOTH_SECONDS)
@@ -888,21 +809,21 @@ def main():
                 desiredAcceleration=float(a_cmd),
                 shouldStop=False,
             )
-            rs = resample_for_viz(sliced)
+            rs = resample_for_viz(path)
 
             # 디버그 로그: 매 20Hz loop curvature, engage 중에만
             if debug_log is not None:
                 debug_log.write(
                     f"[t={time.monotonic():.3f}] CURV frame={frame_id} v_ego={v_ego:.2f} "
                     f"raw={kappa_pp:+.4f} sm={kappa:+.4f} "
-                    f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} slice_s={slice_s:.2f} "
+                    f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} "
                     f"cte={float(path['y'][0]):+.2f} pkts={recv_count}\n"
                 )
 
             if diag_writer is not None and frame_id % DIAG_CONTROL_EVERY_N == 0:
                 diag_writer.writerow(
                     build_path_diag_row(
-                        sliced,
+                        path,
                         event="control",
                         recv_count=recv_count,
                         frame_id=frame_id,
@@ -911,7 +832,7 @@ def main():
                         prev_goal_y_by_ld={},
                         now_wall_us=time.time_ns() // 1000,
                         now_mono_s=time.monotonic(),
-                        slice_s=slice_s,
+                        slice_s=None,
                     )
                 )
 
@@ -922,7 +843,7 @@ def main():
                     f"track: v_ego={v_ego:.2f} target={TARGET_SPEED_MPS:.2f} "
                     f"κ={kappa:+.4f}(raw {kappa_pp:+.4f}) a={a_cmd:+.2f} "
                     f"L_d={L_d_eff:.1f} i_goal={i_goal} N={path['N']} "
-                    f"slice_s={slice_s:.2f} cte={cte:+.2f} pkts={recv_count}"
+                    f"cte={cte:+.2f} pkts={recv_count}"
                 )
         else:
             action = idle_action()
