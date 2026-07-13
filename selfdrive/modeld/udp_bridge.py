@@ -10,11 +10,14 @@ ego-frame JSON으로 보내준다.
   내부 좌표계: x=forward(m), y=left(m)   ← openpilot body frame
   parse 시점에 y 부호를 뒤집어 내부적으로는 openpilot 규약으로 통일한다.
 
-매 패킷이 그 시점 차량 위치 기준으로 잘려 들어오므로 anchor/world 변환 없이
-받은 path를 그대로 ego-frame path로 사용한다.
+매 패킷이 그 시점 차량 위치 기준으로 잘려 들어온다. 도착 시점의 ego pose 로
+path 를 world frame 에 1회 앵커링해 두고, 제어 루프는 매 틱 '현재' ego pose 에서
+그 world path 를 바라본다(world_to_ego). 즉 ego 원점(0,0) 재앵커를 하지 않으므로
+패킷과 패킷 사이에 차량이 전진/회전한 만큼이 goal 선택에 반영된다(위치 lookup).
 
-받은 path 를 매 루프 ego 원점(0,0)에서 그대로 pure pursuit 으로 따라간다.
-slice/re-zero 없이 최신 패킷 path 를 그대로 쓰며, 새 패킷이 오면 교체된다.
+goal 은 현재 위치에서 L_d 앞의 점(거리 기반 look-ahead)으로 뽑고, path 를 다
+지나가면(전방 점 없음) 직전 curvature 를 유지한다. localization 미준비 시엔
+수신 ego-frame path 를 그대로 쓰는 구 동작으로 폴백한다.
 
 종방향은 TARGET_SPEED_MPS(=15 km/h) 유지 P 제어.
 """
@@ -59,14 +62,10 @@ MIN_LAT_CONTROL_SPEED = 0.3          # 이 속도 이하에서는 직전 curvatu
 CURV_DEADZONE = 0.01                  # |curvature| 이 이하면 0 으로 (직진 데드존)
 
 # ── pure pursuit 파라미터 ────────────────────────────
-PP_LOOKAHEAD_M = 5.0                 # 고정 look-ahead (거리 기반 모드)
+# 제어 goal 선택은 항상 '거리 기반 look-ahead': 현재 ego 위치에서 L_d 앞의 path 점.
+# (world 앵커링으로 매 틱 현재 위치를 반영하므로 인덱스 비율 방식은 더 이상 사용 안 함.)
+PP_LOOKAHEAD_M = 5.0                 # 고정 look-ahead 거리 (m)
 PP_CURV_LIMIT = 0.2
-
-# goal 점 선택 방식:
-#   PP_INDEX_FRAC 이 None 이면 → 거리 기반(L_d 만큼 떨어진 점)
-#   PP_INDEX_FRAC 이 [0.0, 1.0] 값이면 → 들어온 path 인덱스의 그 비율 지점을 goal 로
-#   예) 0.5 → path 중간 인덱스, 1.0 → path 끝점, 0.0 → 첫 점
-PP_INDEX_FRAC = 0.5
 
 # ── 디버그 로그 ──────────────────────────────────────
 DEBUG_LOG_DIR = os.path.join(BASEDIR, "logs")
@@ -575,6 +574,22 @@ def ego_to_world(x_ego, y_ego, viz_anchor):
     return wx, wy
 
 
+def world_to_ego(x_world, y_world, anchor):
+    """world frame (NED) → ego-frame (x=fwd, y=LEFT). ego_to_world 의 정확한 역변환.
+
+    ego_to_world 의 선형부 행렬 M = [[c,s],[s,-c]] 는 대칭 직교(반사) 행렬이라
+    자기 자신이 역행렬이다(M·M = I). 따라서 역변환도 같은 꼴로 쓴다.
+    anchor = (x0, y0, yaw0).
+    """
+    x0, y0, yaw0 = anchor
+    c0, s0 = math.cos(yaw0), math.sin(yaw0)
+    dx = x_world - x0
+    dy = y_world - y0
+    x_ego = c0 * dx + s0 * dy
+    y_ego = s0 * dx - c0 * dy
+    return x_ego, y_ego
+
+
 def build_world_path(path_ego, viz_anchor):
     """수신 ego-frame path → world frame 점 list."""
     px = path_ego['x']
@@ -688,9 +703,10 @@ def main():
                      f"world path→{WORLD_PATH_VIZ_PORT}")
     cloudlog.warning(f"udp_bridge debug log: engage 시 {DEBUG_LOG_DIR}/udp_bridge_debug_*.log 생성")
 
-    world = LocalWorld()        # viz only (vehicle trail)
+    world = LocalWorld()        # vehicle trail viz + path world-anchoring 에 사용
     frame_id = 0
-    path = None
+    path = None                 # 최신 수신 ego-frame packet (fallback/N/viz 용)
+    path_world = None           # 도착 시점 ego pose 로 world 에 앵커된 path {'wx','wy','N','meta'}
     recv_count = 0
     log_counter = 0
     prev_curvature = 0.0
@@ -716,7 +732,16 @@ def main():
                 pkt = parse_path_packet(data)
                 if pkt is not None:
                     recv_count += 1
-                    path = pkt      # 최신 패킷 path 로 교체 (이 시점 차량 위치가 원점)
+                    path = pkt      # 최신 패킷 (fallback + N/viz 용)
+                    # 도착 시점의 ego pose 로 path 를 world frame 에 1회 앵커링.
+                    # 이후 제어 루프는 매 틱 '현재' pose 에서 이 world path 를 바라본다
+                    # (재앵커 안 함 → 패킷 사이 차량 전진/회전이 goal 에 반영됨).
+                    if world.is_initialized():
+                        _, ax, ay, ayaw = world.current()
+                        awx, awy = ego_to_world(pkt['x'], pkt['y'], (ax, ay, ayaw))
+                        path_world = {'wx': awx, 'wy': awy, 'N': pkt['N'], 'meta': pkt.get('meta')}
+                    else:
+                        path_world = None   # localization 미준비 → 폴백(구 동작)
                     # 디버그 로그: 수신 path (내부 좌표계, y=left). 한 줄=한 path. engage 중에만.
                     if debug_log is not None:
                         debug_log.write(
@@ -728,9 +753,11 @@ def main():
                         viz_sock.sendto(data, ('127.0.0.1', LOCAL_PATH_VIZ_PORT))
                     except OSError:
                         pass
-                    # 패킷 도착 시점 pure pursuit 1회 → goal + raw kappa snapshot
+                    # 패킷 도착 시점 pure pursuit 1회 → goal + raw kappa snapshot (viz/diag).
+                    # 제어와 동일하게 거리 기반(index_frac=None): 도착 시엔 ego≈anchor 이므로
+                    # 이 goal 이 제어 첫 틱의 goal 과 일치한다.
                     v_ego_now = max(sm["carState"].vEgo, 0.0) if sm.alive["carState"] else 0.0
-                    kappa_pp_pkt, i_goal_pkt, L_d_eff_pkt = pure_pursuit_curvature(pkt, v_ego_now, index_frac=PP_INDEX_FRAC)
+                    kappa_pp_pkt, i_goal_pkt, L_d_eff_pkt = pure_pursuit_curvature(pkt, v_ego_now, index_frac=None)
                     if diag_writer is not None:   # engage 중에만 기록
                         now_wall_us = time.time_ns() // 1000
                         now_mono_s = time.monotonic()
@@ -789,14 +816,37 @@ def main():
                 diag_writer = None
         prev_engaged = engaged
 
-        # 3. tracker — 받은 path 를 그대로 ego 원점(0,0)에서 pure pursuit 으로 추종
+        # 3. tracker — world 에 앵커된 path 를 '현재' ego pose 에서 바라보며 pure pursuit
+        #    (매 틱 ego 원점 재앵커 없음: 패킷 사이 차량이 전진한 만큼 goal 이 앞으로 이동)
         if path is not None:
-            kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path, v_ego, index_frac=PP_INDEX_FRAC)
-
-            if v_ego > MIN_LAT_CONTROL_SPEED:
-                kappa = smooth_value(kappa_pp, prev_curvature, LAT_SMOOTH_SECONDS)
+            cur_pose = world.current() if world.is_initialized() else None
+            if path_world is not None and cur_pose is not None:
+                _, cx, cy, cyaw = cur_pose
+                ex, ey = world_to_ego(path_world['wx'], path_world['wy'], (cx, cy, cyaw))
+                path_cur = {'x': ex, 'y': ey, 'raw_y': -ey,
+                            'N': path_world['N'], 'meta': path_world.get('meta')}
             else:
+                # localization 미준비 → 구 동작(수신 ego-frame path 그대로) 로 폴백
+                path_cur = path
+
+            xs_cur = np.asarray(path_cur['x'], dtype=np.float64)
+            ys_cur = np.asarray(path_cur['y'], dtype=np.float64)
+            # cross-track: 현재 위치(x≈0)에 가장 가까운 path 점의 lateral offset
+            cte = float(ys_cur[int(np.argmin(np.abs(xs_cur)))]) if xs_cur.size else 0.0
+            # 전방(x>0) 점이 하나도 없으면 path 소진 → 직전 curvature 유지
+            path_exhausted = not bool(np.any(xs_cur > 0.0))
+
+            if path_exhausted:
+                kappa_pp = prev_curvature
+                i_goal, L_d_eff = -1, 0.0
                 kappa = prev_curvature
+            else:
+                # 거리 기반 look-ahead: 현재 위치에서 L_d 앞의 점을 goal 로 (위치 lookup)
+                kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path_cur, v_ego, index_frac=None)
+                if v_ego > MIN_LAT_CONTROL_SPEED:
+                    kappa = smooth_value(kappa_pp, prev_curvature, LAT_SMOOTH_SECONDS)
+                else:
+                    kappa = prev_curvature
             prev_curvature = kappa
 
             # 직진 데드존: |curvature| 이 임계 이하면 제어 입력을 0 으로
@@ -809,7 +859,7 @@ def main():
                 desiredAcceleration=float(a_cmd),
                 shouldStop=False,
             )
-            rs = resample_for_viz(path)
+            rs = resample_for_viz(path_cur)
 
             # 디버그 로그: 매 20Hz loop curvature, engage 중에만
             if debug_log is not None:
@@ -817,13 +867,13 @@ def main():
                     f"[t={time.monotonic():.3f}] CURV frame={frame_id} v_ego={v_ego:.2f} "
                     f"raw={kappa_pp:+.4f} sm={kappa:+.4f} "
                     f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} "
-                    f"cte={float(path['y'][0]):+.2f} pkts={recv_count}\n"
+                    f"cte={cte:+.2f} pkts={recv_count}\n"
                 )
 
             if diag_writer is not None and frame_id % DIAG_CONTROL_EVERY_N == 0:
                 diag_writer.writerow(
                     build_path_diag_row(
-                        path,
+                        path_cur,
                         event="control",
                         recv_count=recv_count,
                         frame_id=frame_id,
@@ -838,11 +888,10 @@ def main():
 
             log_counter += 1
             if log_counter % 20 == 1:   # 1Hz
-                cte = float(path['y'][0])
                 cloudlog.warning(
                     f"track: v_ego={v_ego:.2f} target={TARGET_SPEED_MPS:.2f} "
                     f"κ={kappa:+.4f}(raw {kappa_pp:+.4f}) a={a_cmd:+.2f} "
-                    f"L_d={L_d_eff:.1f} i_goal={i_goal} N={path['N']} "
+                    f"L_d={L_d_eff:.1f} i_goal={i_goal} N={path_cur['N']} "
                     f"cte={cte:+.2f} pkts={recv_count}"
                 )
         else:
