@@ -57,14 +57,24 @@ MIN_LAT_CONTROL_SPEED = 0.3          # 이 속도 이하에서는 직전 curvatu
 CURV_DEADZONE = 0.01                  # |curvature| 이 이하면 0 으로 (직진 데드존)
 
 # ── pure pursuit 파라미터 ────────────────────────────
-PP_LOOKAHEAD_M = 5.0                 # 고정 look-ahead (거리 기반 모드)
+# 속도 비례 look-ahead: L_d = clip(PP_LOOKAHEAD_K_S * v_ego, MIN, MAX)
+#   대중적 pure pursuit 방식(L_d ∝ v). 최소 10m, 최대 20m 로 clamp.
+PP_LOOKAHEAD_MIN_M = 10.0
+PP_LOOKAHEAD_MAX_M = 20.0
+PP_LOOKAHEAD_K_S = 3.0               # look-ahead time gain (s) — L_d = k · v
 PP_CURV_LIMIT = 0.2
 
 # goal 점 선택 방식:
-#   PP_INDEX_FRAC 이 None 이면 → 거리 기반(L_d 만큼 떨어진 점)
+#   PP_INDEX_FRAC 이 None 이면 → 거리 기반(속도 비례 L_d 만큼 떨어진 점)
 #   PP_INDEX_FRAC 이 [0.0, 1.0] 값이면 → 들어온 path 인덱스의 그 비율 지점을 goal 로
 #   예) 0.5 → path 중간 인덱스, 1.0 → path 끝점, 0.0 → 첫 점
-PP_INDEX_FRAC = 0.5
+PP_INDEX_FRAC = None                 # None → 속도 비례 거리 기반 look-ahead 사용
+
+
+def lookahead_for_speed(v_ego):
+    """속도 비례 look-ahead 거리 L_d = clip(k · v, MIN, MAX)."""
+    return float(np.clip(PP_LOOKAHEAD_K_S * max(v_ego, 0.0),
+                         PP_LOOKAHEAD_MIN_M, PP_LOOKAHEAD_MAX_M))
 
 # ── 디버그 로그 ──────────────────────────────────────
 DEBUG_LOG_DIR = os.path.join(BASEDIR, "logs")
@@ -72,8 +82,8 @@ DIAG_LOG_DIR = os.environ.get("UDP_BRIDGE_DIAG_LOG_DIR", DEBUG_LOG_DIR)
 DIAG_LD_VALUES_M = tuple(
     sorted(
         {
-            PP_LOOKAHEAD_M,
-            10.0,
+            PP_LOOKAHEAD_MIN_M,
+            PP_LOOKAHEAD_MAX_M,
             *(
                 float(token)
                 for token in os.environ.get("UDP_BRIDGE_DIAG_LDS_M", "").split(",")
@@ -202,8 +212,8 @@ def pure_pursuit_curvature(path_ego, v_ego, lookahead_m=None, index_frac=None):
         f = float(np.clip(index_frac, 0.0, 1.0))
         goal_idx = int(round(f * (n - 1)))
     else:
-        # B) 거리 기반
-        L_d = float(PP_LOOKAHEAD_M if lookahead_m is None else lookahead_m)
+        # B) 거리 기반 (lookahead_m 미지정 시 속도 비례 L_d)
+        L_d = float(lookahead_for_speed(v_ego) if lookahead_m is None else lookahead_m)
         fwd_mask = x > 0.0
         candidates = np.where(fwd_mask & (d >= L_d))[0]
         if candidates.size > 0:
