@@ -47,20 +47,20 @@ X_IDXS = np.array(ModelConstants.X_IDXS, dtype=np.float64)
 IDX_N = ModelConstants.IDX_N   # 33
 
 # ── 종방향 ────────────────────────────────────────────
-TARGET_SPEED_MPS = 15.0 / 3.6        # 15 km/h ≈ 4.17 m/s
+TARGET_SPEED_MPS = 8.0 / 3.6        # 15 km/h ≈ 4.17 m/s
 LON_KP = 0.3
 ACCEL_MIN = -3.5
 ACCEL_MAX = 2.0
 
-MIN_LAT_CONTROL_SPEED = 0.3          # 이 속도 이하에서는 직전 curvature 유지
+MIN_LAT_CONTROL_SPEED = 0.0001          # 이 속도 이하에서는 직전 curvature 유지
 
-CURV_DEADZONE = 0.01                  # |curvature| 이 이하면 0 으로 (직진 데드존)
+CURV_DEADZONE = 0.00                  # |curvature| 이 이하면 0 으로 (직진 데드존)
 
 # ── pure pursuit 파라미터 ────────────────────────────
 # 속도 비례 look-ahead: L_d = clip(PP_LOOKAHEAD_K_S * v_ego, MIN, MAX)
 #   대중적 pure pursuit 방식(L_d ∝ v). 최소 10m, 최대 20m 로 clamp.
-PP_LOOKAHEAD_MIN_M = 10.0
-PP_LOOKAHEAD_MAX_M = 20.0
+PP_LOOKAHEAD_MIN_M = 5.0
+PP_LOOKAHEAD_MAX_M = 15.0
 PP_LOOKAHEAD_K_S = 3.0               # look-ahead time gain (s) — L_d = k · v
 PP_CURV_LIMIT = 0.2
 
