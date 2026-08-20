@@ -67,13 +67,15 @@ openpilot venv 필요 없음 (stdlib 만 사용).
 - `CURV` 줄 — `sm` 이 실제로 실어 보낸 curvature, `raw` 가 clip·smoothing 전 원값.
   제어기를 안 쓰므로 `comma`/`pp`/`alpasim`/`L_d_eff`/`i_goal`/`cte` 는 없다
   (뷰에서 빈칸).
-  - `t_query` — 시계열에서 읽은 시점. 기본은 패킷 `t=0` 기준 **고정 0.3s**
-    (`RAW_ACTION_FIXED_T_S`), `idx = t_query/dt` 라 dt 0.1s 면 항상 3.
+  - `t_query` — 시계열에서 읽은 시점. 기본은 **패킷 나이 + `lat_delay`** 이고
+    `idx = t_query/dt`. `RAW_ACTION_FIXED_T_S` 에 숫자를 넣으면 패킷 `t=0` 기준
+    고정 오프셋으로 바뀐다(예: 0.3 → dt 0.1s 에서 항상 idx 3).
   - `lead = t_query - age` — **지금보다 얼마나 앞선 값인가**. 여기가 핵심 지표다.
-    `age` 는 publisher 추론시간 + 전송·loop 지연이라, 고정 오프셋을 쓰면 패킷이
-    늙은 만큼 lead 가 깎인다. `lead` 가 0 근처거나 음수면 지연 보상이 안 되고
-    있다는 뜻이므로 `RAW_ACTION_FIXED_T_S` 를 키워야 한다.
-  - `lat_delay` — `liveDelay.lateralDelay` 참고값(고정 모드에선 인덱스에 안 쓰임).
+    기본 설정에서는 lead 가 곧 `lat_delay` 다. 0 근처면 `liveDelay` 가 아직 추정
+    전이라 지연 보상이 안 되고 있다는 뜻. 고정 오프셋을 쓸 때는 패킷이 늙은 만큼
+    lead 가 깎이므로(age 는 publisher 추론시간 + 전송·loop 지연) 음수로 가면
+    과거 값을 싣고 있다는 뜻이다.
+  - `lat_delay` — `liveDelay.lateralDelay` (기본 설정에서 인덱스 계산에 쓰인다).
 - 제어가 멈추면 `... mode=bypass STOP reason='stale 0.71s' ...` 줄이 남는다.
 
 즉 XY 패널·κ 시계열·히스토그램·통계는 그대로 보이고, 제어기 비교 series 3개만

@@ -41,10 +41,9 @@ ego-frame JSON으로 보내준다.
                   전혀 개입하지 않으므로 "모델 출력 그 자체" 의 주행을 볼 수 있다.
                   단 latcontrol_torque 는 desired_curvature 를 "lat_delay 후 도달
                   목표"(future_desired_lateral_accel)로 해석하므로, 시계열의 t=0 이
-                  아니라 조금 미래 시점 값을 골라야 짝이 맞는다. 기본은 패킷 t=0
-                  기준 고정 t=RAW_ACTION_FIXED_T_S(0.3s → dt 0.1s 이면 idx 3).
-                  패킷이 늙은 만큼 선행량이 깎이므로(lead = t - age) lead 를 로그와
-                  lat_ctl 에 함께 남긴다.
+                  아니라 (패킷 나이 + lat_delay) 시점 값을 골라야 짝이 맞는다.
+                  지금보다 얼마나 앞선 값인지(lead = t - 패킷나이)를 로그와 lat_ctl
+                  에 함께 남긴다. RAW_ACTION_FIXED_T_S 로 고정 오프셋도 쓸 수 있다.
 
 전환 방법 (프로세스 재시작 불필요):
     python selfdrive/modeld/lat_ctl.py          # 터미널에서 키 입력으로 전환
@@ -181,17 +180,21 @@ RAW_ACTION_MIN_N = 2           # 이보다 점이 적으면 버림
 # (추론지연 ~0.3s + 연속 3패킷 유실) 정도를 한도로 잡았다. 이보다 완만한 노화는
 # 시계열 인덱스가 앞으로 밀리는 것으로 자연히 흡수되고, horizon 을 넘기면 따로 걸린다.
 RAW_ACTION_MAX_AGE_S = 0.6
-# 시계열에서 읽을 시점 t [s] — 패킷 t=0(= publisher 추론 시작 시점) 기준 고정 오프셋.
-# 0.3s = 지연 보상분. dt=0.1s 이면 항상 idx 3 을 읽는다.
-#   latcontrol_torque 가 desired_curvature 를 "lat_delay 후 도달 목표"
-#   (future_desired_lateral_accel)로 해석하므로 미래 시점 값을 실어야 짝이 맞는다.
-# None 으로 두면 매 loop (패킷 나이 + liveDelay) 를 계산해 쓰는 적응식으로 돌아간다.
-RAW_ACTION_FIXED_T_S = 0.3
-# 아래 둘은 RAW_ACTION_FIXED_T_S = None (적응식) 일 때만 쓰인다.
-RAW_ACTION_USE_LAT_DELAY = True
+# 시계열에서 읽을 시점 t [s] 를 정하는 방식.
+#   기본(적응식): t = 패킷 나이 + liveDelay.lateralDelay 를 매 loop 계산.
+#     latcontrol_torque 가 desired_curvature 를 "lat_delay 후 도달 목표"
+#     (future_desired_lateral_accel)로 해석하므로 미래 시점 값을 실어야 짝이 맞고,
+#     패킷 나이를 더해야 "지금" 기준이 된다. 패킷이 밀리면 앞쪽 인덱스가 저절로
+#     소모되므로 별도의 보간·재정렬이 필요 없다.
+#   숫자를 넣으면 패킷 t=0(= publisher 추론 시작 시점) 기준 **고정 오프셋** 이 된다.
+#     예) 0.3 → dt 0.1s 에서 항상 idx 3. liveDelay 와 무관해 결정적이지만, 패킷이
+#     늙은 만큼 선행량(lead)이 깎여 inference_time_s 가 오프셋에 가까워지면 지연
+#     보상이 사라진다. 실차에서 lead 를 보고 판단할 때 쓰라고 남겨둔 스위치다.
+RAW_ACTION_FIXED_T_S = None
+RAW_ACTION_USE_LAT_DELAY = True    # False 면 lat_delay 를 빼고 패킷 나이만 본다
 RAW_ACTION_LAT_DELAY_MAX_S = 0.5   # liveDelay 가 튀어도 이 이상은 앞서 보지 않음
-# lead(= t - 패킷 나이) 가 이 값보다 작으면 경고. 고정 오프셋은 패킷이 늙을수록
-# 선행량이 줄어들어, inference_time_s 가 오프셋에 가까워지면 lead 가 0/음수가 된다.
+# lead(= t - 패킷 나이 = 지금보다 앞선 양) 가 이 값보다 작으면 경고. 적응식에서는
+# lead 가 곧 lat_delay 라, liveDelay 가 아직 추정 전(0)이면 여기서 걸린다.
 RAW_ACTION_LEAD_WARN_S = 0.05
 # curvature 부호. Alpamayo raw_action 은 openpilot desiredCurvature(좌회전 +) 와 같은
 # 규약으로 확인됐다 — debug 브랜치에서 실차로 음수 부호를 걷어낸 결과값(5/15)이다.
@@ -1155,13 +1158,13 @@ def build_action_command(ext_action, now_mono_s, lat_delay_s):
     인덱스 선택: 시계열의 t=0 은 publisher 가 추론을 시작한 시점이고, 우리가 명령을
     실을 때는 이미 age 만큼 지나 있다. 어느 시점 값을 실을지는 두 방식 중 하나:
 
-      RAW_ACTION_FIXED_T_S 가 숫자면  t = 그 값 (패킷 t=0 기준 고정 오프셋)
-      None 이면                       t = age + lat_delay (매 loop 계산)
+      RAW_ACTION_FIXED_T_S 가 None 이면  t = age + lat_delay (기본, 매 loop 계산)
+      숫자면                             t = 그 값 (패킷 t=0 기준 고정 오프셋)
 
-    고정 방식에서 "지금보다 얼마나 앞선 값인가" 는 lead = t - age 다. age 는
-    inference_time_s + 전송·loop 지연이라, inference 가 고정 오프셋에 가까워지면
-    lead 가 0 이 되고 넘어가면 **과거 값을 싣는다**. 그래서 lead 를 계산해 로그와
-    lat_ctl 에 노출한다 (음수면 경고).
+    "지금보다 얼마나 앞선 값인가" 는 lead = t - age 다. 적응식에서는 lead 가 곧
+    lat_delay 이고, 고정 오프셋에서는 패킷이 늙은 만큼 깎여 inference_time_s 가
+    오프셋에 가까워지면 0/음수가 된다(= 과거 값을 싣는다). 어느 쪽이든 lead 를
+    계산해 로그와 lat_ctl 에 노출한다 (0 이하면 경고).
     """
     info = {"alive": ext_action is not None, "age": None, "n": 0, "horizon_s": None,
             "idx": None, "curv": None, "accel": None, "v_ref": None, "dt_s": None,
@@ -1200,8 +1203,9 @@ def build_action_command(ext_action, now_mono_s, lat_delay_s):
         return None, info
     idx = max(idx, 0)
 
-    # 고정 오프셋인데 패킷이 그만큼 늙었으면 지금 실는 값이 과거 시점 값이다.
-    # 정지시키지는 않되(지령을 끊는 게 더 위험할 수 있다) 눈에 띄게 남긴다.
+    # 선행량이 없으면(적응식이면 liveDelay 미추정, 고정이면 패킷이 오프셋만큼 늙음)
+    # 지연 보상이 안 되거나 과거 값을 싣고 있다는 뜻이다. 정지시키지는 않되
+    # (지령을 끊는 게 더 위험할 수 있다) 눈에 띄게 남긴다.
     if lead < -RAW_ACTION_LEAD_WARN_S:
         info["warn"] = f"lead {lead:+.2f}s (과거값)"
     elif lead < RAW_ACTION_LEAD_WARN_S:

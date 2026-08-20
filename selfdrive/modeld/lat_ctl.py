@@ -83,10 +83,10 @@ def model_status_line(st):
 def action_status_line(st):
     """raw_action 상태 한 줄. 소스가 alpa_action 일 때 제어 가능 여부가 여기서 보인다.
 
-    t = 시계열에서 읽는 시점(패킷 t=0 기준, 기본 고정 0.3s), idx = t/dt 로 고른 점,
-    lead = t - age = "지금보다 얼마나 앞선 값인가". age 는 publisher 추론시간 + 전송
-    지연이라, 고정 t 를 쓰면 패킷이 늙은 만큼 lead 가 깎인다 — lead 가 0 이하로 가면
-    선행이 없거나(⚠) 과거 값을 싣고 있다는 뜻이므로 t 를 키워야 한다.
+    t = 시계열에서 읽는 시점(패킷 t=0 기준, 기본 = 패킷 나이 + liveDelay),
+    idx = t/dt 로 고른 점, lead = t - age = "지금보다 얼마나 앞선 값인가".
+    기본 설정에서 lead 는 곧 lat_delay 라, 0 근처면(⚠) liveDelay 가 아직 추정 전이라
+    지연 보상이 안 되고 있다는 뜻이다.
     """
     if not st.get("action_alive"):
         return "raw action: 수신 없음 (publisher 가 raw_action 을 안 보냄)"
