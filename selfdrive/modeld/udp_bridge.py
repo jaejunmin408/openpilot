@@ -40,8 +40,11 @@ ego-frame JSON으로 보내준다.
                   로 실어 latcontrol_torque 로 넘긴다. 중간 pure pursuit / MPC 가
                   전혀 개입하지 않으므로 "모델 출력 그 자체" 의 주행을 볼 수 있다.
                   단 latcontrol_torque 는 desired_curvature 를 "lat_delay 후 도달
-                  목표"(future_desired_lateral_accel)로 해석하므로, 시계열에서
-                  (패킷 나이 + lat_delay) 만큼 미래 시점의 값을 골라 짝을 맞춘다.
+                  목표"(future_desired_lateral_accel)로 해석하므로, 시계열의 t=0 이
+                  아니라 조금 미래 시점 값을 골라야 짝이 맞는다. 기본은 패킷 t=0
+                  기준 고정 t=RAW_ACTION_FIXED_T_S(0.3s → dt 0.1s 이면 idx 3).
+                  패킷이 늙은 만큼 선행량이 깎이므로(lead = t - age) lead 를 로그와
+                  lat_ctl 에 함께 남긴다.
 
 전환 방법 (프로세스 재시작 불필요):
     python selfdrive/modeld/lat_ctl.py          # 터미널에서 키 입력으로 전환
@@ -178,10 +181,18 @@ RAW_ACTION_MIN_N = 2           # 이보다 점이 적으면 버림
 # (추론지연 ~0.3s + 연속 3패킷 유실) 정도를 한도로 잡았다. 이보다 완만한 노화는
 # 시계열 인덱스가 앞으로 밀리는 것으로 자연히 흡수되고, horizon 을 넘기면 따로 걸린다.
 RAW_ACTION_MAX_AGE_S = 0.6
-# 시계열 인덱스 = (패킷 나이 + lat_delay) / dt.  latcontrol_torque 가 desired_curvature 를
-# "lat_delay 후 도달 목표"(future_desired_lateral_accel)로 해석하므로 미래값을 골라야 짝이 맞는다.
+# 시계열에서 읽을 시점 t [s] — 패킷 t=0(= publisher 추론 시작 시점) 기준 고정 오프셋.
+# 0.3s = 지연 보상분. dt=0.1s 이면 항상 idx 3 을 읽는다.
+#   latcontrol_torque 가 desired_curvature 를 "lat_delay 후 도달 목표"
+#   (future_desired_lateral_accel)로 해석하므로 미래 시점 값을 실어야 짝이 맞는다.
+# None 으로 두면 매 loop (패킷 나이 + liveDelay) 를 계산해 쓰는 적응식으로 돌아간다.
+RAW_ACTION_FIXED_T_S = 0.3
+# 아래 둘은 RAW_ACTION_FIXED_T_S = None (적응식) 일 때만 쓰인다.
 RAW_ACTION_USE_LAT_DELAY = True
 RAW_ACTION_LAT_DELAY_MAX_S = 0.5   # liveDelay 가 튀어도 이 이상은 앞서 보지 않음
+# lead(= t - 패킷 나이) 가 이 값보다 작으면 경고. 고정 오프셋은 패킷이 늙을수록
+# 선행량이 줄어들어, inference_time_s 가 오프셋에 가까워지면 lead 가 0/음수가 된다.
+RAW_ACTION_LEAD_WARN_S = 0.05
 # curvature 부호. Alpamayo raw_action 은 openpilot desiredCurvature(좌회전 +) 와 같은
 # 규약으로 확인됐다 — debug 브랜치에서 실차로 음수 부호를 걷어낸 결과값(5/15)이다.
 # 차가 반대로 조향하면 여기만 -1.0 으로 바꾸면 된다.
@@ -962,13 +973,15 @@ def build_path_diag_row(path_ego, *, event, recv_count, frame_id, v_ego, kappa_s
         "action_n": "" if info.get("n") in (None, 0) else int(info["n"]),
         "action_dt_s": _safe_float(cmd.get("dt_s", info.get("dt_s"))),
         "action_horizon_s": _safe_float(info.get("horizon_s")),
-        "action_t_query_s": _safe_float(cmd.get("t_query")),
+        "action_t_query_s": _safe_float(cmd.get("t_query", info.get("t_query"))),
+        "action_lead_s": _safe_float(cmd.get("lead", info.get("lead"))),
         "action_age_s": _safe_float(info.get("age")),
         "action_lat_delay_s": _safe_float(info.get("lat_delay")),
         "action_kappa_raw": _safe_float(cmd.get("kappa", info.get("curv"))),
         "action_accel_mps2": _safe_float(cmd.get("accel", info.get("accel"))),
         "action_v_ref_mps": _safe_float(cmd.get("v_ref", info.get("v_ref"))),
         "action_reason": info.get("reason") or "",
+        "action_warn": info.get("warn") or "",
     })
 
     for ld_m in DIAG_LD_VALUES_M:
@@ -1028,12 +1041,14 @@ def diag_fieldnames():
         "action_dt_s",
         "action_horizon_s",
         "action_t_query_s",
+        "action_lead_s",
         "action_age_s",
         "action_lat_delay_s",
         "action_kappa_raw",
         "action_accel_mps2",
         "action_v_ref_mps",
         "action_reason",
+        "action_warn",
     ]
     for ld_m in DIAG_LD_VALUES_M:
         tag = f"ld{ld_m:g}"
@@ -1137,15 +1152,21 @@ def build_action_command(ext_action, now_mono_s, lat_delay_s):
     return (cmd|None, info). info 는 lat_ctl 표시·로그용 진단이고, cmd 가 None 일
     때 그 이유(reason)를 담는다. cmd 가 None 이면 제어를 정지한다(안전측).
 
-    인덱스 선택: latcontrol_torque 는 desired_curvature 를 "lat_delay 후 도달 목표"
-    (future_desired_lateral_accel)로 해석한다. 그래서 시계열에서
-        t = (지금 - 시계열 t0) + lat_delay
-    지점의 값을 골라야 명령과 해석이 짝을 맞춘다. 패킷이 늦게 오거나 갱신이 밀리면
-    앞쪽 인덱스가 자동으로 소모되므로 별도의 보간·재정렬이 필요 없다.
+    인덱스 선택: 시계열의 t=0 은 publisher 가 추론을 시작한 시점이고, 우리가 명령을
+    실을 때는 이미 age 만큼 지나 있다. 어느 시점 값을 실을지는 두 방식 중 하나:
+
+      RAW_ACTION_FIXED_T_S 가 숫자면  t = 그 값 (패킷 t=0 기준 고정 오프셋)
+      None 이면                       t = age + lat_delay (매 loop 계산)
+
+    고정 방식에서 "지금보다 얼마나 앞선 값인가" 는 lead = t - age 다. age 는
+    inference_time_s + 전송·loop 지연이라, inference 가 고정 오프셋에 가까워지면
+    lead 가 0 이 되고 넘어가면 **과거 값을 싣는다**. 그래서 lead 를 계산해 로그와
+    lat_ctl 에 노출한다 (음수면 경고).
     """
     info = {"alive": ext_action is not None, "age": None, "n": 0, "horizon_s": None,
             "idx": None, "curv": None, "accel": None, "v_ref": None, "dt_s": None,
-            "lat_delay": float(lat_delay_s), "reason": ""}
+            "lat_delay": float(lat_delay_s), "t_query": None, "lead": None,
+            "reason": "", "warn": ""}
     if ext_action is None:
         info["reason"] = "raw_action 수신 없음"
         return None, info
@@ -1160,8 +1181,16 @@ def build_action_command(ext_action, now_mono_s, lat_delay_s):
         info["reason"] = f"stale {age:.2f}s"
         return None, info
 
-    delay = min(max(lat_delay_s, 0.0), RAW_ACTION_LAT_DELAY_MAX_S) if RAW_ACTION_USE_LAT_DELAY else 0.0
-    t_query = max(age, 0.0) + delay
+    if RAW_ACTION_FIXED_T_S is not None:
+        t_query = float(RAW_ACTION_FIXED_T_S)
+    else:
+        delay = (min(max(lat_delay_s, 0.0), RAW_ACTION_LAT_DELAY_MAX_S)
+                 if RAW_ACTION_USE_LAT_DELAY else 0.0)
+        t_query = max(age, 0.0) + delay
+    lead = t_query - max(age, 0.0)
+    info["t_query"] = t_query
+    info["lead"] = lead
+
     idx = int(round(t_query / ext_action['dt_s']))
     if idx > ext_action['N'] - 1:
         # 시계열을 다 소모했다 = 새 패킷이 horizon 만큼 끊긴 것. 끝값을 붙들고 있으면
@@ -1170,6 +1199,13 @@ def build_action_command(ext_action, now_mono_s, lat_delay_s):
         info["reason"] = f"horizon 초과 (t={t_query:.2f}s > {ext_action['horizon_s']:.1f}s)"
         return None, info
     idx = max(idx, 0)
+
+    # 고정 오프셋인데 패킷이 그만큼 늙었으면 지금 실는 값이 과거 시점 값이다.
+    # 정지시키지는 않되(지령을 끊는 게 더 위험할 수 있다) 눈에 띄게 남긴다.
+    if lead < -RAW_ACTION_LEAD_WARN_S:
+        info["warn"] = f"lead {lead:+.2f}s (과거값)"
+    elif lead < RAW_ACTION_LEAD_WARN_S:
+        info["warn"] = f"lead {lead:+.2f}s (선행 없음)"
 
     kappa = float(np.clip(ext_action['curv'][idx], -RAW_ACTION_CURV_LIMIT, RAW_ACTION_CURV_LIMIT))
     # 종방향은 없을 수 있다 (횡제어와 독립). accel 만 clip 하고 v_ref 는 원값 그대로.
@@ -1181,7 +1217,8 @@ def build_action_command(ext_action, now_mono_s, lat_delay_s):
     info["accel"] = accel
     info["v_ref"] = v_ref
     return {"kappa": kappa, "accel": accel, "v_ref": v_ref, "idx": idx,
-            "t_query": t_query, "dt_s": ext_action['dt_s'], "N": ext_action['N']}, info
+            "t_query": t_query, "lead": lead,
+            "dt_s": ext_action['dt_s'], "N": ext_action['N']}, info
 
 
 def action_telemetry(action_info):
@@ -1196,7 +1233,10 @@ def action_telemetry(action_info):
         "action_accel": action_info["accel"],
         "action_v_ref": action_info["v_ref"],
         "action_lat_delay": action_info["lat_delay"],
-        "action_reason": action_info["reason"],
+        "action_t_query": action_info["t_query"],
+        "action_lead": action_info["lead"],
+        # reason = 정지 이유(cmd 없음), warn = 실행은 하되 눈여겨볼 것
+        "action_reason": action_info["reason"] or action_info["warn"],
     }
 
 
@@ -1601,7 +1641,10 @@ def main():
         cloudlog.warning("udp_bridge: raw action 직결 모드 — 제어기(pure pursuit/MPC) 우회, "
                          f"curv_sign={RAW_ACTION_CURV_SIGN:+.0f} "
                          f"use_accel={RAW_ACTION_USE_ACCEL}")
-        print(f"[PATH] raw action 직결 — 제어기 우회 (curv_sign={RAW_ACTION_CURV_SIGN:+.0f}, "
+        t_desc = ("적응식 (age+liveDelay)" if RAW_ACTION_FIXED_T_S is None
+                  else f"고정 t={RAW_ACTION_FIXED_T_S:.2f}s")
+        print(f"[PATH] raw action 직결 — 제어기 우회 (읽는 시점 {t_desc}, "
+              f"curv_sign={RAW_ACTION_CURV_SIGN:+.0f}, "
               f"lon={'raw_accel_mps2' if RAW_ACTION_USE_ACCEL else 'speed-hold'})", flush=True)
 
     frame_id = 0
@@ -1870,6 +1913,7 @@ def main():
                         f"raw={kappa_raw:+.5f} sm={kappa:+.5f} a={a_cmd:+.2f} "
                         f"idx={action_cmd['idx']}/{action_cmd['N'] - 1} "
                         f"t_query={action_cmd['t_query']:.3f}s "
+                        f"lead={action_cmd['lead']:+.3f}s "
                         f"lat_delay={lat_delay:.3f}s age={action_info['age']:.3f}s "
                         f"raw_a={_fmt_opt(action_cmd['accel'], '+.2f')} "
                         f"raw_v={_fmt_opt(action_cmd['v_ref'], '.2f')} "
@@ -1900,8 +1944,10 @@ def main():
                         f"raw_a={_fmt_opt(action_cmd['accel'], '+.2f')} "
                         f"raw_v={_fmt_opt(action_cmd['v_ref'], '.2f')} "
                         f"idx={action_cmd['idx']}/{action_cmd['N'] - 1} "
+                        f"t={action_cmd['t_query']:.2f}s lead={action_cmd['lead']:+.3f}s "
                         f"age={action_info['age']:.3f}s lat_delay={lat_delay:.3f}s "
                         f"pkts={action_recv_count}"
+                        + (f" ⚠ {action_info['warn']}" if action_info['warn'] else "")
                     )
 
             lat_state.telemetry = {

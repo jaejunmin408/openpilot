@@ -54,8 +54,8 @@ openpilot venv 필요 없음 (stdlib 만 사용).
     [t=..] ACTION recv #12 N=64 dt=0.100s horizon=6.40s infer=0.120s int_v=4.12 \
         curv=[...] raw_a=[...] raw_v=[...]
     [t=..] PATH recv #12 src=alpa_action N=33 pts=[(0.00,0.00), ...]
-    [t=..] CURV frame=. v_ego=. src=alpa_action mode=bypass raw=+0.00456 sm=+0.00456 \
-        a=+0.35 idx=3/63 t_query=0.270s lat_delay=0.150s age=0.083s \
+    [t=..] CURV frame=. v_ego=. src=alpa_action mode=bypass raw=+0.00300 sm=+0.00300 \
+        a=+0.35 idx=3/63 t_query=0.300s lead=+0.180s lat_delay=0.150s age=0.120s \
         raw_a=+0.47 raw_v=4.15 path=12 pkts=812
 
 - `ACTION` 줄 — 받은 시계열 **원본**. `curv` 가 6.4s/0.1s = 64점 곡률, `raw_a` 는
@@ -66,7 +66,14 @@ openpilot venv 필요 없음 (stdlib 만 사용).
   변하면 같은 곡률에도 모양이 바뀌는 점만 유의.
 - `CURV` 줄 — `sm` 이 실제로 실어 보낸 curvature, `raw` 가 clip·smoothing 전 원값.
   제어기를 안 쓰므로 `comma`/`pp`/`alpasim`/`L_d_eff`/`i_goal`/`cte` 는 없다
-  (뷰에서 빈칸). `idx` 는 시계열에서 고른 점 번호 = `(age + lat_delay)/dt`.
+  (뷰에서 빈칸).
+  - `t_query` — 시계열에서 읽은 시점. 기본은 패킷 `t=0` 기준 **고정 0.3s**
+    (`RAW_ACTION_FIXED_T_S`), `idx = t_query/dt` 라 dt 0.1s 면 항상 3.
+  - `lead = t_query - age` — **지금보다 얼마나 앞선 값인가**. 여기가 핵심 지표다.
+    `age` 는 publisher 추론시간 + 전송·loop 지연이라, 고정 오프셋을 쓰면 패킷이
+    늙은 만큼 lead 가 깎인다. `lead` 가 0 근처거나 음수면 지연 보상이 안 되고
+    있다는 뜻이므로 `RAW_ACTION_FIXED_T_S` 를 키워야 한다.
+  - `lat_delay` — `liveDelay.lateralDelay` 참고값(고정 모드에선 인덱스에 안 쓰임).
 - 제어가 멈추면 `... mode=bypass STOP reason='stale 0.71s' ...` 줄이 남는다.
 
 즉 XY 패널·κ 시계열·히스토그램·통계는 그대로 보이고, 제어기 비교 series 3개만

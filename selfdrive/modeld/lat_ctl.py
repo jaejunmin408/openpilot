@@ -83,8 +83,10 @@ def model_status_line(st):
 def action_status_line(st):
     """raw_action 상태 한 줄. 소스가 alpa_action 일 때 제어 가능 여부가 여기서 보인다.
 
-    idx 는 시계열에서 지금 실어 보내는 점의 번호다. (패킷 나이 + lat_delay)/dt 로
-    고르므로, 패킷이 제때 오면 0~1 근처에 머물고 갱신이 밀리면 끝(N-1)까지 올라간다.
+    t = 시계열에서 읽는 시점(패킷 t=0 기준, 기본 고정 0.3s), idx = t/dt 로 고른 점,
+    lead = t - age = "지금보다 얼마나 앞선 값인가". age 는 publisher 추론시간 + 전송
+    지연이라, 고정 t 를 쓰면 패킷이 늙은 만큼 lead 가 깎인다 — lead 가 0 이하로 가면
+    선행이 없거나(⚠) 과거 값을 싣고 있다는 뜻이므로 t 를 키워야 한다.
     """
     if not st.get("action_alive"):
         return "raw action: 수신 없음 (publisher 가 raw_action 을 안 보냄)"
@@ -92,11 +94,12 @@ def action_status_line(st):
     idx = st.get("action_idx")
     # a/v 는 publisher 필드 raw_accel_mps2 / accel_mps2 다. 후자는 이름과 달리 속도(m/s).
     line = (f"raw action: age {fmt_num(st, 'action_age', '.3f')}s"
+            f"  t {fmt_num(st, 'action_t_query', '.2f')}s"
+            f"  lead {fmt_num(st, 'action_lead', '+.3f')}s"
             f"  idx {'—' if idx is None else idx}/{'—' if not n else n - 1}"
             f"  κ {fmt_kappa(st.get('action_curv'))}"
             f"  a {fmt_num(st, 'action_accel', '+.2f')}"
-            f"  v {fmt_num(st, 'action_v_ref', '.2f')}"
-            f"  delay {fmt_num(st, 'action_lat_delay', '.3f')}s")
+            f"  v {fmt_num(st, 'action_v_ref', '.2f')}")
     reason = st.get("action_reason") or ""
     return line + (f"  ⚠ {reason}" if reason else "  ok")
 
