@@ -32,7 +32,9 @@ from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.fill_model_msg import fill_pose_msg
 from openpilot.common.file_chunker import read_file_chunked
-from openpilot.selfdrive.modeld.constants import ModelConstants
+from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.controls.lib.drive_helpers import get_curvature_from_plan
+from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 
 PROCESS_NAME = "selfdrive.modeld.modeld"
 
@@ -246,9 +248,9 @@ def main(demo=False):
   if use_extra_client:
     cloudlog.warning(f"connected extra cam with buffer size: {vipc_client_extra.buffer_len} ({vipc_client_extra.width} x {vipc_client_extra.height})")
 
-  # messaging — cameraOdometry only
-  pm = PubMaster(["cameraOdometry"])
-  sm = SubMaster(["deviceState", "roadCameraState", "liveCalibration", "driverMonitoringState"])
+  # messaging — cameraOdometry + modelLanePath(차선유지 융합용 모델 예측경로)
+  pm = PubMaster(["cameraOdometry", "modelLanePath"])
+  sm = SubMaster(["deviceState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carState"])
 
   params = Params()
 
@@ -342,6 +344,26 @@ def main(demo=False):
       posenet_send = messaging.new_message('cameraOdometry')
       fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
       pm.send('cameraOdometry', posenet_send)
+
+      # comma 비전 모델의 예측 주행경로(plan/position)를 udp_bridge 로 노출 → 외부경로 차선유지 융합.
+      # 모델은 매 프레임 이 path 를 계산하지만 기존엔 버려졌음. 좌표계는 modelV2.position 규약 그대로 전달하고
+      # 내부규약 변환·부호 처리는 수신부(udp_bridge)가 담당한다.
+      plan = model_output['plan'][0]
+      pos = plan[:, Plan.POSITION]                              # (IDX_N, 3) ego-frame
+      v_ego = float(sm["carState"].vEgo) if sm.alive["carState"] else 0.0
+      model_curv = get_curvature_from_plan(plan[:, Plan.T_FROM_CURRENT_EULER][:, 2],
+                                           plan[:, Plan.ORIENTATION_RATE][:, 2],
+                                           ModelConstants.T_IDXS, v_ego, DT_MDL)
+      lane_send = messaging.new_message('modelLanePath')
+      lane_send.valid = True
+      mlp = lane_send.modelLanePath
+      mlp.frameId = meta_main.frame_id
+      mlp.valid = bool(live_calib_seen)                         # 보정 전엔 warp 미정 → 경로 신뢰 불가
+      mlp.vEgo = v_ego
+      mlp.positionX = pos[:, 0].tolist()
+      mlp.positionY = pos[:, 1].tolist()
+      mlp.desiredCurvature = float(model_curv)
+      pm.send('modelLanePath', lane_send)
     last_vipc_frame_id = meta_main.frame_id
 
 

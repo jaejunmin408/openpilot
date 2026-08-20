@@ -27,8 +27,17 @@ ego-frame JSON으로 보내준다.
                    선형화해 ADMM QP 로 푼다. controls/lib/alpasim_mpc 참고.
                    전륜 조향각 δ 를 내고 κ = curvature_factor(v)·δ 로 환산.  (~13ms)
 
+**reference path 소스도 주행 중 전환** 할 수 있다 (제어기와 직교):
+
+  "alpamayo"    — 외부 publisher 가 UDP_PORT 로 보내주는 reference path slice (위 설명)
+  "comma_model" — comma 비전모델이 스스로 뽑은 예측경로. modeld 가 매 프레임 계산하지만
+                  버리던 plan/position 을 modelLanePath 로 발행하고, 여기서 그걸 받아
+                  외부경로와 똑같은 형태의 path 로 만들어 같은 제어기에 물린다.
+                  즉 "외부경로 추종" ↔ "comma 자체 주행" 을 같은 파이프라인에서 비교할 수 있다.
+
 전환 방법 (프로세스 재시작 불필요):
     python selfdrive/modeld/lat_ctl.py          # 터미널에서 키 입력으로 전환
+                                                #   1/2/3=제어기, p=경로 소스 토글
 udp_bridge 는 manager 가 띄우는 프로세스라 stdin 이 터미널이 아니다. 그래서 키
 입력은 lat_ctl.py 가 받아 UDP 제어 포트(LAT_CTL_PORT)로 명령을 보내는 구조다.
 같은 LAN 의 노트북에서 `--host <device-ip>` 로 원격 조작도 된다.
@@ -118,6 +127,24 @@ LAT_MODE_FILE = "/data/udp_bridge_lat_mode"
 LAT_CTL_PORT = 5009            # lat_ctl.py ↔ udp_bridge 제어/상태 포트
 # 활성 MPC 가 이만큼 연속 실패하면 낡은 curvature 를 붙들지 않고 PP 로 폴백
 LAT_FAIL_FALLBACK_N = 10
+
+# ── reference path 소스 선택 ─────────────────────────
+# 제어기(LAT_MODES)와 직교한다. 같은 제어기에 reference path 만 바꿔 끼우는 구조라
+# "외부경로 추종" 과 "comma 자체 주행" 을 같은 조건에서 비교할 수 있다.
+#   "alpamayo"    — 외부 publisher 의 UDP reference path slice
+#   "comma_model" — modeld 가 발행하는 comma 비전모델 예측경로(modelLanePath)
+PATH_SOURCES = ("alpamayo", "comma_model")
+DEFAULT_PATH_SOURCE = "alpamayo"
+PATH_SOURCE_FILE = "/data/udp_bridge_path_source"
+
+# comma 모델경로 신뢰 조건. 하나라도 어긋나면 path=None → 제어 정지(안전측).
+MODEL_PATH_MAX_AGE_S = 0.3     # modelLanePath 가 이보다 오래되면 버림
+MODEL_PATH_MIN_RANGE_M = 2.0   # 전방 커버가 이보다 짧으면 버림 (모델경로는 시간축
+                               # T_IDXS 33점이라 저속·정차에서 길이가 0 으로 수축한다)
+# modelLanePath.positionY → 내부규약(y=LEFT+) 변환 부호. 1.0 = 그대로 사용.
+# 모델 예측경로는 이미 내부규약과 같은 프레임이라 변환이 필요 없다. 실차 검증된 값이며
+# -1.0 으로 두면 경로가 좌우로 뒤집혀 반대로 조향한다. 건드리지 말 것.
+MODEL_Y_TO_INTERNAL_SIGN = 1.0
 
 # ── comma MPC 파라미터 (삭제된 lateral_planner.py 원본 값) ──
 COMMA_PATH_COST = 1.0
@@ -516,16 +543,20 @@ class AlpasimMpcController:
 #   {"cmd": "cycle"}                  → 다음 제어기로 순환 후 상태
 #   {"cmd": "compare", "on": bool}    → 비활성 제어기도 매 loop 계산(로그 비교용)
 #   {"cmd": "reset"}                  → 활성 제어기 내부 상태 리셋
+#   {"cmd": "source"}                 → reference path 소스 토글 후 상태
+#   {"cmd": "source", "src": "<name>"}→ reference path 소스 지정 후 상태
 # 응답은 아래 LatModeState.status() 의 dict 를 JSON 으로 직렬화한 것.
 class LatModeState:
-    """현재 선택된 횡제어기 + 제어 포트 서버 (non-blocking)."""
+    """현재 선택된 횡제어기 + reference path 소스 + 제어 포트 서버 (non-blocking)."""
 
-    def __init__(self, mode, sock):
+    def __init__(self, mode, sock, source=DEFAULT_PATH_SOURCE):
         self.mode = mode
+        self.source = source        # reference path 소스 (제어기와 직교)
         self.compare = False        # True 면 비활성 제어기도 매 loop 계산(로그용)
         self.sock = sock
         self.reset_request = False  # main loop 가 소비하는 1회성 플래그
         self.switch_count = 0
+        self.source_switch_count = 0
         self.last_cmd_from = None
         # main loop 가 매 frame 채워 넣는 텔레메트리 (status 응답용)
         self.telemetry = {}
@@ -549,12 +580,36 @@ class LatModeState:
     def cycle(self):
         return self.set_mode(LAT_MODES[(LAT_MODES.index(self.mode) + 1) % len(LAT_MODES)])
 
+    def set_source(self, source):
+        """reference path 소스 전환. 제어기 선택과는 독립이다."""
+        source = str(source).strip().lower()
+        if source not in PATH_SOURCES:
+            return False, f"unknown source {source!r} (choose from {', '.join(PATH_SOURCES)})"
+        if source == self.source:
+            return True, f"already {source}"
+        prev, self.source = self.source, source
+        self.source_switch_count += 1
+        # reference 가 불연속으로 바뀌므로 제어기 누적 상태(x0/warm start)를 비운다
+        self.reset_request = True
+        save_path_source(source)
+        msg = f"path source {prev} -> {source}"
+        cloudlog.warning(f"udp_bridge: {msg}")
+        print(f"[PATH] {msg}", flush=True)
+        return True, msg
+
+    def toggle_source(self):
+        nxt = PATH_SOURCES[(PATH_SOURCES.index(self.source) + 1) % len(PATH_SOURCES)]
+        return self.set_source(nxt)
+
     def status(self):
         st = {
             "mode": self.mode,
             "modes": list(LAT_MODES),
+            "source": self.source,
+            "sources": list(PATH_SOURCES),
             "compare": self.compare,
             "switch_count": self.switch_count,
+            "source_switch_count": self.source_switch_count,
         }
         st.update(self.telemetry)
         return st
@@ -580,6 +635,12 @@ class LatModeState:
                 elif cmd == "compare":
                     self.compare = bool(req.get("on", not self.compare))
                     msg = f"compare={'on' if self.compare else 'off'}"
+                elif cmd == "source":
+                    src = req.get("src")
+                    if src in (None, "", "toggle"):
+                        ok, msg = self.toggle_source()
+                    else:
+                        ok, msg = self.set_source(src)
                 elif cmd == "reset":
                     self.reset_request = True
                     msg = "controller state reset"
@@ -623,6 +684,32 @@ def save_lat_mode(mode):
         cloudlog.warning(f"udp_bridge: lat mode 저장 실패 ({e})")
 
 
+def load_path_source():
+    """시작 시 경로 소스 결정: 환경변수 > 마지막 선택 저장값 > 기본값."""
+    env = os.environ.get("UDP_BRIDGE_PATH_SOURCE", "").strip().lower()
+    if env in PATH_SOURCES:
+        return env
+    if env:
+        cloudlog.warning(f"udp_bridge: unknown UDP_BRIDGE_PATH_SOURCE {env!r}, ignoring")
+    try:
+        with open(PATH_SOURCE_FILE, encoding="utf-8") as f:
+            saved = f.read().strip().lower()
+        if saved in PATH_SOURCES:
+            return saved
+    except OSError:
+        pass
+    return DEFAULT_PATH_SOURCE
+
+
+def save_path_source(source):
+    """다음 실행에서도 같은 소스로 뜨도록 저장 (실패해도 무시)."""
+    try:
+        with open(PATH_SOURCE_FILE, "w", encoding="utf-8") as f:
+            f.write(source)
+    except OSError as e:
+        cloudlog.warning(f"udp_bridge: path source 저장 실패 ({e})")
+
+
 def _safe_float(value):
     if value is None:
         return ""
@@ -663,10 +750,12 @@ def _path_shape_metrics(path_ego):
 
 
 def build_path_diag_row(path_ego, *, event, recv_count, frame_id, v_ego, kappa_smoothed,
-                        prev_goal_y_by_ld, now_wall_us, now_mono_s, slice_s=None):
+                        prev_goal_y_by_ld, now_wall_us, now_mono_s, slice_s=None,
+                        path_source=""):
     meta = dict(path_ego.get("meta") or {})
     row = {
         "event": event,
+        "path_source": path_source,
         "monotonic_s": now_mono_s,
         "wall_unix_s": now_wall_us / 1_000_000.0,
         "frame_id": int(frame_id),
@@ -710,6 +799,7 @@ def build_path_diag_row(path_ego, *, event, recv_count, frame_id, v_ego, kappa_s
 def diag_fieldnames():
     fields = [
         "event",
+        "path_source",
         "monotonic_s",
         "wall_unix_s",
         "frame_id",
@@ -767,6 +857,74 @@ def open_diag_csv():
     writer.writeheader()
     cloudlog.warning(f"udp_bridge path diagnostics CSV: {path}")
     return path, fh, writer
+
+
+# ── comma 모델 예측경로 (modeld → modelLanePath) ─────
+def build_model_path(sm, now_mono_s):
+    """modelLanePath → 내부규약(y=LEFT+) 모델경로 dict. 못 쓰면 None.
+
+    return (path|None, info). info 는 lat_ctl 표시·로그용 진단 상태로, path 가
+    None 일 때 그 이유(reason)를 담는다. 모델경로는 시간축 T_IDXS 33점이라 전방
+    커버가 속도에 비례한다 — 정차 중엔 길이가 거의 0 이므로 제어에 쓰면 안 된다.
+    """
+    info = {"alive": bool(sm.alive["modelLanePath"]), "age": None, "n": 0,
+            "range_m": None, "curv": None, "frame_id": None, "reason": ""}
+    if not info["alive"]:
+        info["reason"] = "modeld 미수신"
+        return None, info
+
+    mlp = sm["modelLanePath"]
+    info["age"] = now_mono_s - sm.logMonoTime["modelLanePath"] / 1e9
+    info["n"] = len(mlp.positionX)
+    info["curv"] = float(mlp.desiredCurvature)
+    info["frame_id"] = int(mlp.frameId)
+
+    if not mlp.valid:
+        info["reason"] = "캘리브레이션 전"
+        return None, info
+    if info["n"] < 2:
+        info["reason"] = f"점 부족 ({info['n']})"
+        return None, info
+    if info["age"] > MODEL_PATH_MAX_AGE_S:
+        info["reason"] = f"stale {info['age']:.2f}s"
+        return None, info
+
+    x = np.asarray(mlp.positionX, dtype=np.float64)
+    y = MODEL_Y_TO_INTERNAL_SIGN * np.asarray(mlp.positionY, dtype=np.float64)
+    info["range_m"] = float(x[-1] - x[0])
+    if info["range_m"] < MODEL_PATH_MIN_RANGE_M:
+        info["reason"] = f"전방커버 {info['range_m']:.1f}m (저속/정차)"
+        return None, info
+
+    return {"x": x, "y": y, "age": info["age"], "frame_id": info["frame_id"],
+            "model_curv": info["curv"], "v_ego": float(mlp.vEgo)}, info
+
+
+def model_telemetry(model_info):
+    """build_model_path 의 info → lat_ctl 표시용 텔레메트리 키."""
+    return {
+        "model_alive": bool(model_info["alive"]),
+        "model_age": model_info["age"],
+        "model_n": model_info["n"],
+        "model_range_m": model_info["range_m"],
+        "model_curv": model_info["curv"],
+        "model_reason": model_info["reason"],
+    }
+
+
+def model_path_to_packet(model_path):
+    """모델경로 → 외부 UDP 패킷과 동일한 path dict.
+
+    이렇게 맞춰두면 pure pursuit / comma MPC / alpasim MPC 셋 다 소스를 모른 채
+    지금까지와 똑같이 동작한다. raw_y 는 진단 표시용 우향(+) 복원.
+    """
+    x = np.asarray(model_path["x"], dtype=np.float64)
+    y = np.asarray(model_path["y"], dtype=np.float64)
+    return {
+        "x": x, "y": y, "raw_y": -y, "N": int(x.shape[0]),
+        "meta": {"udp_mode": "comma_model", "label": "modelLanePath",
+                 "plan_seq": int(model_path["frame_id"])},
+    }
 
 
 # ── 종방향 ───────────────────────────────────────────
@@ -1073,7 +1231,8 @@ def main():
     cloudlog.warning("udp_bridge init (ref-path slice mode, target=15km/h)")
 
     pm = PubMaster(["modelV2", "drivingModelData", "longitudinalPlan", "driverAssistance"])
-    sm = SubMaster(["carState", "livePose", "selfdriveState", "liveParameters"])
+    sm = SubMaster(["carState", "livePose", "selfdriveState", "liveParameters",
+                    "modelLanePath"])
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1100,17 +1259,22 @@ def main():
     # lat_ctl.py 가 제어 포트로 보내는 명령으로 처리(프로세스 재시작 불필요).
     comma_ctl = CommaMpcController()
     alpasim_ctl = AlpasimMpcController(load_car_params())
-    lat_state = LatModeState(load_lat_mode(), ctl_sock)
+    lat_state = LatModeState(load_lat_mode(), ctl_sock, load_path_source())
     lat_fail_streak = 0
     last_loop_ms = 0.0
     cloudlog.warning(f"udp_bridge lateral controller: {lat_state.mode} "
                      f"(전환: python selfdrive/modeld/lat_ctl.py, 포트 {LAT_CTL_PORT})")
+    cloudlog.warning(f"udp_bridge reference path source: {lat_state.source} "
+                     f"(전환: lat_ctl.py 의 [p])")
     print(f"[LAT] lateral controller = {lat_state.mode}  "
           f"(전환: python selfdrive/modeld/lat_ctl.py)", flush=True)
+    print(f"[PATH] reference path source = {lat_state.source}  ([p] 로 토글)", flush=True)
 
     frame_id = 0
-    path = None
-    recv_count = 0
+    ext_path = None            # 외부 UDP 로 받은 최신 reference path
+    recv_count = 0             # 외부 UDP 패킷 수신 누계
+    path_seq = 0               # 실제로 채택한 path 의 일련번호 (소스 무관, 로그 기준)
+    last_model_frame_id = None # 같은 모델 프레임을 두 번 세지 않기 위한 마커
     log_counter = 0
     prev_curvature = 0.0
 
@@ -1135,12 +1299,16 @@ def main():
                 pkt = parse_path_packet(data)
                 if pkt is not None:
                     recv_count += 1
-                    path = pkt
+                    ext_path = pkt
+                    # 소스가 외부경로일 때만 '채택한 path' 로 세고 기록한다.
+                    # (comma_model 로 돌려놔도 수신·미러링은 계속해서 즉시 되돌릴 수 있게 둔다)
+                    if lat_state.source == "alpamayo":
+                        path_seq += 1
                     # 디버그 로그: 수신 path (내부 좌표계, y=left). 한 줄=한 path. engage 중에만.
-                    if debug_log is not None:
+                    if debug_log is not None and lat_state.source == "alpamayo":
                         debug_log.write(
-                            f"[t={time.monotonic():.3f}] PATH recv #{recv_count} N={pkt['N']} "
-                            f"pts={format_xy_points(pkt['x'], pkt['y'])}\n"
+                            f"[t={time.monotonic():.3f}] PATH recv #{path_seq} src=alpamayo "
+                            f"N={pkt['N']} pts={format_xy_points(pkt['x'], pkt['y'])}\n"
                         )
                     # raw mirror → viz (ego-frame 원본)
                     try:
@@ -1150,13 +1318,13 @@ def main():
                     # 패킷 도착 시점 pure pursuit 1회 → goal + raw kappa snapshot
                     v_ego_now = max(sm["carState"].vEgo, 0.0) if sm.alive["carState"] else 0.0
                     kappa_pp_pkt, i_goal_pkt, L_d_eff_pkt = pure_pursuit_curvature(pkt, v_ego_now, index_frac=PP_INDEX_FRAC)
-                    if diag_writer is not None:   # engage 중에만 기록
+                    if diag_writer is not None and lat_state.source == "alpamayo":
                         now_wall_us = time.time_ns() // 1000
                         now_mono_s = time.monotonic()
                         diag_row = build_path_diag_row(
                             pkt,
                             event="recv",
-                            recv_count=recv_count,
+                            recv_count=path_seq,
                             frame_id=frame_id,
                             v_ego=v_ego_now,
                             kappa_smoothed=None,
@@ -1164,6 +1332,7 @@ def main():
                             now_wall_us=now_wall_us,
                             now_mono_s=now_mono_s,
                             slice_s=0.0,
+                            path_source="alpamayo",
                         )
                         diag_writer.writerow(diag_row)
                         for ld_m in DIAG_LD_VALUES_M:
@@ -1215,6 +1384,42 @@ def main():
             alpasim_ctl.reset()
             lat_fail_streak = 0
             lat_state.reset_request = False
+
+        # 2.7. reference path 소스 선택 — 외부 UDP 경로 ↔ comma 모델 자체 경로
+        # 두 소스 모두 항상 받아두고 여기서 고르기만 한다. 아래 제어기들은 소스를
+        # 모른 채 동일한 path dict 를 받으므로 전환에 재시작·재초기화가 필요 없다.
+        model_path, model_info = build_model_path(sm, loop_start)
+        if lat_state.source == "comma_model":
+            if model_path is None:
+                path = None          # 모델경로를 못 믿으면 제어 정지 (안전측)
+            else:
+                path = model_path_to_packet(model_path)
+                # 모델은 20Hz 라 loop 와 1:1 이지만, 프레임이 밀리면 같은 경로가
+                # 두 번 온다. frameId 로 새 경로일 때만 새 번호를 준다.
+                if model_path["frame_id"] != last_model_frame_id:
+                    last_model_frame_id = model_path["frame_id"]
+                    path_seq += 1
+                    if debug_log is not None:
+                        debug_log.write(
+                            f"[t={time.monotonic():.3f}] PATH recv #{path_seq} src=comma_model "
+                            f"N={path['N']} pts={format_xy_points(path['x'], path['y'])}\n"
+                        )
+                    if diag_writer is not None:
+                        diag_writer.writerow(build_path_diag_row(
+                            path,
+                            event="recv",
+                            recv_count=path_seq,
+                            frame_id=frame_id,
+                            v_ego=v_ego,
+                            kappa_smoothed=None,
+                            prev_goal_y_by_ld={},
+                            now_wall_us=time.time_ns() // 1000,
+                            now_mono_s=time.monotonic(),
+                            slice_s=0.0,
+                            path_source="comma_model",
+                        ))
+        else:
+            path = ext_path
 
         # 3. tracker — 받은 path 를 그대로(원점 재정렬 없이) 추종
         if path is not None:
@@ -1269,10 +1474,12 @@ def main():
                 "cte_m": float(path['y'][0]),
                 "path_points": int(path['N']),
                 "pkts": recv_count,
+                "path_seq": path_seq,
                 "engaged": engaged,
                 "frame": frame_id,
                 "loop_ms": last_loop_ms,
                 "has_path": True,
+                **model_telemetry(model_info),
             }
 
             # 직진 데드존: |curvature| 이 임계 이하면 제어 입력을 0 으로
@@ -1289,13 +1496,18 @@ def main():
 
             # 디버그 로그: 매 20Hz loop curvature, engage 중에만
             if debug_log is not None:
+                mc = model_info["curv"]
+                ma = model_info["age"]
                 debug_log.write(
                     f"[t={time.monotonic():.3f}] CURV frame={frame_id} v_ego={v_ego:.2f} "
-                    f"mode={mode} comma={kappa_comma:+.4f}({'ok' if comma_ok else '-'}) "
+                    f"src={lat_state.source} mode={mode} "
+                    f"comma={kappa_comma:+.4f}({'ok' if comma_ok else '-'}) "
                     f"alpasim={kappa_alpasim:+.4f}({'ok' if alpasim_ok else '-'}) "
                     f"pp={kappa_pp:+.4f} sm={kappa:+.4f} "
                     f"L_d_eff={L_d_eff:.2f} i_goal={i_goal} solve={solve_s * 1e3:.1f}ms "
-                    f"cte={float(path['y'][0]):+.2f} pkts={recv_count}\n"
+                    f"cte={float(path['y'][0]):+.2f} path={path_seq} pkts={recv_count} "
+                    f"model_curv={'nan' if mc is None else f'{mc:+.4f}'} "
+                    f"model_age={'nan' if ma is None else f'{ma:.3f}'}\n"
                 )
 
             if diag_writer is not None and frame_id % DIAG_CONTROL_EVERY_N == 0:
@@ -1303,7 +1515,7 @@ def main():
                     build_path_diag_row(
                         path,
                         event="control",
-                        recv_count=recv_count,
+                        recv_count=path_seq,
                         frame_id=frame_id,
                         v_ego=v_ego,
                         kappa_smoothed=kappa,
@@ -1311,6 +1523,7 @@ def main():
                         now_wall_us=time.time_ns() // 1000,
                         now_mono_s=time.monotonic(),
                         slice_s=0.0,
+                        path_source=lat_state.source,
                     )
                 )
 
@@ -1318,11 +1531,11 @@ def main():
             if log_counter % 20 == 1:   # 1Hz
                 cte = float(path['y'][0])
                 cloudlog.warning(
-                    f"track: v_ego={v_ego:.2f} target={TARGET_SPEED_MPS:.2f} "
+                    f"track[{lat_state.source}]: v_ego={v_ego:.2f} target={TARGET_SPEED_MPS:.2f} "
                     f"κ={kappa:+.4f}[{mode}](comma {kappa_comma:+.4f} "
                     f"alpasim {kappa_alpasim:+.4f} pp {kappa_pp:+.4f}) a={a_cmd:+.2f} "
                     f"L_d={L_d_eff:.1f} i_goal={i_goal} N={path['N']} "
-                    f"cte={cte:+.2f} pkts={recv_count}"
+                    f"cte={cte:+.2f} path={path_seq} pkts={recv_count}"
                 )
         else:
             action = idle_action()
@@ -1334,10 +1547,12 @@ def main():
             lat_state.telemetry = {
                 "v_ego": v_ego,
                 "pkts": recv_count,
+                "path_seq": path_seq,
                 "engaged": engaged,
                 "frame": frame_id,
                 "loop_ms": last_loop_ms,
                 "has_path": False,
+                **model_telemetry(model_info),
             }
 
         # 4. 메시지 발행

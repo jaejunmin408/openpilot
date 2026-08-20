@@ -1,0 +1,975 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>udp_bridge curvature log viewer</title>
+<style>
+  :root{
+    --bg:#0f1216; --panel:#161b22; --panel2:#1c2230; --line:#2a3240;
+    --fg:#d7dee8; --dim:#8b97a8; --accent:#4fd1ff; --warn:#ffb454;
+    --pos:#5bd68a; --neg:#ff7a85; --sel:#ffd166;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;
+    display:grid; grid-template-rows:auto auto minmax(0,1fr) auto; height:100vh; overflow:hidden;
+  }
+  header{
+    display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+    padding:8px 10px; background:var(--panel); border-bottom:1px solid var(--line);
+  }
+  header h1{font-size:13px; margin:0 8px 0 0; color:var(--accent); font-weight:600; letter-spacing:.02em}
+  select,input[type=file],button,input[type=text],input[type=number]{
+    background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+    border-radius:4px; padding:3px 6px; font:inherit;
+  }
+  select{max-width:min(46vw,460px)}
+  button{cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  button.on{border-color:var(--accent); color:var(--accent)}
+  label.chk{display:inline-flex; align-items:center; gap:4px; color:var(--dim); cursor:pointer}
+  .spacer{flex:1}
+  #drop{color:var(--dim)}
+  #drop.hot{color:var(--accent)}
+
+  #summary{
+    display:flex; flex-wrap:wrap; gap:14px; padding:6px 10px;
+    background:var(--panel); border-bottom:1px solid var(--line); color:var(--dim);
+  }
+  #summary b{color:var(--fg); font-weight:600}
+  #summary .k{color:var(--accent)}
+
+  main{display:grid; grid-template-columns:272px minmax(0,1fr) 410px; gap:1px; background:var(--line); min-height:0}
+  main>section,main>aside{background:var(--bg); min-width:0; min-height:0; display:flex; flex-direction:column}
+  .ttl{padding:4px 8px; color:var(--dim); border-bottom:1px solid var(--line); background:var(--panel);
+       display:flex; gap:8px; align-items:center; white-space:nowrap}
+  .ttl .spacer{flex:1}
+
+  #pathList{overflow-y:auto; flex:1}
+  .prow{display:grid; grid-template-columns:56px 48px 34px 30px 1fr; gap:4px; padding:2px 6px;
+        border-bottom:1px solid #1b212b; cursor:pointer; white-space:nowrap}
+  .prow:hover{background:#1a2130}
+  .prow.sel{background:#243247; box-shadow:inset 2px 0 0 var(--sel)}
+  .prow.nop{opacity:.45}
+  .prow .pid{color:var(--sel)}
+  .prow .pt,.prow .pn{color:var(--dim)}
+  .prow .pc{color:var(--accent)}
+  .prow .pk{text-align:right}
+
+  #plotWrap{position:relative; flex:1; min-height:0}
+  #xy{width:100%; height:100%; display:block; cursor:grab}
+  #xy.drag{cursor:grabbing}
+  #xyHint{position:absolute; left:8px; bottom:6px; color:var(--dim); pointer-events:none}
+  #legend{position:absolute; right:8px; top:8px; background:rgba(15,18,22,.82); border:1px solid var(--line);
+          border-radius:4px; padding:5px 7px; max-height:60%; overflow:auto; pointer-events:none}
+  #legend div{white-space:nowrap}
+
+  #right{display:flex; flex-direction:column; min-height:0}
+  #right .box{display:flex; flex-direction:column; min-height:0}
+  #ts{width:100%; height:150px; display:block}
+  #hist{width:100%; height:170px; display:block}
+  #statsBox{overflow:auto; padding:4px 6px; flex:1; min-height:0}
+  table.st{border-collapse:collapse; width:100%}
+  table.st th,table.st td{padding:1px 5px; text-align:right; border-bottom:1px solid #1b212b; white-space:nowrap}
+  table.st th{color:var(--dim); font-weight:500; text-align:right}
+  table.st td.l,table.st th.l{text-align:left}
+  table.st tr.hi td{background:#243247}
+
+  #tableWrap{height:190px; overflow:auto; background:var(--bg); border-top:1px solid var(--line)}
+  #curvTable{border-collapse:collapse; width:100%}
+  #curvTable th{position:sticky; top:0; background:var(--panel); color:var(--dim); font-weight:500;
+                padding:3px 6px; text-align:right; border-bottom:1px solid var(--line); z-index:1}
+  #curvTable td{padding:1px 6px; text-align:right; border-bottom:1px solid #171d26; white-space:nowrap}
+  #curvTable td.l,#curvTable th.l{text-align:left}
+  #curvTable tr:hover td{background:#1a2130}
+  #curvTable .swatch{display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:5px; vertical-align:-1px}
+  .pos{color:var(--pos)} .neg{color:var(--neg)} .nan{color:#5a6472}
+  .muted{color:var(--dim)}
+  #err{color:var(--neg); padding:0 10px}
+</style>
+</head>
+<body>
+<header>
+  <h1>curvature log viewer</h1>
+  <select id="fileSel" title="기기 logs/ 안의 udp_bridge_debug_*.log"></select>
+  <button id="reload" title="목록 새로고침">↻</button>
+  <input type="file" id="fileInput" accept=".log,.txt">
+  <span id="drop">← 파일을 여기로 끌어다 놓아도 됩니다</span>
+  <span class="spacer"></span>
+  <label class="chk">series
+    <select id="seriesSel">
+      <option value="sm">sm (최종 지령)</option>
+      <option value="comma">comma_mpc</option>
+      <option value="pp">pure pursuit</option>
+      <option value="alpasim">alpasim_mpc</option>
+    </select>
+  </label>
+  <label class="chk"><input type="checkbox" id="cbArc" checked>κ 원호</label>
+  <label class="chk"><input type="checkbox" id="cbPts" checked>점</label>
+  <label class="chk">이전경로 <input type="number" id="ghostN" value="2" min="0" max="20" style="width:46px"></label>
+  <label class="chk">y확대
+    <select id="stretchSel">
+      <option value="auto">auto</option>
+      <option value="1">1× (실제 비율)</option>
+      <option value="2">2×</option><option value="5">5×</option>
+      <option value="10">10×</option><option value="20">20×</option>
+    </select>
+  </label>
+  <label class="chk"><input type="checkbox" id="cbAutoFit">자동맞춤</label>
+  <button id="fitBtn" title="현재 경로에 맞춰 확대">fit</button>
+</header>
+
+<div id="summary"><span class="muted">로그를 선택하세요.</span></div>
+<div id="err"></div>
+
+<main>
+  <aside>
+    <div class="ttl">경로 목록 <span class="spacer"></span>
+      <input type="text" id="findPath" placeholder="#번호" style="width:74px">
+    </div>
+    <div id="pathList"></div>
+  </aside>
+
+  <section>
+    <div class="ttl">
+      <span id="plotTitle">XY 경로 (ego frame · x=전방↑ · y=좌측←)</span>
+      <span class="spacer"></span>
+      <span class="muted">휠=확대 · 드래그=이동</span>
+    </div>
+    <div id="plotWrap">
+      <canvas id="xy"></canvas>
+      <div id="legend"></div>
+      <div id="xyHint"></div>
+    </div>
+  </section>
+
+  <section id="right">
+    <div class="ttl">κ 시계열 (전체 로그 · 세로 띠 = 경로 1개)</div>
+    <canvas id="ts"></canvas>
+    <div class="ttl">κ 분포 (전체 로그) <span class="spacer"></span>
+      <label class="chk">bins <input type="number" id="binsN" value="40" min="5" max="200" style="width:52px"></label>
+      <label class="chk"><input type="checkbox" id="cbLog">log</label>
+    </div>
+    <canvas id="hist"></canvas>
+    <div class="ttl">통계</div>
+    <div id="statsBox"></div>
+  </section>
+</main>
+
+<div id="tableWrap">
+  <table id="curvTable"><thead></thead><tbody></tbody></table>
+</div>
+
+<script>
+"use strict";
+// =====================================================================
+// udp_bridge_debug_*.log 뷰어
+//   PATH 줄 : [t=..] PATH recv #<id> N=<n> pts=[(x,y), ...]      ← 수신 경로 1개
+//   CURV 줄 : [t=..] CURV frame=.. v_ego=.. mode=.. comma=..(ok) alpasim=..(-)
+//             pp=.. sm=.. L_d_eff=.. i_goal=.. solve=..ms cte=.. pkts=<id>
+//   경로는 ~10Hz, 제어는 20Hz 라 CURV 여러 줄이 같은 pkts(=경로 번호)를 가리킨다.
+//   pkts 로 묶어서 "같은 경로에서 뽑힌 curvature 들"을 한 세트로 본다.
+// 좌표계: 내부 openpilot body frame. x=전방(+), y=좌측(+), κ>0 = 좌회전.
+// =====================================================================
+
+const $ = (id) => document.getElementById(id);
+const SERIES = ['sm', 'comma', 'pp', 'alpasim'];
+const SERIES_LABEL = {sm:'sm (최종)', comma:'comma_mpc', pp:'pure pursuit', alpasim:'alpasim_mpc'};
+
+const S = {
+  fileName: '', paths: [], curvs: [], byId: new Map(),
+  sel: -1, hover: -1,            // sel: paths 인덱스, hover: 선택 경로의 curv 인덱스
+  series: 'sm', ghost: 2, showArcs: true, showPts: true, bins: 40, autoFit: false,
+  stretchMode: 'auto', histLog: false,
+  view: null,                    // {wx, wy, scale, stretch}  중앙 world 좌표 + m→px (+ y축 확대배율)
+  t0: 0, stats: {},
+};
+
+// ---------- 파싱 ----------
+const RE_HDR  = /^\[t=([-0-9.]+)\]\s+(\w+)\s+(.*)$/;
+const RE_PATH = /^recv\s+#(\d+)\s+(?:src=(\S+)\s+)?N=(\d+)\s+pts=(.*)$/;
+const RE_PT   = /\(\s*([-+0-9.eE]+)\s*,\s*([-+0-9.eE]+)\s*\)/g;
+
+function numFlag(tok) {
+  // "-0.0082(ok)" / "+nan(-)" / "1.9ms" → {v, ok}
+  if (tok === undefined) return {v: NaN, ok: false};
+  const ok = /\(ok\)$/.test(tok);
+  const v = parseFloat(tok.replace(/\(.*\)$/, ''));
+  return {v: Number.isFinite(v) ? v : NaN, ok};
+}
+
+function parseLog(text) {
+  const paths = [], curvs = [], byId = new Map();
+  let truncated = 0, badPath = 0;
+  for (const line of text.split('\n')) {
+    if (!line) continue;
+    const m = RE_HDR.exec(line);
+    if (!m) continue;
+    const t = parseFloat(m[1]), kind = m[2], rest = m[3];
+
+    if (kind === 'PATH') {
+      const mm = RE_PATH.exec(rest);
+      if (!mm) { badPath++; continue; }
+      const id = +mm[1], src = mm[2] || '', N = +mm[3];
+      const x = [], y = [];
+      RE_PT.lastIndex = 0;
+      let pm;
+      while ((pm = RE_PT.exec(mm[4])) !== null) { x.push(+pm[1]); y.push(+pm[2]); }
+      if (x.length !== N) truncated++;          // 프로세스 종료로 줄이 잘린 경우
+      const p = {id, t, N, x, y, src, curvs: [], missing: false};
+      const old = byId.get(id);
+      if (old) { Object.assign(old, {t, N, x, y, src, missing: false}); }  // placeholder 채우기
+      else { paths.push(p); byId.set(id, p); }
+
+    } else if (kind === 'CURV') {
+      const kv = {};
+      for (const tok of rest.split(/\s+/)) {
+        const i = tok.indexOf('=');
+        if (i > 0) kv[tok.slice(0, i)] = tok.slice(i + 1);
+      }
+      const comma = numFlag(kv.comma), alpa = numFlag(kv.alpasim);
+      const c = {
+        t, frame: parseInt(kv.frame, 10),
+        v: parseFloat(kv.v_ego), mode: kv.mode || '',
+        comma: comma.v, commaOk: comma.ok,
+        alpasim: alpa.v, alpasimOk: alpa.ok,
+        pp: numFlag(kv.pp).v, sm: numFlag(kv.sm).v,
+        L: parseFloat(kv.L_d_eff), iGoal: parseInt(kv.i_goal, 10),
+        solve: parseFloat(kv.solve), cte: parseFloat(kv.cte),
+        pkts: parseInt(kv.pkts, 10),
+        src: kv.src || '',
+        modelCurv: numFlag(kv.model_curv).v, modelAge: numFlag(kv.model_age).v,
+      };
+      // 경로 번호: 신형 로그는 path=(채택한 path 일련번호), 구형은 pkts=(수신 누계)
+      c.pathId = Number.isFinite(parseInt(kv.path, 10)) ? parseInt(kv.path, 10) : c.pkts;
+      curvs.push(c);
+      let p = byId.get(c.pathId);
+      if (!p) {   // 로그가 열리기 전에 수신된 경로 → 점 없음
+        p = {id: c.pathId, t, N: 0, x: [], y: [], src: c.src, curvs: [], missing: true};
+        paths.push(p); byId.set(c.pathId, p);
+      }
+      if (!p.src && c.src) p.src = c.src;
+      c.k = p.curvs.length;      // 이 경로 안에서 몇 번째 계산인지
+      p.curvs.push(c);
+    }
+  }
+  paths.sort((a, b) => a.t - b.t || a.id - b.id);
+  return {paths, curvs, byId, truncated, badPath};
+}
+
+// ---------- 통계 ----------
+function stats(vals) {
+  const v = vals.filter(Number.isFinite).slice().sort((a, b) => a - b);
+  const n = v.length;
+  if (!n) return {n: 0};
+  const sum = v.reduce((a, b) => a + b, 0);
+  const mean = sum / n;
+  const varr = v.reduce((a, b) => a + (b - mean) * (b - mean), 0) / n;
+  const q = (p) => {
+    const i = (n - 1) * p, lo = Math.floor(i), hi = Math.ceil(i);
+    return v[lo] + (v[hi] - v[lo]) * (i - lo);
+  };
+  return {
+    n, mean, std: Math.sqrt(varr), med: q(0.5), p5: q(0.05), p95: q(0.95),
+    min: v[0], max: v[n - 1],
+    absMean: v.reduce((a, b) => a + Math.abs(b), 0) / n,
+  };
+}
+
+function histogram(vals, nbins) {
+  const v = vals.filter(Number.isFinite);
+  if (!v.length) return null;
+  let lo = v[0], hi = v[0];
+  for (const x of v) { if (x < lo) lo = x; if (x > hi) hi = x; }
+  if (hi - lo < 1e-12) { lo -= 5e-4; hi += 5e-4; }
+  const w = (hi - lo) / nbins;
+  const bins = new Array(nbins).fill(0);
+  for (const x of v) {
+    let i = Math.floor((x - lo) / w);
+    if (i < 0) i = 0; if (i >= nbins) i = nbins - 1;
+    bins[i]++;
+  }
+  let peak = 0;
+  for (const b of bins) if (b > peak) peak = b;
+  return {bins, lo, hi, w, n: v.length, peak};
+}
+
+const fmtK = (x, d = 5) => Number.isFinite(x) ? (x >= 0 ? '+' : '') + x.toFixed(d) : 'nan';
+const cls = (x) => !Number.isFinite(x) ? 'nan' : (x > 0 ? 'pos' : (x < 0 ? 'neg' : 'muted'));
+// 같은 경로 안에서 몇 번째 계산인지 → 색 (cyan → orange)
+function sampleColor(i, n, a = 1) {
+  const f = n > 1 ? i / (n - 1) : 0;
+  return `hsla(${(195 - 175 * f).toFixed(0)},85%,${(62 - 6 * f).toFixed(0)}%,${a})`;
+}
+
+// ---------- 캔버스 공통 ----------
+function prep(cv) {
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth || 300, H = cv.clientHeight || 150;
+  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) {
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  ctx.font = '10px ui-monospace,Menlo,Consolas,monospace';
+  return {ctx, W, H};
+}
+
+function niceStep(targetPx, scale) {
+  const raw = targetPx / scale;
+  const e = Math.pow(10, Math.floor(Math.log10(raw)));
+  const m = raw / e;
+  return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * e;
+}
+
+// ---------- XY 경로 플롯 ----------
+// y(횡)방향은 scale*stretch 로 그린다. 경로도 원호도 같은 배율로 늘어나므로
+// 둘의 비교는 그대로 유효하다. stretch=1 이 실제 비율.
+function w2s(x, y, W, H) {
+  const v = S.view;
+  return [W / 2 - (y - v.wy) * v.scale * v.stretch, H / 2 - (x - v.wx) * v.scale];
+}
+function s2w(sx, sy, W, H) {
+  const v = S.view;
+  return [v.wx - (sy - H / 2) / v.scale, v.wy - (sx - W / 2) / (v.scale * v.stretch)];
+}
+
+function boundsOf(paths) {
+  let xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity, any = false;
+  for (const p of paths) {
+    for (let i = 0; i < p.x.length; i++) {
+      any = true;
+      if (p.x[i] < xmin) xmin = p.x[i];
+      if (p.x[i] > xmax) xmax = p.x[i];
+      if (p.y[i] < ymin) ymin = p.y[i];
+      if (p.y[i] > ymax) ymax = p.y[i];
+    }
+  }
+  if (!any) return {xmin: -2, xmax: 40, ymin: -8, ymax: 8};
+  return {xmin, xmax, ymin, ymax};
+}
+
+function fitView(paths) {
+  const cv = $('xy'), W = cv.clientWidth || 800, H = cv.clientHeight || 600;
+  const b = boundsOf(paths);
+  const dx = Math.max(b.xmax - b.xmin, 2), dy = Math.max(b.ymax - b.ymin, 0.5);
+  let scale = H / (dx * 1.12);                       // 전방 extent 를 세로에 맞춤
+  let stretch = S.stretchMode === 'auto'
+    ? Math.max(1, Math.min(60, (W / (dy * 1.25)) / scale))
+    : Math.max(1, +S.stretchMode || 1);
+  if (dy * scale * stretch > W) scale = W / (dy * 1.25 * stretch);   // 가로로 넘치면 축소
+  S.view = {wx: (b.xmin + b.xmax) / 2, wy: (b.ymin + b.ymax) / 2, scale, stretch};
+}
+
+function pathArcLen(p) {
+  let s = 0;
+  for (let i = 1; i < p.x.length; i++) s += Math.hypot(p.x[i] - p.x[i - 1], p.y[i] - p.y[i - 1]);
+  return s || 30;
+}
+
+function arcPoints(kappa, sMax, n = 96) {
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    const s = sMax * i / n;
+    if (!Number.isFinite(kappa) || Math.abs(kappa) < 1e-7) pts.push([s, 0]);
+    else { const R = 1 / kappa; pts.push([R * Math.sin(s * kappa), R * (1 - Math.cos(s * kappa))]); }
+  }
+  return pts;
+}
+
+function drawXY() {
+  const cv = $('xy');
+  const {ctx, W, H} = prep(cv);
+  if (!S.view || !S.paths.length) return;
+  const sel = S.paths[S.sel] || null;
+
+  // --- 격자 ---
+  let stepX = niceStep(64, S.view.scale);
+  let stepY = niceStep(64, S.view.scale * S.view.stretch);
+  if (!(stepX > 0) || !Number.isFinite(stepX)) stepX = 10;
+  if (!(stepY > 0) || !Number.isFinite(stepY)) stepY = 10;
+  const tl = s2w(0, 0, W, H), br = s2w(W, H, W, H);
+  const MAXLINES = 400;
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = '#1d2531'; ctx.fillStyle = '#4d5866';
+  for (let x = Math.ceil(br[0] / stepX) * stepX, n = 0; x <= tl[0] && n < MAXLINES; x += stepX, n++) {   // 전방 등고선(가로줄)
+    const p = w2s(x, 0, W, H);
+    ctx.beginPath(); ctx.moveTo(0, p[1]); ctx.lineTo(W, p[1]); ctx.stroke();
+    ctx.fillText(x.toFixed(stepX < 1 ? 1 : 0) + 'm', 3, p[1] - 2);
+  }
+  for (let y = Math.ceil(br[1] / stepY) * stepY, n = 0; y <= tl[1] && n < MAXLINES; y += stepY, n++) {   // 좌우 등고선(세로줄)
+    const p = w2s(0, y, W, H);
+    ctx.beginPath(); ctx.moveTo(p[0], 0); ctx.lineTo(p[0], H); ctx.stroke();
+    ctx.fillText(y.toFixed(stepY < 1 ? 2 : 0), p[0] + 2, H - 3);
+  }
+  // 원점 축
+  ctx.strokeStyle = '#334055';
+  const o = w2s(0, 0, W, H);
+  ctx.beginPath(); ctx.moveTo(0, o[1]); ctx.lineTo(W, o[1]); ctx.moveTo(o[0], 0); ctx.lineTo(o[0], H); ctx.stroke();
+
+  // --- 이전 경로 잔상 ---
+  if (S.ghost > 0) {
+    for (let g = S.ghost; g >= 1; g--) {
+      const p = S.paths[S.sel - g];
+      if (!p || !p.x.length) continue;
+      ctx.strokeStyle = `rgba(120,140,170,${0.10 + 0.16 * (1 - g / (S.ghost + 1))})`;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (let i = 0; i < p.x.length; i++) {
+        const q = w2s(p.x[i], p.y[i], W, H);
+        i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]);
+      }
+      ctx.stroke();
+    }
+  }
+
+  // --- 같은 경로에서 나온 κ 원호들 ---
+  if (sel && S.showArcs && sel.curvs.length) {
+    const sMax = sel.x.length ? pathArcLen(sel) : 30;
+    sel.curvs.forEach((c, i) => {
+      const k = c[S.series];
+      if (!Number.isFinite(k)) return;
+      const hot = (S.hover === i);
+      ctx.strokeStyle = sampleColor(i, sel.curvs.length, hot ? 1 : 0.55);
+      ctx.lineWidth = hot ? 2.5 : 1.2;
+      ctx.setLineDash(hot ? [] : [5, 3]);
+      ctx.beginPath();
+      arcPoints(k, sMax).forEach((pt, j) => {
+        const q = w2s(pt[0], pt[1], W, H);
+        j ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]);
+      });
+      ctx.stroke();
+    });
+    ctx.setLineDash([]);
+  }
+
+  // --- 선택 경로 ---
+  if (sel && sel.x.length) {
+    ctx.strokeStyle = '#ffd166'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < sel.x.length; i++) {
+      const q = w2s(sel.x[i], sel.y[i], W, H);
+      i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]);
+    }
+    ctx.stroke();
+    if (S.showPts) {
+      ctx.fillStyle = '#ffe9ad';
+      for (let i = 0; i < sel.x.length; i++) {
+        const q = w2s(sel.x[i], sel.y[i], W, H);
+        ctx.beginPath(); ctx.arc(q[0], q[1], 1.8, 0, 6.2832); ctx.fill();
+      }
+      // 10점마다 인덱스
+      ctx.fillStyle = '#8b7a4a';
+      for (let i = 0; i < sel.x.length; i += 10) {
+        const q = w2s(sel.x[i], sel.y[i], W, H);
+        ctx.fillText(String(i), q[0] + 4, q[1] - 3);
+      }
+    }
+    // goal 점 (hover 중인 계산의 i_goal)
+    const hc = sel.curvs[S.hover >= 0 ? S.hover : 0];
+    if (hc && hc.iGoal >= 0 && hc.iGoal < sel.x.length) {
+      const q = w2s(sel.x[hc.iGoal], sel.y[hc.iGoal], W, H);
+      ctx.strokeStyle = '#4fd1ff'; ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(o[0], o[1]); ctx.lineTo(q[0], q[1]); ctx.stroke();
+      ctx.beginPath(); ctx.arc(q[0], q[1], 5, 0, 6.2832); ctx.stroke();
+      ctx.fillStyle = '#4fd1ff';
+      ctx.fillText(`goal i=${hc.iGoal} L_d=${hc.L.toFixed(1)}m`, q[0] + 8, q[1] + 3);
+    }
+  }
+
+  // --- 차량 ---
+  ctx.fillStyle = '#e8eef7';
+  ctx.beginPath();
+  ctx.moveTo(o[0], o[1] - 9); ctx.lineTo(o[0] - 5, o[1] + 6); ctx.lineTo(o[0] + 5, o[1] + 6);
+  ctx.closePath(); ctx.fill();
+
+  drawLegend(sel);
+  $('plotTitle').textContent = 'XY 경로 (ego frame · x=전방↑ · y=좌측←)'
+    + (S.view.stretch > 1.01 ? `  ·  y축 ${S.view.stretch.toFixed(1)}× 확대` : '  ·  실제 비율');
+  $('xyHint').textContent = sel
+    ? `경로 #${sel.id}${sel.src ? ` · src=${sel.src}` : ''} · N=${sel.x.length || sel.N}`
+      + ` · t=+${(sel.t - S.t0).toFixed(2)}s · 이 경로로 계산된 κ ${sel.curvs.length}회`
+    : '';
+}
+
+function drawLegend(sel) {
+  const el = $('legend');
+  if (!sel) { el.innerHTML = ''; return; }
+  const rows = [`<div style="color:#ffd166">경로 #${sel.id}${sel.src ? ` [${sel.src}]` : ''}`
+    + ` — κ(${SERIES_LABEL[S.series]}) ${sel.curvs.length}회</div>`];
+  sel.curvs.forEach((c, i) => {
+    const k = c[S.series];
+    rows.push(`<div style="color:${sampleColor(i, sel.curvs.length)}">`
+      + `${String(i).padStart(2, ' ')}. +${((c.t - sel.t) * 1000).toFixed(0).padStart(4, ' ')}ms  `
+      + `κ=${fmtK(k, 5)}</div>`);
+  });
+  if (sel.curvs.length) {
+    const st = stats(sel.curvs.map((c) => c[S.series]));
+    if (st.n) rows.push(`<div style="color:#8b97a8">평균 ${fmtK(st.mean)} · 폭 ${(st.max - st.min).toExponential(2)}</div>`);
+  }
+  el.innerHTML = rows.join('');
+}
+
+// ---------- κ 시계열 ----------
+let tsGeom = null;
+function drawTS() {
+  const cv = $('ts');
+  const {ctx, W, H} = prep(cv);
+  if (!S.curvs.length) { tsGeom = null; return; }
+  const L = 46, R = 8, T = 8, B = 15;
+  const t0 = S.curvs[0].t, t1 = S.curvs[S.curvs.length - 1].t || t0 + 1;
+  const st = S.stats[S.series] || {};
+  if (!st.n) {
+    ctx.fillStyle = '#8b97a8'; ctx.fillText(`${SERIES_LABEL[S.series]}: 데이터 없음`, L, H / 2);
+    tsGeom = null; return;
+  }
+  let vmin = st.min, vmax = st.max;
+  const pad = Math.max((vmax - vmin) * 0.08, 1e-4);
+  vmin -= pad; vmax += pad;
+  const X = (t) => L + (t - t0) / (t1 - t0 || 1) * (W - L - R);
+  const Y = (v) => T + (vmax - v) / (vmax - vmin) * (H - T - B);
+  tsGeom = {L, R, T, B, t0, t1, W, H, X};
+
+  // 경로별 세로 띠 (같은 경로 = 같은 띠)
+  S.paths.forEach((p, i) => {
+    if (!p.curvs.length) return;
+    const fill = (i === S.sel) ? 'rgba(255,209,102,.20)' : (i % 2 ? 'rgba(255,255,255,.035)' : null);
+    if (!fill) return;
+    const a = X(p.curvs[0].t), b = X(p.curvs[p.curvs.length - 1].t) + 1.5;
+    ctx.fillStyle = fill;
+    ctx.fillRect(a, T, Math.max(b - a, 1), H - T - B);
+  });
+
+  // 축
+  ctx.strokeStyle = '#2a3240'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(L, T); ctx.lineTo(L, H - B); ctx.lineTo(W - R, H - B); ctx.stroke();
+  ctx.fillStyle = '#5c6878';
+  ctx.beginPath(); ctx.setLineDash([3, 3]); ctx.strokeStyle = '#3a4557';
+  ctx.moveTo(L, Y(0)); ctx.lineTo(W - R, Y(0)); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillText(fmtK(vmax, 4), 2, T + 8);
+  ctx.fillText(fmtK(vmin, 4), 2, H - B - 1);
+  ctx.fillText('0', 2, Y(0) + 3);
+  ctx.fillText(`+${(t1 - t0).toFixed(0)}s`, W - R - 26, H - 3);
+  ctx.fillText('0s', L + 2, H - 3);
+
+  // 값
+  ctx.strokeStyle = '#4fd1ff'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  let started = false;
+  for (const c of S.curvs) {
+    const v = c[S.series];
+    if (!Number.isFinite(v)) { started = false; continue; }
+    const x = X(c.t), y = Y(v);
+    started ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    started = true;
+  }
+  ctx.stroke();
+
+  // 선택 경로 강조
+  const sel = S.paths[S.sel];
+  if (sel && sel.curvs.length) {
+    ctx.strokeStyle = '#ffd166'; ctx.lineWidth = 2;
+    ctx.beginPath(); started = false;
+    for (const c of sel.curvs) {
+      const v = c[S.series];
+      if (!Number.isFinite(v)) { started = false; continue; }
+      const x = X(c.t), y = Y(v);
+      started ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+      started = true;
+    }
+    ctx.stroke();
+    ctx.fillStyle = '#ffd166';
+    sel.curvs.forEach((c) => {
+      const v = c[S.series];
+      if (Number.isFinite(v)) { ctx.beginPath(); ctx.arc(X(c.t), Y(v), 2.4, 0, 6.2832); ctx.fill(); }
+    });
+  }
+  // 평균선
+  ctx.strokeStyle = 'rgba(255,122,133,.75)'; ctx.setLineDash([6, 4]);
+  ctx.beginPath(); ctx.moveTo(L, Y(st.mean)); ctx.lineTo(W - R, Y(st.mean)); ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+// ---------- κ 분포 ----------
+function drawHist() {
+  const cv = $('hist');
+  const {ctx, W, H} = prep(cv);
+  const st = S.stats[S.series];
+  if (!st || !st.n) {
+    ctx.fillStyle = '#8b97a8'; ctx.fillText('데이터 없음', 8, H / 2); return;
+  }
+  const h = histogram(S.curvs.map((c) => c[S.series]), S.bins);
+  if (!h) return;
+  const L = 34, R = 8, T = 10, B = 26;
+  const X = (v) => L + (v - h.lo) / (h.hi - h.lo || 1) * (W - L - R);
+  const f = S.histLog ? ((n) => Math.log1p(n)) : ((n) => n);
+  const Y = (n) => T + (1 - f(n) / f(h.peak)) * (H - T - B);
+
+  ctx.strokeStyle = '#2a3240';
+  ctx.beginPath(); ctx.moveTo(L, T); ctx.lineTo(L, H - B); ctx.lineTo(W - R, H - B); ctx.stroke();
+
+  const bw = (W - L - R) / h.bins.length;
+  h.bins.forEach((n, i) => {
+    if (!n) return;
+    const x = L + i * bw, y = Y(n);
+    const mid = h.lo + (i + 0.5) * h.w;
+    ctx.fillStyle = mid >= 0 ? 'rgba(91,214,138,.72)' : 'rgba(255,122,133,.72)';
+    ctx.fillRect(x + 0.4, y, Math.max(bw - 0.8, 1), H - B - y);
+  });
+
+  // 평균 / 중앙값
+  const vline = (v, color, label, dy) => {
+    if (!Number.isFinite(v)) return;
+    const x = X(v);
+    ctx.strokeStyle = color; ctx.lineWidth = 1.4; ctx.setLineDash([4, 3]);
+    ctx.beginPath(); ctx.moveTo(x, T); ctx.lineTo(x, H - B); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = color; ctx.fillText(label, Math.min(x + 3, W - 76), T + dy);
+  };
+  vline(st.mean, '#ff7a85', `평균 ${fmtK(st.mean)}`, 9);
+  vline(st.med, '#ffb454', `중앙 ${fmtK(st.med)}`, 21);
+  vline(0, '#55627a', '', 0);
+
+  // 선택 경로 샘플 위치 눈금
+  const sel = S.paths[S.sel];
+  if (sel) {
+    sel.curvs.forEach((c, i) => {
+      const v = c[S.series];
+      if (!Number.isFinite(v)) return;
+      const x = X(Math.min(Math.max(v, h.lo), h.hi));
+      ctx.strokeStyle = sampleColor(i, sel.curvs.length); ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.moveTo(x, H - B); ctx.lineTo(x, H - B + 7); ctx.stroke();
+    });
+  }
+  ctx.fillStyle = '#5c6878'; ctx.lineWidth = 1;
+  ctx.fillText(fmtK(h.lo, 4), L, H - 4);
+  ctx.fillText(fmtK(h.hi, 4), W - R - 48, H - 4);
+  ctx.fillText(`n=${h.n}  bin=${h.w.toExponential(1)}  peak=${h.peak}${S.histLog ? '  (log)' : ''}`, L + 4, T + 9 + 24);
+  ctx.fillText('아래 눈금 = 선택 경로의 계산들', L + 4, H - 14);
+}
+
+// ---------- 통계 표 ----------
+function drawStats() {
+  const box = $('statsBox');
+  if (!S.curvs.length) { box.innerHTML = '<div class="muted">로그 없음</div>'; return; }
+  const ROWS = [
+    ['n', (st) => st.n, false], ['평균', (st) => st.mean, true], ['|평균|', (st) => st.absMean, false],
+    ['σ', (st) => st.std, false], ['중앙값', (st) => st.med, true],
+    ['p5', (st) => st.p5, true], ['p95', (st) => st.p95, true],
+    ['min', (st) => st.min, true], ['max', (st) => st.max, true],
+  ];
+  let h = '<table class="st"><thead><tr><th class="l"></th>'
+    + SERIES.map((s) => `<th${s === S.series ? ' style="color:var(--accent)"' : ''}>`
+        + `${s === 'sm' ? 'sm' : s === 'comma' ? 'comma' : s === 'pp' ? 'pp' : 'alpasim'}</th>`).join('')
+    + '</tr></thead><tbody>';
+  for (const [label, get, sign] of ROWS) {
+    h += `<tr><td class="l muted">${label}</td>`;
+    for (const s of SERIES) {
+      const st = S.stats[s];
+      if (!st || !st.n) { h += '<td class="nan">-</td>'; continue; }
+      const v = get(st);
+      h += label === 'n' ? `<td>${v}</td>` : `<td class="${sign ? cls(v) : ''}">${fmtK(v, 4)}</td>`;
+    }
+    h += '</tr>';
+  }
+  h += '</tbody></table>';
+
+  const sel = S.paths[S.sel];
+  if (sel && sel.curvs.length) {
+    const st = stats(sel.curvs.map((c) => c[S.series]));
+    h += `<div style="margin-top:6px" class="muted">선택 경로 #${sel.id} (${SERIES_LABEL[S.series]}, ${sel.curvs.length}회)</div>`
+      + '<table class="st"><tbody>'
+      + `<tr><td class="l">평균</td><td>${fmtK(st.mean)}</td><td class="l">표준편차</td><td>${fmtK(st.std)}</td></tr>`
+      + `<tr><td class="l">최소</td><td>${fmtK(st.min)}</td><td class="l">최대</td><td>${fmtK(st.max)}</td></tr>`
+      + `<tr><td class="l">폭(max-min)</td><td colspan="3">${Number.isFinite(st.max) ? (st.max - st.min).toExponential(3) : '-'}</td></tr>`
+      + '</tbody></table>';
+  }
+
+  // 경로당 계산 횟수 분포
+  const counts = S.paths.map((p) => p.curvs.length);
+  const cs = stats(counts);
+  const hist = {};
+  counts.forEach((c) => { hist[c] = (hist[c] || 0) + 1; });
+  const top = Object.keys(hist).map(Number).sort((a, b) => a - b)
+    .map((k) => `${k}회×${hist[k]}`).join(' · ');
+  h += `<div style="margin-top:6px" class="muted">경로당 κ 계산 횟수: 평균 ${cs.mean ? cs.mean.toFixed(2) : '-'} `
+    + `(최소 ${cs.min} / 최대 ${cs.max})<br>${top}</div>`;
+  box.innerHTML = h;
+}
+
+// ---------- 경로 목록 ----------
+function drawPathList() {
+  const el = $('pathList');
+  if (!S.paths.length) { el.innerHTML = '<div class="muted" style="padding:6px">-</div>'; return; }
+  const rows = S.paths.map((p, i) => {
+    const st = stats(p.curvs.map((c) => c[S.series]));
+    const k = st.n ? fmtK(st.mean, 4) : '-';
+    return `<div class="prow${i === S.sel ? ' sel' : ''}${p.missing ? ' nop' : ''}" data-i="${i}">`
+      + `<span class="pid">#${p.id}</span>`
+      + `<span class="pt">${(p.t - S.t0).toFixed(2)}s</span>`
+      + `<span class="pn">N${p.x.length || p.N}</span>`
+      + `<span class="pc">×${p.curvs.length}</span>`
+      + `<span class="pk ${cls(st.mean)}">${k}</span></div>`;
+  });
+  el.innerHTML = rows.join('');
+}
+
+function scrollPathIntoView() {
+  const row = $('pathList').querySelector('.prow.sel');
+  if (row) row.scrollIntoView({block: 'nearest'});
+}
+
+// ---------- 선택 경로의 curvature 표 ----------
+const COLS = [
+  ['#', 'k'], ['t(+s)', 't'], ['Δt(ms)', 'dt'], ['frame', 'frame'], ['src', 'src'], ['mode', 'mode'],
+  ['v_ego', 'v'], ['κ sm', 'sm'], ['κ comma', 'comma'], ['κ pp', 'pp'], ['κ alpasim', 'alpasim'],
+  ['i_goal', 'iGoal'], ['L_d(m)', 'L'], ['solve(ms)', 'solve'], ['cte(m)', 'cte'],
+];
+function drawCurvTable() {
+  const thead = $('curvTable').tHead, tbody = $('curvTable').tBodies[0];
+  thead.innerHTML = '<tr>' + COLS.map(([h, k]) =>
+    `<th class="${(k === 'mode' || k === 'src') ? 'l' : ''}">${h}</th>`).join('') + '</tr>';
+  const sel = S.paths[S.sel];
+  if (!sel) { tbody.innerHTML = ''; return; }
+  tbody.innerHTML = sel.curvs.map((c, i) => {
+    const dt = ((c.t - sel.t) * 1000).toFixed(0);
+    const cell = (k) => {
+      if (k === 'k') return `<td><span class="swatch" style="background:${sampleColor(i, sel.curvs.length)}"></span>${i}</td>`;
+      if (k === 't') return `<td>${(c.t - S.t0).toFixed(3)}</td>`;
+      if (k === 'dt') return `<td>${dt}</td>`;
+      if (k === 'mode') return `<td class="l">${c.mode}</td>`;
+      if (k === 'src') return `<td class="l">${c.src || '-'}</td>`;
+      if (k === 'frame' || k === 'iGoal') return `<td>${c[k]}</td>`;
+      if (['sm', 'comma', 'pp', 'alpasim'].includes(k)) {
+        const bold = k === S.series ? 'font-weight:600;text-decoration:underline' : '';
+        return `<td class="${cls(c[k])}" style="${bold}">${fmtK(c[k], 5)}</td>`;
+      }
+      const v = c[k];
+      return `<td>${Number.isFinite(v) ? v.toFixed(2) : '-'}</td>`;
+    };
+    return `<tr data-i="${i}">` + COLS.map(([, k]) => cell(k)).join('') + '</tr>';
+  }).join('');
+}
+
+// ---------- 요약 ----------
+function drawSummary(extra) {
+  const st = S.stats[S.series] || {};
+  const dur = S.curvs.length ? (S.curvs[S.curvs.length - 1].t - S.curvs[0].t) : 0;
+  const nPts = S.paths.reduce((a, p) => a + (p.x.length ? 1 : 0), 0);
+  $('summary').innerHTML = [
+    `<span>파일 <b>${S.fileName || '-'}</b></span>`,
+    `<span>길이 <b>${dur.toFixed(1)}s</b></span>`,
+    `<span>경로 <b>${S.paths.length}</b> (점 있음 ${nPts})</span>`,
+    `<span>κ 계산 <b>${S.curvs.length}</b> (경로당 <b>${S.paths.length ? (S.curvs.length / S.paths.length).toFixed(1) : '-'}</b>회)</span>`,
+    `<span class="k">${SERIES_LABEL[S.series]}</span>`,
+    `<span>평균 <b>${fmtK(st.mean)}</b></span>`,
+    `<span>|평균| <b>${fmtK(st.absMean)}</b></span>`,
+    `<span>σ <b>${fmtK(st.std)}</b></span>`,
+    `<span>범위 <b>${fmtK(st.min)} ~ ${fmtK(st.max)}</b></span>`,
+    extra ? `<span class="muted">${extra}</span>` : '',
+  ].join('');
+}
+
+function redrawAll() { drawXY(); drawTS(); drawHist(); drawStats(); }
+function redrawSelection() { drawPathList(); drawCurvTable(); drawSummary(S._extra); redrawAll(); }
+
+function selectPath(i, scroll) {
+  if (!S.paths.length) return;
+  S.sel = Math.max(0, Math.min(S.paths.length - 1, i));
+  S.hover = -1;
+  if (S.autoFit) {
+    const sel = S.paths[S.sel];
+    fitView(sel && sel.x.length ? [sel] : S.paths);
+  }
+  drawPathList(); drawCurvTable(); redrawAll();
+  if (scroll) scrollPathIntoView();
+}
+
+// ---------- 로드 ----------
+function loadText(name, text) {
+  const r = parseLog(text);
+  S.fileName = name;
+  S.paths = r.paths; S.curvs = r.curvs; S.byId = r.byId;
+  const firstTs = [];
+  if (S.curvs.length) firstTs.push(S.curvs[0].t);
+  if (S.paths.length) firstTs.push(S.paths[0].t);
+  S.t0 = firstTs.length ? Math.min(...firstTs) : 0;
+  S.stats = {};
+  for (const s of SERIES) S.stats[s] = stats(S.curvs.map((c) => c[s]));
+  S._extra = [
+    r.truncated ? `잘린 PATH ${r.truncated}줄` : '',
+    r.badPath ? `파싱실패 ${r.badPath}줄` : '',
+  ].filter(Boolean).join(' · ');
+  const firstWithPts = S.paths.findIndex((p) => p.x.length > 0);
+  S.sel = firstWithPts >= 0 ? firstWithPts : 0; S.hover = -1;
+  // 경로 하나하나는 30~40m 인데 드물게 크게 튀는 경로가 있어서 전체 union 으로
+  // 맞추면 지나치게 축소된다. 선택 경로 기준으로 맞춘다 (fit 버튼/자동맞춤으로 갱신).
+  fitView(S.paths[S.sel] && S.paths[S.sel].x.length ? [S.paths[S.sel]] : S.paths);
+  drawPathList(); drawCurvTable(); drawSummary(S._extra); redrawAll();
+  if (!S.curvs.length && !S.paths.length) {
+    $('err').textContent = 'PATH/CURV 줄을 찾지 못했습니다. udp_bridge_debug_*.log 가 맞는지 확인하세요.';
+  } else { $('err').textContent = ''; }
+}
+
+async function refreshFileList(pick) {
+  try {
+    const res = await fetch('/api/logs');
+    if (!res.ok) throw new Error(res.status);
+    const j = await res.json();
+    const sel = $('fileSel');
+    sel.innerHTML = j.logs.map((f) => {
+      const d = new Date(f.mtime * 1000).toLocaleString('ko-KR', {hour12: false});
+      return `<option value="${f.name}">${f.name}  ·  ${(f.size / 1024).toFixed(0)}KB  ·  ${d}</option>`;
+    }).join('') || '<option value="">(로그 없음)</option>';
+    if (pick && j.logs.length) { sel.value = j.logs[0].name; await loadFromServer(sel.value); }
+  } catch (e) {
+    $('fileSel').innerHTML = '<option value="">(서버 없음 — 파일을 드래그하세요)</option>';
+  }
+}
+
+async function loadFromServer(name) {
+  if (!name) return;
+  $('err').textContent = '';
+  try {
+    const res = await fetch('/api/log?name=' + encodeURIComponent(name));
+    if (!res.ok) throw new Error(await res.text());
+    loadText(name, await res.text());
+  } catch (e) { $('err').textContent = '로드 실패: ' + e.message; }
+}
+
+function loadFile(file) {
+  const fr = new FileReader();
+  fr.onload = () => loadText(file.name, String(fr.result));
+  fr.readAsText(file);
+}
+
+// ---------- UI 배선 ----------
+$('fileSel').addEventListener('change', (e) => loadFromServer(e.target.value));
+$('reload').addEventListener('click', () => refreshFileList(false));
+$('fileInput').addEventListener('change', (e) => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+$('seriesSel').addEventListener('change', (e) => { S.series = e.target.value; redrawSelection(); });
+$('cbAutoFit').addEventListener('change', (e) => { S.autoFit = e.target.checked; if (S.autoFit) $('fitBtn').click(); });
+$('stretchSel').addEventListener('change', (e) => { S.stretchMode = e.target.value; $('fitBtn').click(); });
+$('cbLog').addEventListener('change', (e) => { S.histLog = e.target.checked; drawHist(); });
+$('cbArc').addEventListener('change', (e) => { S.showArcs = e.target.checked; drawXY(); });
+$('cbPts').addEventListener('change', (e) => { S.showPts = e.target.checked; drawXY(); });
+$('ghostN').addEventListener('change', (e) => { S.ghost = Math.max(0, +e.target.value || 0); drawXY(); });
+$('binsN').addEventListener('change', (e) => { S.bins = Math.max(5, Math.min(200, +e.target.value || 40)); drawHist(); });
+$('fitBtn').addEventListener('click', () => {
+  const sel = S.paths[S.sel];
+  fitView(sel && sel.x.length ? [sel] : S.paths);
+  drawXY();
+});
+$('findPath').addEventListener('change', (e) => {
+  const id = parseInt(String(e.target.value).replace('#', ''), 10);
+  if (!Number.isFinite(id)) return;
+  const i = S.paths.findIndex((p) => p.id === id);
+  if (i >= 0) selectPath(i, true);
+});
+
+$('pathList').addEventListener('click', (e) => {
+  const row = e.target.closest('.prow');
+  if (row) selectPath(+row.dataset.i, false);
+});
+
+const tbody = () => $('curvTable').tBodies[0];
+tbody().addEventListener('mouseover', (e) => {
+  const tr = e.target.closest('tr');
+  if (!tr) return;
+  const i = +tr.dataset.i;
+  if (i !== S.hover) { S.hover = i; drawXY(); }
+});
+tbody().addEventListener('mouseleave', () => { S.hover = -1; drawXY(); });
+
+// 시계열 클릭 → 해당 시각의 경로 선택
+$('ts').addEventListener('click', (e) => {
+  if (!tsGeom || !S.curvs.length) return;
+  const r = e.currentTarget.getBoundingClientRect();
+  const x = e.clientX - r.left;
+  const frac = (x - tsGeom.L) / (tsGeom.W - tsGeom.L - tsGeom.R);
+  const t = tsGeom.t0 + frac * (tsGeom.t1 - tsGeom.t0);
+  let best = 0, bd = Infinity;
+  S.paths.forEach((p, i) => {
+    if (!p.curvs.length) return;
+    const d = Math.abs(p.curvs[0].t - t);
+    if (d < bd) { bd = d; best = i; }
+  });
+  selectPath(best, true);
+});
+
+// XY 팬 / 줌
+(function () {
+  const cv = $('xy');
+  let dragging = false, lastX = 0, lastY = 0;
+  cv.addEventListener('mousedown', (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; cv.classList.add('drag'); });
+  window.addEventListener('mouseup', () => { dragging = false; cv.classList.remove('drag'); });
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging || !S.view) return;
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    S.view.wy -= dx / (S.view.scale * S.view.stretch);
+    S.view.wx += dy / S.view.scale;
+    drawXY();
+  });
+  cv.addEventListener('wheel', (e) => {
+    if (!S.view) return;
+    e.preventDefault();
+    const r = cv.getBoundingClientRect();
+    const W = cv.clientWidth, H = cv.clientHeight;
+    const mx = e.clientX - r.left, my = e.clientY - r.top;
+    const before = s2w(mx, my, W, H);
+    const f = Math.exp(-e.deltaY * 0.0015);
+    S.view.scale = Math.max(0.5, Math.min(400, S.view.scale * f));
+    const after = s2w(mx, my, W, H);
+    S.view.wx += before[0] - after[0];
+    S.view.wy += before[1] - after[1];
+    drawXY();
+  }, {passive: false});
+})();
+
+// 드래그&드롭
+window.addEventListener('dragover', (e) => { e.preventDefault(); $('drop').classList.add('hot'); });
+window.addEventListener('dragleave', () => $('drop').classList.remove('hot'));
+window.addEventListener('drop', (e) => {
+  e.preventDefault(); $('drop').classList.remove('hot');
+  const f = e.dataTransfer.files[0];
+  if (f) loadFile(f);
+});
+
+// 키보드: ←/→ 경로 이동, ↑/↓ 10개씩, space 자동재생
+let playTimer = null;
+window.addEventListener('keydown', (e) => {
+  const ae = document.activeElement;
+  if (ae && ['INPUT', 'SELECT', 'TEXTAREA'].includes(ae.tagName)) return;
+  if (e.key === 'ArrowRight') { selectPath(S.sel + 1, true); e.preventDefault(); }
+  else if (e.key === 'ArrowLeft') { selectPath(S.sel - 1, true); e.preventDefault(); }
+  else if (e.key === 'ArrowDown') { selectPath(S.sel + 10, true); e.preventDefault(); }
+  else if (e.key === 'ArrowUp') { selectPath(S.sel - 10, true); e.preventDefault(); }
+  else if (e.key === ' ') {
+    e.preventDefault();
+    if (playTimer) { clearInterval(playTimer); playTimer = null; }
+    else playTimer = setInterval(() => {
+      if (S.sel >= S.paths.length - 1) { clearInterval(playTimer); playTimer = null; return; }
+      selectPath(S.sel + 1, true);
+    }, 150);
+  }
+});
+
+let rid = null;
+new ResizeObserver(() => {
+  if (rid) cancelAnimationFrame(rid);
+  rid = requestAnimationFrame(() => { rid = null; redrawAll(); });
+}).observe(document.body);
+
+// 시작
+const qs = new URLSearchParams(location.search);
+refreshFileList(!qs.get('file')).then(() => {
+  const f = qs.get('file');
+  if (f) { $('fileSel').value = f; loadFromServer(f); }
+});
+</script>
+</body>
+</html>

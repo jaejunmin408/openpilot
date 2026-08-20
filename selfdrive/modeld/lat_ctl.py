@@ -12,6 +12,9 @@ udp_bridge 는 manager 가 띄우는 프로세스라 stdin 이 터미널이 아�
 키:
   1 / 2 / 3   pure_pursuit / comma_mpc / alpasim_mpc 선택
   m           다음 제어기로 순환
+  p           reference path 소스 토글
+              alpamayo(외부 UDP 경로) ↔ comma_model(comma 비전모델 자체 경로)
+              제어기 선택과 직교한다 — 같은 제어기로 두 경로를 번갈아 비교할 수 있다.
   c           compare 토글 (비활성 MPC 도 매 loop 계산해 로그에 남김)
   x           활성 제어기 내부 상태 리셋
   q / Ctrl-C  종료
@@ -19,6 +22,8 @@ udp_bridge 는 manager 가 띄우는 프로세스라 stdin 이 터미널이 아�
 TTY 가 아니거나(파이프·스크립트) 일회성 조작만 필요하면 인자 모드를 쓴다:
   python lat_ctl.py --set comma_mpc
   python lat_ctl.py --cycle
+  python lat_ctl.py --source comma_model
+  python lat_ctl.py --toggle-source
   python lat_ctl.py --compare on
   python lat_ctl.py --status
 """
@@ -43,6 +48,23 @@ MODE_LABEL = {
     "comma_mpc": "comma MPC     (원본 lateral_mpc_lib, acados)",
     "alpasim_mpc": "alpasim MPC   (LinearMPC 이식, ADMM QP)",
 }
+SOURCES = ("alpamayo", "comma_model")
+SOURCE_LABEL = {
+    "alpamayo": "alpamayo     (외부 publisher 가 UDP 로 보내주는 경로)",
+    "comma_model": "comma_model  (comma 비전모델이 직접 뽑은 예측경로)",
+}
+
+
+def model_status_line(st):
+    """comma 모델경로 상태 한 줄. 소스가 comma_model 일 때 제어 가능 여부가 여기서 보인다."""
+    if not st.get("model_alive"):
+        return "모델경로: 수신 없음 (modeld 미발행 — 온로드/카메라 확인)"
+    line = (f"모델경로: age {fmt_num(st, 'model_age', '.3f')}s"
+            f"  N {fmt_num(st, 'model_n', 'd')}"
+            f"  전방 {fmt_num(st, 'model_range_m', '.1f')}m"
+            f"  κ {fmt_kappa(st.get('model_curv'))}")
+    reason = st.get("model_reason") or ""
+    return line + (f"  ⚠ {reason}" if reason else "  ok")
 
 
 def request(sock, addr, payload, timeout=REQUEST_TIMEOUT_S):
@@ -73,17 +95,17 @@ def fmt_num(st, key, fmt, default="—"):
 def render(st, addr, note=""):
     """상태 dict → 화면 문자열. 고정 높이라 커서를 올려 제자리 갱신한다."""
     w = 64
-    lines = [f"┌─ udp_bridge 횡제어기 ─{'─' * (w - 23)}┐"]
+    lines = [f"┌─ udp_bridge 횡제어 / 경로소스 ─{'─' * (w - 32)}┐"]
     if st is None:
         lines += [
             f"  대상 {addr[0]}:{addr[1]}   상태: 응답 없음",
             "",
             "  udp_bridge 가 떠 있지 않습니다. 온로드 상태인지 확인하세요",
             "  (manager 의 udp_bridge 는 only_onroad 프로세스입니다).",
-            "", "", "",
+            "", "", "", "", "", "", "",
         ]
     elif "error" in st:
-        lines += [f"  오류: {st['error']}", "", "", "", "", "", ""]
+        lines += [f"  오류: {st['error']}"] + [""] * 10
     else:
         mode = st.get("mode", "?")
         modes = st.get("modes", list(MODE_KEYS.values()))
@@ -94,6 +116,14 @@ def render(st, addr, note=""):
         for i, m in enumerate(modes, start=1):
             mark = "◀ 활성" if m == mode else "      "
             lines.append(f"   [{i}] {MODE_LABEL.get(m, m):<44} {mark}")
+        lines.append("")
+        # ── reference path 소스 ([p] 로 토글) ──
+        src = st.get("source", "?")
+        for sname in st.get("sources", list(SOURCES)):
+            mark = "◀ 활성" if sname == src else "      "
+            bullet = "●" if sname == src else "○"
+            lines.append(f"   [p] {bullet} {SOURCE_LABEL.get(sname, sname):<42} {mark}")
+        lines.append(f"       {model_status_line(st)}")
         lines.append("")
         if st.get("has_path"):
             lines.append(f"   κ 지령 {fmt_kappa(st.get('kappa_cmd'))}"
@@ -109,10 +139,12 @@ def render(st, addr, note=""):
             lines.append("")
         lines.append(f"   compare {'on ' if st.get('compare') else 'off'}"
                      f"   연속실패 {fmt_num(st, 'fail_streak', 'd', '0')}"
-                     f"   전환 {fmt_num(st, 'switch_count', 'd', '0')}회"
+                     f"   전환 {fmt_num(st, 'switch_count', 'd', '0')}/"
+                     f"{fmt_num(st, 'source_switch_count', 'd', '0')}회"
+                     f"   경로 #{fmt_num(st, 'path_seq', 'd', '0')}"
                      f"   수신 {fmt_num(st, 'pkts', 'd', '0')} 패킷")
     lines.append(f"└{'─' * (w - 1)}┘")
-    lines.append("  [1/2/3] 선택   [m] 순환   [c] compare   [x] 리셋   [q] 종료")
+    lines.append("  [1/2/3] 제어기   [m] 순환   [p] 경로소스   [c] compare   [x] 리셋   [q] 종료")
     lines.append(f"  {note}")
     return lines
 
@@ -146,6 +178,8 @@ def interactive(sock, addr):
                 st = request(sock, addr, {"cmd": "set", "mode": MODE_KEYS[key]})
             elif key in ("m", "M"):
                 st = request(sock, addr, {"cmd": "cycle"})
+            elif key in ("p", "P"):
+                st = request(sock, addr, {"cmd": "source"})
             elif key in ("c", "C"):
                 st = request(sock, addr, {"cmd": "compare"})
             elif key in ("x", "X"):
@@ -181,6 +215,9 @@ def main():
     g.add_argument("--set", dest="set_mode", choices=sorted(MODE_KEYS.values()),
                    help="제어기 지정 후 종료")
     g.add_argument("--cycle", action="store_true", help="다음 제어기로 순환 후 종료")
+    g.add_argument("--source", choices=SOURCES, help="reference path 소스 지정 후 종료")
+    g.add_argument("--toggle-source", action="store_true", dest="toggle_source",
+                   help="reference path 소스 토글 후 종료")
     g.add_argument("--compare", choices=("on", "off"), help="compare 토글 후 종료")
     g.add_argument("--reset", action="store_true", help="제어기 상태 리셋 후 종료")
     g.add_argument("--status", action="store_true", help="현재 상태만 출력")
@@ -193,6 +230,10 @@ def main():
         return one_shot(sock, addr, {"cmd": "set", "mode": args.set_mode})
     if args.cycle:
         return one_shot(sock, addr, {"cmd": "cycle"})
+    if args.source:
+        return one_shot(sock, addr, {"cmd": "source", "src": args.source})
+    if args.toggle_source:
+        return one_shot(sock, addr, {"cmd": "source"})
     if args.compare:
         return one_shot(sock, addr, {"cmd": "compare", "on": args.compare == "on"})
     if args.reset:
