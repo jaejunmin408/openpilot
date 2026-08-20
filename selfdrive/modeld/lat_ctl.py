@@ -12,9 +12,15 @@ udp_bridge 는 manager 가 띄우는 프로세스라 stdin 이 터미널이 아�
 키:
   1 / 2 / 3   pure_pursuit / comma_mpc / alpasim_mpc 선택
   m           다음 제어기로 순환
-  p           reference path 소스 토글
-              alpamayo(외부 UDP 경로) ↔ comma_model(comma 비전모델 자체 경로)
-              제어기 선택과 직교한다 — 같은 제어기로 두 경로를 번갈아 비교할 수 있다.
+  p           reference path 소스 순환
+              alpamayo(외부 UDP x,y 경로) → comma_model(comma 비전모델 자체 경로)
+              → alpa_action(외부 raw_action 직결)
+              제어기 선택과 직교한다 — 같은 제어기로 여러 경로를 번갈아 비교할 수 있다.
+  a           raw action 직결 ↔ 직전 경로소스 1키 토글
+              alpa_action 은 x,y 경로 대신 accel/curvature 시계열(6.4s@0.1s)을 받아
+              그 curvature 를 그대로 desiredCurvature 로 실어 latcontrol_torque 로
+              넘긴다. **pure pursuit / MPC 가 전혀 개입하지 않는다**(우회).
+              p 로 순환하면 비교 대상 사이에 세 번째 소스가 끼므로, A/B 는 이 키로.
   c           compare 토글 (비활성 MPC 도 매 loop 계산해 로그에 남김)
   x           활성 제어기 내부 상태 리셋
   q / Ctrl-C  종료
@@ -22,8 +28,9 @@ udp_bridge 는 manager 가 띄우는 프로세스라 stdin 이 터미널이 아�
 TTY 가 아니거나(파이프·스크립트) 일회성 조작만 필요하면 인자 모드를 쓴다:
   python lat_ctl.py --set comma_mpc
   python lat_ctl.py --cycle
-  python lat_ctl.py --source comma_model
+  python lat_ctl.py --source alpa_action
   python lat_ctl.py --toggle-source
+  python lat_ctl.py --raw-toggle
   python lat_ctl.py --compare on
   python lat_ctl.py --status
 """
@@ -48,11 +55,17 @@ MODE_LABEL = {
     "comma_mpc": "comma MPC     (원본 lateral_mpc_lib, acados)",
     "alpasim_mpc": "alpasim MPC   (LinearMPC 이식, ADMM QP)",
 }
-SOURCES = ("alpamayo", "comma_model")
+SOURCES = ("alpamayo", "comma_model", "alpa_action")
 SOURCE_LABEL = {
-    "alpamayo": "alpamayo     (외부 publisher 가 UDP 로 보내주는 경로)",
+    "alpamayo": "alpamayo     (외부 publisher 의 x,y 경로)",
     "comma_model": "comma_model  (comma 비전모델이 직접 뽑은 예측경로)",
+    "alpa_action": "alpa_action  (외부 raw_action 직결 — 제어기 우회)",
 }
+# 제어기를 우회하는 소스 (udp_bridge.BYPASS_SOURCES 와 같은 값). 상태 응답에
+# bypass_sources 가 오면 그걸 쓰고, 구버전 udp_bridge 면 이 기본값으로 표시한다.
+BYPASS_SOURCES = ("alpa_action",)
+SOURCE_KEY = {"alpa_action": "[a]"}      # 그 외는 [p]
+BODY_LINES = 15                          # 테두리 내부 줄 수 (짧은 화면도 여기까지 패딩)
 
 
 def model_status_line(st):
@@ -64,6 +77,27 @@ def model_status_line(st):
             f"  전방 {fmt_num(st, 'model_range_m', '.1f')}m"
             f"  κ {fmt_kappa(st.get('model_curv'))}")
     reason = st.get("model_reason") or ""
+    return line + (f"  ⚠ {reason}" if reason else "  ok")
+
+
+def action_status_line(st):
+    """raw_action 상태 한 줄. 소스가 alpa_action 일 때 제어 가능 여부가 여기서 보인다.
+
+    idx 는 시계열에서 지금 실어 보내는 점의 번호다. (패킷 나이 + lat_delay)/dt 로
+    고르므로, 패킷이 제때 오면 0~1 근처에 머물고 갱신이 밀리면 끝(N-1)까지 올라간다.
+    """
+    if not st.get("action_alive"):
+        return "raw action: 수신 없음 (publisher 가 raw_action 을 안 보냄)"
+    n = st.get("action_n")
+    idx = st.get("action_idx")
+    # a/v 는 publisher 필드 raw_accel_mps2 / accel_mps2 다. 후자는 이름과 달리 속도(m/s).
+    line = (f"raw action: age {fmt_num(st, 'action_age', '.3f')}s"
+            f"  idx {'—' if idx is None else idx}/{'—' if not n else n - 1}"
+            f"  κ {fmt_kappa(st.get('action_curv'))}"
+            f"  a {fmt_num(st, 'action_accel', '+.2f')}"
+            f"  v {fmt_num(st, 'action_v_ref', '.2f')}"
+            f"  delay {fmt_num(st, 'action_lat_delay', '.3f')}s")
+    reason = st.get("action_reason") or ""
     return line + (f"  ⚠ {reason}" if reason else "  ok")
 
 
@@ -95,58 +129,78 @@ def fmt_num(st, key, fmt, default="—"):
 def render(st, addr, note=""):
     """상태 dict → 화면 문자열. 고정 높이라 커서를 올려 제자리 갱신한다."""
     w = 64
-    lines = [f"┌─ udp_bridge 횡제어 / 경로소스 ─{'─' * (w - 32)}┐"]
+    body = []
     if st is None:
-        lines += [
+        body += [
             f"  대상 {addr[0]}:{addr[1]}   상태: 응답 없음",
             "",
             "  udp_bridge 가 떠 있지 않습니다. 온로드 상태인지 확인하세요",
             "  (manager 의 udp_bridge 는 only_onroad 프로세스입니다).",
-            "", "", "", "", "", "", "",
         ]
     elif "error" in st:
-        lines += [f"  오류: {st['error']}"] + [""] * 10
+        body += [f"  오류: {st['error']}"]
     else:
         mode = st.get("mode", "?")
         modes = st.get("modes", list(MODE_KEYS.values()))
-        lines.append(f"  대상 {addr[0]}:{addr[1]}   frame {fmt_num(st, 'frame', 'd')}"
-                     f"   loop {fmt_num(st, 'loop_ms', '.1f')}ms / 50ms"
-                     f"   {'engaged' if st.get('engaged') else 'disengaged'}")
-        lines.append("")
+        # 우회 소스에서는 제어기 선택이 무의미하다 (curvature 를 그대로 쓴다)
+        bypass = bool(st.get("bypass", st.get("source") in BYPASS_SOURCES))
+        body.append(f"  대상 {addr[0]}:{addr[1]}   frame {fmt_num(st, 'frame', 'd')}"
+                    f"   loop {fmt_num(st, 'loop_ms', '.1f')}ms / 50ms"
+                    f"   {'engaged' if st.get('engaged') else 'disengaged'}")
+        body.append("")
         for i, m in enumerate(modes, start=1):
-            mark = "◀ 활성" if m == mode else "      "
-            lines.append(f"   [{i}] {MODE_LABEL.get(m, m):<44} {mark}")
-        lines.append("")
-        # ── reference path 소스 ([p] 로 토글) ──
+            if m != mode:
+                mark = "      "
+            else:
+                mark = "◀ 우회 중" if bypass else "◀ 활성"
+            body.append(f"   [{i}] {MODE_LABEL.get(m, m):<44} {mark}")
+        body.append("")
+        # ── reference path 소스 ([p] 순환 / [a] raw action 토글) ──
         src = st.get("source", "?")
+        bypass_srcs = tuple(st.get("bypass_sources", BYPASS_SOURCES))
         for sname in st.get("sources", list(SOURCES)):
             mark = "◀ 활성" if sname == src else "      "
             bullet = "●" if sname == src else "○"
-            lines.append(f"   [p] {bullet} {SOURCE_LABEL.get(sname, sname):<42} {mark}")
-        lines.append(f"       {model_status_line(st)}")
-        lines.append("")
+            key = SOURCE_KEY.get(sname, "[p]") if sname in bypass_srcs else "[p]"
+            body.append(f"   {key} {bullet} {SOURCE_LABEL.get(sname, sname):<42} {mark}")
+        body.append(f"       {model_status_line(st)}")
+        body.append(f"       {action_status_line(st)}")
+        body.append("")
         if st.get("has_path"):
-            lines.append(f"   κ 지령 {fmt_kappa(st.get('kappa_cmd'))}"
-                         f"   v {fmt_num(st, 'v_ego', '.2f')} m/s"
-                         f"   cte {fmt_num(st, 'cte_m', '+.3f')} m"
-                         f"   solve {fmt_num(st, 'solve_ms', '.1f')}ms")
-            lines.append(f"   κ  pp  {fmt_kappa(st.get('kappa_pp'))}"
-                         f"   comma {fmt_kappa(st.get('kappa_comma'))}"
-                         f"   alpasim {fmt_kappa(st.get('kappa_alpasim'))}")
+            body.append(f"   κ 지령 {fmt_kappa(st.get('kappa_cmd'))}"
+                        f"   v {fmt_num(st, 'v_ego', '.2f')} m/s"
+                        f"   cte {fmt_num(st, 'cte_m', '+.3f')} m"
+                        f"   solve {fmt_num(st, 'solve_ms', '.1f')}ms")
+            if bypass:
+                # 제어기 출력이 없다 — 대신 그대로 실어 보낸 raw 값을 보여준다
+                body.append(f"   raw κ {fmt_kappa(st.get('action_curv'))}"
+                            f"   raw a {fmt_num(st, 'action_accel', '+.2f')} m/s²"
+                            f"   raw v {fmt_num(st, 'action_v_ref', '.2f')} m/s"
+                            f"   (pure pursuit / MPC 미사용)")
+            else:
+                body.append(f"   κ  pp  {fmt_kappa(st.get('kappa_pp'))}"
+                            f"   comma {fmt_kappa(st.get('kappa_comma'))}"
+                            f"   alpasim {fmt_kappa(st.get('kappa_alpasim'))}")
         else:
-            lines.append(f"   경로 수신 대기 중 (수신 {fmt_num(st, 'pkts', 'd')} 패킷)"
-                         f"   v {fmt_num(st, 'v_ego', '.2f')} m/s")
-            lines.append("")
-        lines.append(f"   compare {'on ' if st.get('compare') else 'off'}"
-                     f"   연속실패 {fmt_num(st, 'fail_streak', 'd', '0')}"
-                     f"   전환 {fmt_num(st, 'switch_count', 'd', '0')}/"
-                     f"{fmt_num(st, 'source_switch_count', 'd', '0')}회"
-                     f"   경로 #{fmt_num(st, 'path_seq', 'd', '0')}"
-                     f"   수신 {fmt_num(st, 'pkts', 'd', '0')} 패킷")
-    lines.append(f"└{'─' * (w - 1)}┘")
-    lines.append("  [1/2/3] 제어기   [m] 순환   [p] 경로소스   [c] compare   [x] 리셋   [q] 종료")
-    lines.append(f"  {note}")
-    return lines
+            what = "raw action" if bypass else "경로"
+            body.append(f"   {what} 수신 대기 중 (경로 {fmt_num(st, 'pkts', 'd')} / "
+                        f"action {fmt_num(st, 'action_pkts', 'd')} 패킷)"
+                        f"   v {fmt_num(st, 'v_ego', '.2f')} m/s")
+            body.append("")
+        body.append(f"   compare {'on ' if st.get('compare') else 'off'}"
+                    f"   연속실패 {fmt_num(st, 'fail_streak', 'd', '0')}"
+                    f"   전환 {fmt_num(st, 'switch_count', 'd', '0')}/"
+                    f"{fmt_num(st, 'source_switch_count', 'd', '0')}회"
+                    f"   경로 #{fmt_num(st, 'path_seq', 'd', '0')}"
+                    f"   수신 {fmt_num(st, 'pkts', 'd', '0')}/"
+                    f"{fmt_num(st, 'action_pkts', 'd', '0')} 패킷")
+    # 화면 높이를 고정한다 — 짧게 그리면 이전 프레임의 아래쪽 줄이 남는다
+    body += [""] * max(0, BODY_LINES - len(body))
+    return ([f"┌─ udp_bridge 횡제어 / 경로소스 ─{'─' * (w - 32)}┐"] + body
+            + [f"└{'─' * (w - 1)}┘",
+               "  [1/2/3] 제어기  [m] 순환  [p] 경로소스  [a] raw action  "
+               "[c] compare  [x] 리셋  [q] 종료",
+               f"  {note}"])
 
 
 def interactive(sock, addr):
@@ -180,6 +234,8 @@ def interactive(sock, addr):
                 st = request(sock, addr, {"cmd": "cycle"})
             elif key in ("p", "P"):
                 st = request(sock, addr, {"cmd": "source"})
+            elif key in ("a", "A"):
+                st = request(sock, addr, {"cmd": "raw_toggle"})
             elif key in ("c", "C"):
                 st = request(sock, addr, {"cmd": "compare"})
             elif key in ("x", "X"):
@@ -217,7 +273,9 @@ def main():
     g.add_argument("--cycle", action="store_true", help="다음 제어기로 순환 후 종료")
     g.add_argument("--source", choices=SOURCES, help="reference path 소스 지정 후 종료")
     g.add_argument("--toggle-source", action="store_true", dest="toggle_source",
-                   help="reference path 소스 토글 후 종료")
+                   help="reference path 소스 순환 후 종료")
+    g.add_argument("--raw-toggle", action="store_true", dest="raw_toggle",
+                   help="raw action 직결 ↔ 직전 경로소스 토글 후 종료")
     g.add_argument("--compare", choices=("on", "off"), help="compare 토글 후 종료")
     g.add_argument("--reset", action="store_true", help="제어기 상태 리셋 후 종료")
     g.add_argument("--status", action="store_true", help="현재 상태만 출력")
@@ -234,6 +292,8 @@ def main():
         return one_shot(sock, addr, {"cmd": "source", "src": args.source})
     if args.toggle_source:
         return one_shot(sock, addr, {"cmd": "source"})
+    if args.raw_toggle:
+        return one_shot(sock, addr, {"cmd": "raw_toggle"})
     if args.compare:
         return one_shot(sock, addr, {"cmd": "compare", "on": args.compare == "on"})
     if args.reset:

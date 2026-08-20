@@ -34,10 +34,19 @@ ego-frame JSON으로 보내준다.
                   버리던 plan/position 을 modelLanePath 로 발행하고, 여기서 그걸 받아
                   외부경로와 똑같은 형태의 path 로 만들어 같은 제어기에 물린다.
                   즉 "외부경로 추종" ↔ "comma 자체 주행" 을 같은 파이프라인에서 비교할 수 있다.
+  "alpa_action" — **제어기 우회.** 같은 외부 publisher 가 x,y 경로 대신 raw_action
+                  (accel_mps2, curvature) 시계열을 직접 보내주는 모드. 6.4s 를
+                  0.1s 간격으로 담은 64점이며, 그 curvature 를 그대로 desiredCurvature
+                  로 실어 latcontrol_torque 로 넘긴다. 중간 pure pursuit / MPC 가
+                  전혀 개입하지 않으므로 "모델 출력 그 자체" 의 주행을 볼 수 있다.
+                  단 latcontrol_torque 는 desired_curvature 를 "lat_delay 후 도달
+                  목표"(future_desired_lateral_accel)로 해석하므로, 시계열에서
+                  (패킷 나이 + lat_delay) 만큼 미래 시점의 값을 골라 짝을 맞춘다.
 
 전환 방법 (프로세스 재시작 불필요):
     python selfdrive/modeld/lat_ctl.py          # 터미널에서 키 입력으로 전환
-                                                #   1/2/3=제어기, p=경로 소스 토글
+                                                #   1/2/3=제어기, p=경로 소스 순환
+                                                #   a=raw action 직결 ↔ 직전 소스 토글
 udp_bridge 는 manager 가 띄우는 프로세스라 stdin 이 터미널이 아니다. 그래서 키
 입력은 lat_ctl.py 가 받아 UDP 제어 포트(LAT_CTL_PORT)로 명령을 보내는 구조다.
 같은 LAN 의 노트북에서 `--host <device-ip>` 로 원격 조작도 된다.
@@ -133,9 +142,13 @@ LAT_FAIL_FALLBACK_N = 10
 # "외부경로 추종" 과 "comma 자체 주행" 을 같은 조건에서 비교할 수 있다.
 #   "alpamayo"    — 외부 publisher 의 UDP reference path slice
 #   "comma_model" — modeld 가 발행하는 comma 비전모델 예측경로(modelLanePath)
-PATH_SOURCES = ("alpamayo", "comma_model")
+#   "alpa_action" — 같은 외부 publisher 의 raw_action(accel/curvature) 직결. 이 소스만
+#                   제어기를 우회한다(아래 RAW ACTION 절 참고).
+PATH_SOURCES = ("alpamayo", "comma_model", "alpa_action")
 DEFAULT_PATH_SOURCE = "alpamayo"
 PATH_SOURCE_FILE = "/data/udp_bridge_path_source"
+# 제어기(pure pursuit/MPC)를 쓰지 않는 소스. 여기 속한 소스에서는 제어기 선택이 무의미하다.
+BYPASS_SOURCES = ("alpa_action",)
 
 # comma 모델경로 신뢰 조건. 하나라도 어긋나면 path=None → 제어 정지(안전측).
 MODEL_PATH_MAX_AGE_S = 0.3     # modelLanePath 가 이보다 오래되면 버림
@@ -145,6 +158,40 @@ MODEL_PATH_MIN_RANGE_M = 2.0   # 전방 커버가 이보다 짧으면 버림 (�
 # 모델 예측경로는 이미 내부규약과 같은 프레임이라 변환이 필요 없다. 실차 검증된 값이며
 # -1.0 으로 두면 경로가 좌우로 뒤집혀 반대로 조향한다. 건드리지 말 것.
 MODEL_Y_TO_INTERNAL_SIGN = 1.0
+
+# ── RAW ACTION 직결 ("alpa_action" 소스) ─────────────
+# 외부 publisher 가 경로(pred_xyz) 대신 raw_action 시계열을 보내는 모드.
+#   packet: {"raw_action": {"accel_mps2": [...], "curvature": [...],
+#                           "raw_accel_mps2": [...]},
+#            "plan_dt_s": 0.1, "inference_time_s": 0.xx}
+# 6.4s / 0.1s = 64점을 기대하지만 길이는 패킷을 따른다(검증만 하고 강제하지 않음).
+#
+# **필드 이름 함정** (publisher 측 Handover.md §1.4/§4): `accel_mps2` 는 이름과 달리
+# 내용이 **속도 [m/s]** 이고, 실제 종가속도는 `raw_accel_mps2` 다. 그래서 아래에서
+# accel_mps2 → v_ref, raw_accel_mps2 → accel 로 이름을 바로잡아 담는다. 이름 그대로
+# 가속도로 믿고 종제어에 넣으면 (속도 4m/s 를 가속 4m/s² 로 읽어) 급가속이 된다.
+RAW_ACTION_V_KEY = 'accel_mps2'        # 실제 내용 = 속도 [m/s]
+RAW_ACTION_A_KEY = 'raw_accel_mps2'    # 실제 내용 = 종가속도 [m/s²] (없을 수 있음)
+RAW_ACTION_DT_S = 0.1          # plan_dt_s 가 없을 때 쓰는 기본 간격
+RAW_ACTION_MIN_N = 2           # 이보다 점이 적으면 버림
+# 마지막 raw_action 이 이보다 오래되면 버림 → 제어 정지. publisher 10Hz 기준으로
+# (추론지연 ~0.3s + 연속 3패킷 유실) 정도를 한도로 잡았다. 이보다 완만한 노화는
+# 시계열 인덱스가 앞으로 밀리는 것으로 자연히 흡수되고, horizon 을 넘기면 따로 걸린다.
+RAW_ACTION_MAX_AGE_S = 0.6
+# 시계열 인덱스 = (패킷 나이 + lat_delay) / dt.  latcontrol_torque 가 desired_curvature 를
+# "lat_delay 후 도달 목표"(future_desired_lateral_accel)로 해석하므로 미래값을 골라야 짝이 맞는다.
+RAW_ACTION_USE_LAT_DELAY = True
+RAW_ACTION_LAT_DELAY_MAX_S = 0.5   # liveDelay 가 튀어도 이 이상은 앞서 보지 않음
+# curvature 부호. Alpamayo raw_action 은 openpilot desiredCurvature(좌회전 +) 와 같은
+# 규약으로 확인됐다 — debug 브랜치에서 실차로 음수 부호를 걷어낸 결과값(5/15)이다.
+# 차가 반대로 조향하면 여기만 -1.0 으로 바꾸면 된다.
+RAW_ACTION_CURV_SIGN = 1.0
+RAW_ACTION_CURV_LIMIT = 0.2    # |κ| clip (pure pursuit / MPC 와 동일 한도)
+# 받은 종가속도(raw_accel_mps2)를 종방향 명령으로 쓸지. 초기엔 검증된 TARGET_SPEED
+# 유지 P 제어를 그대로 두고 받은 값은 로그·표시로만 본다 (debug 브랜치
+# LON_USE_FEEDFORWARD 와 동일 방침). 켜도 raw_accel_mps2 가 없는 패킷이면 자동으로
+# 속도유지 P 제어로 되돌아간다.
+RAW_ACTION_USE_ACCEL = False
 
 # ── comma MPC 파라미터 (삭제된 lateral_planner.py 원본 값) ──
 COMMA_PATH_COST = 1.0
@@ -221,6 +268,19 @@ def _as_float_or_none(value):
         return None
 
 
+def _fmt_opt(value, fmt, default="—"):
+    """None 이 올 수 있는 스칼라를 로그용으로 포맷."""
+    return default if value is None else format(value, fmt)
+
+
+def _fmt_opt_arr(arr, precision, default="—"):
+    """None 이 올 수 있는 배열을 로그용 한 줄로 포맷."""
+    if arr is None:
+        return default
+    return np.array2string(arr, precision=precision, separator=',',
+                           max_line_width=10 ** 6)
+
+
 def _packet_meta(d):
     header = d.get("packet_header") if isinstance(d.get("packet_header"), dict) else {}
     direct_header = d.get("header") if isinstance(d.get("header"), dict) else {}
@@ -251,11 +311,12 @@ def _packet_meta(d):
 
 
 # ── JSON 패킷 파싱 ───────────────────────────────────
-def parse_path_packet(data: bytes):
-    """{"pred_xyz": [[x,y,z], ...]} 형태 ego-frame slice 수신.
-    실패 시 None. 수신은 x=forward, y=right 규약이지만 내부적으로는
-    openpilot body frame(y=left)로 통일해서 반환한다.
-    """
+# 한 datagram 에 경로(pred_xyz)와 raw_action 이 같이 올 수도, 한쪽만 올 수도 있다.
+# 그래서 JSON 은 한 번만 디코드하고 두 빌더가 각자 자기 필드만 본다. 자기 필드가
+# 아예 없으면 조용히 None (그 소스를 안 쓰는 publisher 라는 뜻), 있는데 형태가
+# 틀리면 경고를 남긴다.
+def decode_packet(data: bytes):
+    """UDP 바이트 → JSON dict. 실패 시 None."""
     try:
         d = json.loads(data.decode())
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
@@ -264,11 +325,21 @@ def parse_path_packet(data: bytes):
     if not isinstance(d, dict):
         cloudlog.warning(f"udp_bridge: invalid JSON root type {type(d).__name__}")
         return None
+    return d
+
+
+def build_path_from_json(d):
+    """{"pred_xyz": [[x,y,z], ...]} 형태 ego-frame slice → path dict. 없거나 못 쓰면 None.
+    수신은 x=forward, y=right 규약이지만 내부적으로는 openpilot body frame(y=left)로
+    통일해서 반환한다.
+    """
+    if 'pred_xyz' not in d:
+        return None
 
     try:
         pred_xyz = np.asarray(d['pred_xyz'], dtype=np.float64)
-    except (KeyError, TypeError, ValueError) as e:
-        cloudlog.warning(f"udp_bridge: malformed packet ({e})")
+    except (TypeError, ValueError) as e:
+        cloudlog.warning(f"udp_bridge: malformed pred_xyz ({e})")
         return None
 
     if pred_xyz.ndim != 2 or pred_xyz.shape[1] < 2 or pred_xyz.shape[0] < 2:
@@ -284,6 +355,73 @@ def parse_path_packet(data: bytes):
         'y': y,
         'raw_y': raw_y,
         'N': int(x.shape[0]),
+        'meta': _packet_meta(d),
+    }
+
+
+def build_action_from_json(d, recv_mono_s):
+    """{"raw_action": {"curvature": [...], "accel_mps2": [...]}} → action dict. 못 쓰면 None.
+
+    curvature 는 부호만 내부규약(RAW_ACTION_CURV_SIGN)으로 맞춰 두고 clip·인덱스
+    선택은 제어 시점(build_action_command)에 한다. 시계열의 t=0 은 publisher 가
+    추론을 시작한 순간이므로 recv 시각에서 inference_time_s 를 빼서 기준시각을 잡는다.
+
+    accel_mps2 는 실제로 속도(m/s)라 v_ref 로, raw_accel_mps2 가 진짜 종가속도라
+    accel 로 담는다 (RAW_ACTION_V_KEY / RAW_ACTION_A_KEY 주석 참고). 종방향 필드는
+    없거나 길이가 안 맞아도 버리지 않는다 — 이 소스의 본체는 curvature 다.
+    """
+    ra = d.get('raw_action')
+    if not isinstance(ra, dict):
+        return None
+
+    try:
+        curv = np.asarray(ra['curvature'], dtype=np.float64)
+    except (KeyError, TypeError, ValueError) as e:
+        cloudlog.warning(f"udp_bridge: malformed raw_action.curvature ({e})")
+        return None
+
+    if curv.ndim != 1 or curv.shape[0] < RAW_ACTION_MIN_N:
+        cloudlog.warning(f"udp_bridge: bad raw_action.curvature shape {curv.shape}")
+        return None
+    if not np.all(np.isfinite(curv)):
+        cloudlog.warning("udp_bridge: raw_action.curvature 에 NaN/Inf 포함 → 버림")
+        return None
+
+    N = int(curv.shape[0])
+
+    def _lon_series(key):
+        """종방향 시계열 1개. 없거나 길이·값이 이상하면 None (횡제어는 계속한다)."""
+        if key not in ra:
+            return None
+        try:
+            arr = np.asarray(ra[key], dtype=np.float64)
+        except (TypeError, ValueError) as e:
+            cloudlog.warning(f"udp_bridge: malformed raw_action.{key} ({e})")
+            return None
+        if arr.ndim != 1 or arr.shape[0] != N:
+            cloudlog.warning(f"udp_bridge: raw_action.{key} 길이 불일치 "
+                             f"({arr.shape} vs curvature {N})")
+            return None
+        if not np.all(np.isfinite(arr)):
+            cloudlog.warning(f"udp_bridge: raw_action.{key} 에 NaN/Inf 포함 → 무시")
+            return None
+        return arr
+
+    dt_s = _as_float_or_none(d.get('plan_dt_s')) or RAW_ACTION_DT_S
+    if not (dt_s > 0.0):
+        dt_s = RAW_ACTION_DT_S
+    inference_time_s = _as_float_or_none(d.get('inference_time_s')) or 0.0
+
+    return {
+        'curv': RAW_ACTION_CURV_SIGN * curv,
+        'v_ref': _lon_series(RAW_ACTION_V_KEY),   # 속도 [m/s] (필드명은 accel_mps2)
+        'accel': _lon_series(RAW_ACTION_A_KEY),   # 종가속도 [m/s²]
+        'N': N,
+        'dt_s': float(dt_s),
+        'horizon_s': float(N * dt_s),
+        # 시계열 t=0 의 monotonic 기준시각 (추론 지연만큼 과거)
+        't0_mono_s': float(recv_mono_s - max(inference_time_s, 0.0)),
+        'inference_time_s': float(inference_time_s),
         'meta': _packet_meta(d),
     }
 
@@ -558,6 +696,10 @@ class LatModeState:
         self.switch_count = 0
         self.source_switch_count = 0
         self.last_cmd_from = None
+        # raw action 직결 ↔ 직전 경로소스 A/B 토글용. alpa_action 으로 들어가기 직전의
+        # 소스를 기억해 두면 [a] 한 번으로 되돌아올 수 있다.
+        self.prev_path_source = (DEFAULT_PATH_SOURCE if source in BYPASS_SOURCES
+                                 else source)
         # main loop 가 매 frame 채워 넣는 텔레메트리 (status 응답용)
         self.telemetry = {}
 
@@ -588,6 +730,8 @@ class LatModeState:
         if source == self.source:
             return True, f"already {source}"
         prev, self.source = self.source, source
+        if prev not in BYPASS_SOURCES:
+            self.prev_path_source = prev   # [a] 로 되돌아올 지점 기억
         self.source_switch_count += 1
         # reference 가 불연속으로 바뀌므로 제어기 누적 상태(x0/warm start)를 비운다
         self.reset_request = True
@@ -601,12 +745,30 @@ class LatModeState:
         nxt = PATH_SOURCES[(PATH_SOURCES.index(self.source) + 1) % len(PATH_SOURCES)]
         return self.set_source(nxt)
 
+    def toggle_raw_action(self):
+        """raw action 직결 ↔ 직전 경로소스 1키 토글 ([a]).
+
+        소스를 순환(toggle_source)하면 비교하려는 두 소스 사이에 세 번째가 끼어
+        주행 중 손이 많이 간다. 이 토글은 alpa_action 과 "직전에 쓰던 경로소스"
+        사이만 왕복하므로 A/B 를 한 키로 볼 수 있다.
+        """
+        if self.source in BYPASS_SOURCES:
+            return self.set_source(self.prev_path_source)
+        return self.set_source(BYPASS_SOURCES[0])
+
+    def bypass(self):
+        """현재 소스가 제어기를 우회하는지 (pure pursuit/MPC 미개입)."""
+        return self.source in BYPASS_SOURCES
+
     def status(self):
         st = {
             "mode": self.mode,
             "modes": list(LAT_MODES),
             "source": self.source,
             "sources": list(PATH_SOURCES),
+            "bypass_sources": list(BYPASS_SOURCES),
+            "bypass": self.bypass(),
+            "prev_source": self.prev_path_source,
             "compare": self.compare,
             "switch_count": self.switch_count,
             "source_switch_count": self.source_switch_count,
@@ -641,6 +803,8 @@ class LatModeState:
                         ok, msg = self.toggle_source()
                     else:
                         ok, msg = self.set_source(src)
+                elif cmd == "raw_toggle":
+                    ok, msg = self.toggle_raw_action()
                 elif cmd == "reset":
                     self.reset_request = True
                     msg = "controller state reset"
@@ -924,6 +1088,110 @@ def model_path_to_packet(model_path):
         "x": x, "y": y, "raw_y": -y, "N": int(x.shape[0]),
         "meta": {"udp_mode": "comma_model", "label": "modelLanePath",
                  "plan_seq": int(model_path["frame_id"])},
+    }
+
+
+# ── raw action 직결 (외부 raw_action → desiredCurvature) ─────
+def build_action_command(ext_action, now_mono_s, lat_delay_s):
+    """최신 raw_action 시계열에서 지금 실어야 할 (κ, accel) 을 뽑는다.
+
+    return (cmd|None, info). info 는 lat_ctl 표시·로그용 진단이고, cmd 가 None 일
+    때 그 이유(reason)를 담는다. cmd 가 None 이면 제어를 정지한다(안전측).
+
+    인덱스 선택: latcontrol_torque 는 desired_curvature 를 "lat_delay 후 도달 목표"
+    (future_desired_lateral_accel)로 해석한다. 그래서 시계열에서
+        t = (지금 - 시계열 t0) + lat_delay
+    지점의 값을 골라야 명령과 해석이 짝을 맞춘다. 패킷이 늦게 오거나 갱신이 밀리면
+    앞쪽 인덱스가 자동으로 소모되므로 별도의 보간·재정렬이 필요 없다.
+    """
+    info = {"alive": ext_action is not None, "age": None, "n": 0, "horizon_s": None,
+            "idx": None, "curv": None, "accel": None, "v_ref": None, "dt_s": None,
+            "lat_delay": float(lat_delay_s), "reason": ""}
+    if ext_action is None:
+        info["reason"] = "raw_action 수신 없음"
+        return None, info
+
+    age = now_mono_s - ext_action['t0_mono_s']
+    info["age"] = age
+    info["n"] = ext_action['N']
+    info["horizon_s"] = ext_action['horizon_s']
+    info["dt_s"] = ext_action['dt_s']
+
+    if age > RAW_ACTION_MAX_AGE_S:
+        info["reason"] = f"stale {age:.2f}s"
+        return None, info
+
+    delay = min(max(lat_delay_s, 0.0), RAW_ACTION_LAT_DELAY_MAX_S) if RAW_ACTION_USE_LAT_DELAY else 0.0
+    t_query = max(age, 0.0) + delay
+    idx = int(round(t_query / ext_action['dt_s']))
+    if idx > ext_action['N'] - 1:
+        # 시계열을 다 소모했다 = 새 패킷이 horizon 만큼 끊긴 것. 끝값을 붙들고 있으면
+        # 낡은 곡률로 계속 조향하므로 정지시킨다.
+        info["idx"] = ext_action['N'] - 1
+        info["reason"] = f"horizon 초과 (t={t_query:.2f}s > {ext_action['horizon_s']:.1f}s)"
+        return None, info
+    idx = max(idx, 0)
+
+    kappa = float(np.clip(ext_action['curv'][idx], -RAW_ACTION_CURV_LIMIT, RAW_ACTION_CURV_LIMIT))
+    # 종방향은 없을 수 있다 (횡제어와 독립). accel 만 clip 하고 v_ref 는 원값 그대로.
+    accel = (None if ext_action['accel'] is None
+             else float(np.clip(ext_action['accel'][idx], ACCEL_MIN, ACCEL_MAX)))
+    v_ref = None if ext_action['v_ref'] is None else float(ext_action['v_ref'][idx])
+    info["idx"] = idx
+    info["curv"] = kappa
+    info["accel"] = accel
+    info["v_ref"] = v_ref
+    return {"kappa": kappa, "accel": accel, "v_ref": v_ref, "idx": idx,
+            "t_query": t_query, "dt_s": ext_action['dt_s'], "N": ext_action['N']}, info
+
+
+def action_telemetry(action_info):
+    """build_action_command 의 info → lat_ctl 표시용 텔레메트리 키."""
+    return {
+        "action_alive": bool(action_info["alive"]),
+        "action_age": action_info["age"],
+        "action_n": action_info["n"],
+        "action_horizon_s": action_info["horizon_s"],
+        "action_idx": action_info["idx"],
+        "action_curv": action_info["curv"],
+        "action_accel": action_info["accel"],
+        "action_v_ref": action_info["v_ref"],
+        "action_lat_delay": action_info["lat_delay"],
+        "action_reason": action_info["reason"],
+    }
+
+
+def resample_action_for_viz(ext_action, v_ego, idx0=0):
+    """raw_action 의 curvature 시계열을 적분해 T_IDXS 33점 경로로 (viz only).
+
+    이 소스는 x,y 경로를 받지 않으므로, UI 에 그릴 경로가 없다. 명령 곡률을 현재
+    속도로 적분해 "지금 지시하고 있는 궤적" 을 만들어 보여준다 — 실제 제어에는
+    쓰이지 않지만 화면에서 곡률 지령을 눈으로 확인할 수 있다.
+    """
+    v = max(v_ego, 0.5)          # 정차 중엔 그림이 점으로 수축하니 최소 속도 가정
+    curv = ext_action['curv'][idx0:]
+    dt = ext_action['dt_s']
+    if curv.shape[0] < 2:
+        return default_resampled()
+
+    # 등속·이산 적분: θ_k = Σ κ·v·dt, (x,y) += v·dt·(cosθ, sinθ). y=LEFT(+) 규약이라
+    # κ(좌회전 +) 를 그대로 heading 증분으로 쓰면 부호가 맞는다.
+    dtheta = curv * v * dt
+    theta = np.concatenate([[0.0], np.cumsum(dtheta)[:-1]])
+    step = v * dt
+    x = np.concatenate([[0.0], np.cumsum(step * np.cos(theta))[:-1]])
+    y = np.concatenate([[0.0], np.cumsum(step * np.sin(theta))[:-1]])
+    t_path = np.arange(curv.shape[0], dtype=np.float64) * dt
+
+    x_viz = np.interp(T_IDXS, t_path, x).astype(np.float32)
+    y_viz = np.interp(T_IDXS, t_path, y).astype(np.float32)
+    yaw = np.interp(T_IDXS, t_path, theta).astype(np.float32)
+    z_viz = np.zeros(IDX_N, dtype=np.float32)
+    v_viz = np.full(IDX_N, v, dtype=np.float32)
+    return {
+        'x': x_viz, 'y': y_viz, 'z': z_viz, 'yaw': yaw, 'v': v_viz,
+        'vx': (v_viz * np.cos(yaw)).astype(np.float32),
+        'vy': (v_viz * np.sin(yaw)).astype(np.float32),
     }
 
 
@@ -1231,8 +1499,10 @@ def main():
     cloudlog.warning("udp_bridge init (ref-path slice mode, target=15km/h)")
 
     pm = PubMaster(["modelV2", "drivingModelData", "longitudinalPlan", "driverAssistance"])
+    # liveDelay: raw action 직결 모드에서 시계열 인덱스를 latcontrol_torque 의
+    # lat_delay 해석과 맞추는 데 쓴다 (controlsd 와 같은 값을 본다).
     sm = SubMaster(["carState", "livePose", "selfdriveState", "liveParameters",
-                    "modelLanePath"])
+                    "modelLanePath", "liveDelay"])
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1265,14 +1535,23 @@ def main():
     cloudlog.warning(f"udp_bridge lateral controller: {lat_state.mode} "
                      f"(전환: python selfdrive/modeld/lat_ctl.py, 포트 {LAT_CTL_PORT})")
     cloudlog.warning(f"udp_bridge reference path source: {lat_state.source} "
-                     f"(전환: lat_ctl.py 의 [p])")
+                     f"(전환: lat_ctl.py 의 [p] 순환 / [a] raw action 토글)")
     print(f"[LAT] lateral controller = {lat_state.mode}  "
           f"(전환: python selfdrive/modeld/lat_ctl.py)", flush=True)
-    print(f"[PATH] reference path source = {lat_state.source}  ([p] 로 토글)", flush=True)
+    print(f"[PATH] reference path source = {lat_state.source}  "
+          f"([p] 순환, [a] raw action 직결 토글)", flush=True)
+    if lat_state.bypass():
+        cloudlog.warning("udp_bridge: raw action 직결 모드 — 제어기(pure pursuit/MPC) 우회, "
+                         f"curv_sign={RAW_ACTION_CURV_SIGN:+.0f} "
+                         f"use_accel={RAW_ACTION_USE_ACCEL}")
+        print(f"[PATH] raw action 직결 — 제어기 우회 (curv_sign={RAW_ACTION_CURV_SIGN:+.0f}, "
+              f"lon={'raw_accel_mps2' if RAW_ACTION_USE_ACCEL else 'speed-hold'})", flush=True)
 
     frame_id = 0
-    ext_path = None            # 외부 UDP 로 받은 최신 reference path
+    ext_path = None            # 외부 UDP 로 받은 최신 reference path (pred_xyz)
+    ext_action = None          # 외부 UDP 로 받은 최신 raw_action 시계열 (accel/curvature)
     recv_count = 0             # 외부 UDP 패킷 수신 누계
+    action_recv_count = 0      # 그중 raw_action 이 실려 있던 패킷 누계
     path_seq = 0               # 실제로 채택한 path 의 일련번호 (소스 무관, 로그 기준)
     last_model_frame_id = None # 같은 모델 프레임을 두 번 세지 않기 위한 마커
     log_counter = 0
@@ -1296,7 +1575,30 @@ def main():
         try:
             while True:
                 data, _ = sock.recvfrom(RECV_BUF_SIZE)
-                pkt = parse_path_packet(data)
+                d = decode_packet(data)
+                if d is None:
+                    continue
+
+                # raw_action 이 실려 있으면 소스와 무관하게 항상 최신값을 갱신해 둔다
+                # (alpa_action 으로 토글하는 순간 바로 쓸 수 있게).
+                act = build_action_from_json(d, loop_start)
+                if act is not None:
+                    ext_action = act
+                    action_recv_count += 1
+                    if lat_state.source == "alpa_action":
+                        path_seq += 1
+                        if debug_log is not None:
+                            debug_log.write(
+                                f"[t={time.monotonic():.3f}] ACTION recv #{path_seq} "
+                                f"N={act['N']} dt={act['dt_s']:.3f}s "
+                                f"horizon={act['horizon_s']:.2f}s "
+                                f"infer={act['inference_time_s']:.3f}s "
+                                f"curv={_fmt_opt_arr(act['curv'], 5)} "
+                                f"raw_a={_fmt_opt_arr(act['accel'], 3)} "
+                                f"raw_v={_fmt_opt_arr(act['v_ref'], 2)}\n"
+                            )
+
+                pkt = build_path_from_json(d)
                 if pkt is not None:
                     recv_count += 1
                     ext_path = pkt
@@ -1386,9 +1688,13 @@ def main():
             lat_state.reset_request = False
 
         # 2.7. reference path 소스 선택 — 외부 UDP 경로 ↔ comma 모델 자체 경로
-        # 두 소스 모두 항상 받아두고 여기서 고르기만 한다. 아래 제어기들은 소스를
+        #      ↔ 외부 raw_action 직결(제어기 우회)
+        # 모든 소스를 항상 받아두고 여기서 고르기만 한다. 아래 제어기들은 소스를
         # 모른 채 동일한 path dict 를 받으므로 전환에 재시작·재초기화가 필요 없다.
+        lat_delay = (float(sm["liveDelay"].lateralDelay) + LAT_SMOOTH_SECONDS
+                     if sm.alive["liveDelay"] else 0.0)
         model_path, model_info = build_model_path(sm, loop_start)
+        action_cmd, action_info = build_action_command(ext_action, loop_start, lat_delay)
         if lat_state.source == "comma_model":
             if model_path is None:
                 path = None          # 모델경로를 못 믿으면 제어 정지 (안전측)
@@ -1418,11 +1724,95 @@ def main():
                             slice_s=0.0,
                             path_source="comma_model",
                         ))
+        elif lat_state.source == "alpa_action":
+            path = None              # 제어기를 쓰지 않는다 (아래 3-A 분기)
         else:
             path = ext_path
 
+        # 3-A. raw action 직결 — pure pursuit / MPC 를 전부 우회한다.
+        # 받은 curvature 를 (부호 정규화 + clip 만 거쳐) 그대로 desiredCurvature 에
+        # 실어 controlsd → latcontrol_torque 로 넘긴다. 중간 최적화가 없으므로
+        # 모델 출력 자체의 주행이 그대로 나온다.
+        if lat_state.source == "alpa_action":
+            if action_cmd is None:
+                # 못 믿는 raw_action(미수신/stale/horizon 초과) → 제어 정지 (안전측)
+                action = idle_action()
+                rs = default_resampled()
+                prev_curvature = 0.0
+            else:
+                kappa_raw = action_cmd["kappa"]
+                if v_ego > MIN_LAT_CONTROL_SPEED:
+                    kappa = smooth_value(kappa_raw, prev_curvature, LAT_SMOOTH_SECONDS)
+                else:
+                    kappa = prev_curvature
+                prev_curvature = kappa
+
+                if abs(kappa) <= CURV_DEADZONE:
+                    kappa = 0.0
+
+                # 종방향: 기본은 검증된 TARGET_SPEED 유지 P 제어. 받은 종가속도
+                # (raw_accel_mps2)를 쓰려면 RAW_ACTION_USE_ACCEL 을 켠다 — 그때도
+                # ACCEL_MIN/MAX 로 clip 되고, 패킷에 없으면 속도유지로 되돌아간다.
+                if RAW_ACTION_USE_ACCEL and action_cmd["accel"] is not None:
+                    a_cmd = action_cmd["accel"]
+                else:
+                    a_cmd = longitudinal_accel(v_ego)
+                action = log.ModelDataV2.Action(
+                    desiredCurvature=float(kappa),
+                    desiredAcceleration=float(a_cmd),
+                    shouldStop=False,
+                )
+                rs = resample_action_for_viz(ext_action, v_ego, action_cmd["idx"])
+
+                if debug_log is not None:
+                    debug_log.write(
+                        f"[t={time.monotonic():.3f}] CURV frame={frame_id} v_ego={v_ego:.2f} "
+                        f"src=alpa_action mode=bypass "
+                        f"raw={kappa_raw:+.5f} sm={kappa:+.5f} a={a_cmd:+.2f} "
+                        f"idx={action_cmd['idx']}/{action_cmd['N'] - 1} "
+                        f"t_query={action_cmd['t_query']:.3f}s "
+                        f"lat_delay={lat_delay:.3f}s age={action_info['age']:.3f}s "
+                        f"raw_a={_fmt_opt(action_cmd['accel'], '+.2f')} "
+                        f"raw_v={_fmt_opt(action_cmd['v_ref'], '.2f')} "
+                        f"action_pkts={action_recv_count}\n"
+                    )
+                log_counter += 1
+                if log_counter % 20 == 1:   # 1Hz
+                    cloudlog.warning(
+                        f"track[alpa_action/bypass]: v_ego={v_ego:.2f} "
+                        f"κ={kappa:+.5f}(raw {kappa_raw:+.5f}) a={a_cmd:+.2f} "
+                        f"raw_a={_fmt_opt(action_cmd['accel'], '+.2f')} "
+                        f"raw_v={_fmt_opt(action_cmd['v_ref'], '.2f')} "
+                        f"idx={action_cmd['idx']}/{action_cmd['N'] - 1} "
+                        f"age={action_info['age']:.3f}s lat_delay={lat_delay:.3f}s "
+                        f"pkts={action_recv_count}"
+                    )
+
+            lat_state.telemetry = {
+                "kappa_cmd": prev_curvature if action_cmd is not None else None,
+                "kappa_pp": None, "kappa_comma": None, "kappa_alpasim": None,
+                "solve_ms": 0.0,
+                "fail_streak": 0,
+                "v_ego": v_ego,
+                "cte_m": None,
+                "path_points": None if ext_action is None else ext_action['N'],
+                "pkts": recv_count,
+                "action_pkts": action_recv_count,
+                "path_seq": path_seq,
+                "engaged": engaged,
+                "frame": frame_id,
+                "loop_ms": last_loop_ms,
+                "has_path": action_cmd is not None,
+                **model_telemetry(model_info),
+                **action_telemetry(action_info),
+            }
+            # 우회 모드에서는 제어기 누적 상태(warm start)가 낡으므로 비워 둔다.
+            lat_fail_streak = 0
+            comma_ctl.reset()
+            alpasim_ctl.reset()
+
         # 3. tracker — 받은 path 를 그대로(원점 재정렬 없이) 추종
-        if path is not None:
+        elif path is not None:
             mode = lat_state.mode
             # pure pursuit 는 비용이 없으니 항상 계산 (diag 기준선 + 폴백용)
             kappa_pp, i_goal, L_d_eff = pure_pursuit_curvature(path, v_ego, index_frac=PP_INDEX_FRAC)
@@ -1474,12 +1864,14 @@ def main():
                 "cte_m": float(path['y'][0]),
                 "path_points": int(path['N']),
                 "pkts": recv_count,
+                "action_pkts": action_recv_count,
                 "path_seq": path_seq,
                 "engaged": engaged,
                 "frame": frame_id,
                 "loop_ms": last_loop_ms,
                 "has_path": True,
                 **model_telemetry(model_info),
+                **action_telemetry(action_info),
             }
 
             # 직진 데드존: |curvature| 이 임계 이하면 제어 입력을 0 으로
@@ -1547,12 +1939,14 @@ def main():
             lat_state.telemetry = {
                 "v_ego": v_ego,
                 "pkts": recv_count,
+                "action_pkts": action_recv_count,
                 "path_seq": path_seq,
                 "engaged": engaged,
                 "frame": frame_id,
                 "loop_ms": last_loop_ms,
                 "has_path": False,
                 **model_telemetry(model_info),
+                **action_telemetry(action_info),
             }
 
         # 4. 메시지 발행
