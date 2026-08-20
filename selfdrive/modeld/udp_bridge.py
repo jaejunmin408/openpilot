@@ -915,7 +915,16 @@ def _path_shape_metrics(path_ego):
 
 def build_path_diag_row(path_ego, *, event, recv_count, frame_id, v_ego, kappa_smoothed,
                         prev_goal_y_by_ld, now_wall_us, now_mono_s, slice_s=None,
-                        path_source=""):
+                        path_source="", action_cmd=None, action_info=None):
+    """path 1개에 대한 diag CSV 한 줄.
+
+    action_cmd/action_info 를 주면(=alpa_action 소스) raw action 전용 컬럼도 채운다.
+    그 모드에서 path_ego 는 "명령 곡률을 적분한 경로"(action_path_for_log)라, ld*_
+    pure pursuit 컬럼은 "그 경로를 PP 로 다시 추종하면 나올 κ" 이 된다. 곡률이
+    horizon 동안 일정할 때만 action_kappa_raw 와 같아지고, 곡률이 감기는 구간에서는
+    lookahead 가 앞쪽 굽힘까지 보므로 더 크게 나온다 — 같은 값을 기대하는 검산이
+    아니라 "지령 곡률이 기하적으로 어떤 경로인가" 를 보는 참조용 컬럼이다.
+    """
     meta = dict(path_ego.get("meta") or {})
     row = {
         "event": event,
@@ -943,6 +952,24 @@ def build_path_diag_row(path_ego, *, event, recv_count, frame_id, v_ego, kappa_s
         "coord_note": meta.get("coord_note") or "",
     }
     row.update({key: _safe_float(value) for key, value in _path_shape_metrics(path_ego).items()})
+
+    # raw action 전용 컬럼 (다른 소스에서는 빈칸)
+    info = action_info or {}
+    cmd = action_cmd or {}
+    row.update({
+        "action_idx": ("" if (cmd.get("idx", info.get("idx"))) is None
+                       else int(cmd.get("idx", info.get("idx")))),
+        "action_n": "" if info.get("n") in (None, 0) else int(info["n"]),
+        "action_dt_s": _safe_float(cmd.get("dt_s", info.get("dt_s"))),
+        "action_horizon_s": _safe_float(info.get("horizon_s")),
+        "action_t_query_s": _safe_float(cmd.get("t_query")),
+        "action_age_s": _safe_float(info.get("age")),
+        "action_lat_delay_s": _safe_float(info.get("lat_delay")),
+        "action_kappa_raw": _safe_float(cmd.get("kappa", info.get("curv"))),
+        "action_accel_mps2": _safe_float(cmd.get("accel", info.get("accel"))),
+        "action_v_ref_mps": _safe_float(cmd.get("v_ref", info.get("v_ref"))),
+        "action_reason": info.get("reason") or "",
+    })
 
     for ld_m in DIAG_LD_VALUES_M:
         kappa_pp, goal_idx, L_d_eff = pure_pursuit_curvature(path_ego, v_ego, lookahead_m=ld_m)
@@ -995,6 +1022,18 @@ def diag_fieldnames():
         "max_abs_y_m",
         "dy_step_rms_m",
         "d2y_step_rms_m",
+        # raw action 직결 전용 (alpa_action 소스가 아니면 빈칸)
+        "action_idx",
+        "action_n",
+        "action_dt_s",
+        "action_horizon_s",
+        "action_t_query_s",
+        "action_age_s",
+        "action_lat_delay_s",
+        "action_kappa_raw",
+        "action_accel_mps2",
+        "action_v_ref_mps",
+        "action_reason",
     ]
     for ld_m in DIAG_LD_VALUES_M:
         tag = f"ld{ld_m:g}"
@@ -1159,6 +1198,24 @@ def action_telemetry(action_info):
         "action_lat_delay": action_info["lat_delay"],
         "action_reason": action_info["reason"],
     }
+
+
+def action_path_for_log(ext_action, v_ego, idx0=0):
+    """명령 곡률 적분 경로를 다른 소스와 같은 path dict 로 (로그·diag 전용).
+
+    이 소스는 x,y 를 안 받으므로 로그에 남길 "경로" 가 없다. 대신 modelV2 로
+    발행하는 것과 **똑같은** 적분 경로(resample_action_for_viz)를 그대로 남긴다 —
+    화면에 보이는 경로와 로그의 경로가 일치하고, curv_log_viz 의 XY 패널·PP 비교가
+    다른 소스와 동일하게 동작한다. 등속(v_ego) 가정이라 속도가 변하면 같은 곡률에도
+    모양이 바뀐다는 점만 유의.
+    """
+    rs = resample_action_for_viz(ext_action, v_ego, idx0)
+    x = rs['x'].astype(np.float64)
+    y = rs['y'].astype(np.float64)
+    meta = dict((ext_action.get('meta') or {}) if ext_action else {})
+    meta.update({"udp_mode": "alpa_action", "label": "raw_action(적분)",
+                 "inference_time_s": (ext_action or {}).get('inference_time_s')})
+    return {'x': x, 'y': y, 'raw_y': -y, 'N': int(x.shape[0]), 'meta': meta}
 
 
 def resample_action_for_viz(ext_action, v_ego, idx0=0):
@@ -1587,16 +1644,42 @@ def main():
                     action_recv_count += 1
                     if lat_state.source == "alpa_action":
                         path_seq += 1
+                        v_ego_act = max(sm["carState"].vEgo, 0.0) if sm.alive["carState"] else 0.0
+                        act_path = action_path_for_log(act, v_ego_act)
                         if debug_log is not None:
+                            # ACTION 줄 = 받은 시계열 원본 (정확한 숫자)
                             debug_log.write(
                                 f"[t={time.monotonic():.3f}] ACTION recv #{path_seq} "
                                 f"N={act['N']} dt={act['dt_s']:.3f}s "
                                 f"horizon={act['horizon_s']:.2f}s "
                                 f"infer={act['inference_time_s']:.3f}s "
+                                f"int_v={v_ego_act:.2f} "
                                 f"curv={_fmt_opt_arr(act['curv'], 5)} "
                                 f"raw_a={_fmt_opt_arr(act['accel'], 3)} "
                                 f"raw_v={_fmt_opt_arr(act['v_ref'], 2)}\n"
                             )
+                            # PATH 줄 = 곡률 적분 경로. 다른 소스와 형식이 같아서
+                            # curv_log_viz 가 XY 패널·경로 묶기를 그대로 해준다.
+                            debug_log.write(
+                                f"[t={time.monotonic():.3f}] PATH recv #{path_seq} src=alpa_action "
+                                f"N={act_path['N']} pts={format_xy_points(act_path['x'], act_path['y'])}\n"
+                            )
+                        if diag_writer is not None:
+                            _, act_info_recv = build_action_command(act, loop_start, 0.0)
+                            diag_writer.writerow(build_path_diag_row(
+                                act_path,
+                                event="recv",
+                                recv_count=path_seq,
+                                frame_id=frame_id,
+                                v_ego=v_ego_act,
+                                kappa_smoothed=None,
+                                prev_goal_y_by_ld={},
+                                now_wall_us=time.time_ns() // 1000,
+                                now_mono_s=time.monotonic(),
+                                slice_s=0.0,
+                                path_source="alpa_action",
+                                action_info=act_info_recv,
+                            ))
 
                 pkt = build_path_from_json(d)
                 if pkt is not None:
@@ -1735,10 +1818,23 @@ def main():
         # 모델 출력 자체의 주행이 그대로 나온다.
         if lat_state.source == "alpa_action":
             if action_cmd is None:
-                # 못 믿는 raw_action(미수신/stale/horizon 초과) → 제어 정지 (안전측)
+                # 못 믿는 raw_action(미수신/stale/horizon 초과) → 제어 정지 (안전측).
+                # 조용히 멈추면 원인을 못 찾으니 이유를 남긴다 (1Hz 로 throttle).
                 action = idle_action()
                 rs = default_resampled()
                 prev_curvature = 0.0
+                if debug_log is not None:
+                    debug_log.write(
+                        f"[t={time.monotonic():.3f}] CURV frame={frame_id} v_ego={v_ego:.2f} "
+                        f"src=alpa_action mode=bypass STOP reason={action_info['reason']!r} "
+                        f"sm=+0.00000 age={_fmt_opt(action_info['age'], '.3f')} "
+                        f"path={path_seq} pkts={action_recv_count}\n"
+                    )
+                log_counter += 1
+                if log_counter % 20 == 1:
+                    cloudlog.warning(f"track[alpa_action/bypass]: 제어 정지 — "
+                                     f"{action_info['reason']} "
+                                     f"(pkts={action_recv_count}, v_ego={v_ego:.2f})")
             else:
                 kappa_raw = action_cmd["kappa"]
                 if v_ego > MIN_LAT_CONTROL_SPEED:
@@ -1764,6 +1860,9 @@ def main():
                 )
                 rs = resample_action_for_viz(ext_action, v_ego, action_cmd["idx"])
 
+                # 다른 소스의 CURV 줄과 같은 key=value 형식 — curv_log_viz 가 sm/mode/
+                # src 로 읽고 path=(경로 번호) 로 묶는다. 이 모드엔 제어기 출력이 없어
+                # comma/pp/alpasim 은 아예 안 적는다(뷰어에서 NaN → 빈칸).
                 if debug_log is not None:
                     debug_log.write(
                         f"[t={time.monotonic():.3f}] CURV frame={frame_id} v_ego={v_ego:.2f} "
@@ -1774,8 +1873,25 @@ def main():
                         f"lat_delay={lat_delay:.3f}s age={action_info['age']:.3f}s "
                         f"raw_a={_fmt_opt(action_cmd['accel'], '+.2f')} "
                         f"raw_v={_fmt_opt(action_cmd['v_ref'], '.2f')} "
-                        f"action_pkts={action_recv_count}\n"
+                        f"path={path_seq} pkts={action_recv_count}\n"
                     )
+
+                if diag_writer is not None and frame_id % DIAG_CONTROL_EVERY_N == 0:
+                    diag_writer.writerow(build_path_diag_row(
+                        action_path_for_log(ext_action, v_ego, action_cmd["idx"]),
+                        event="control",
+                        recv_count=path_seq,
+                        frame_id=frame_id,
+                        v_ego=v_ego,
+                        kappa_smoothed=kappa,
+                        prev_goal_y_by_ld={},
+                        now_wall_us=time.time_ns() // 1000,
+                        now_mono_s=time.monotonic(),
+                        slice_s=0.0,
+                        path_source="alpa_action",
+                        action_cmd=action_cmd,
+                        action_info=action_info,
+                    ))
                 log_counter += 1
                 if log_counter % 20 == 1:   # 1Hz
                     cloudlog.warning(
